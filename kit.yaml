@@ -1,7 +1,7 @@
 _generated_by: build/build_kit.py
 _note: 本 kit 是由源知识库过滤+去个人化生成的派生数据；真源不在此仓库。
-source_commit: cf3e366112406b83103055e0e75e6cef561c1c73
-built_at: '2026-10-11T13:21:29'
+source_commit: 8ae3f6accc4356cc4f05cf5b5c220ddebe6b9d83
+built_at: '2026-10-11T13:45:57'
 note: 生成物请勿手改；改真源后重跑 build_kit.py。
 tools:
 - tools/journals-multidisciplinary.yaml
@@ -37,6 +37,7 @@ tools:
 - tools/lit_ingest.py
 - tools/lit_journals.py
 - tools/lit_manual_import.py
+- tools/lit_report.py
 - tools/qc_base_check.py
 - tools/qc_evidence_base.py
 - tools/qc_schema_check.py
@@ -65,7 +66,7 @@ tool_sha256:
   tools/lit_catalogue.py: 5ede7cfb1cf6ab9aed1a6d7adb8099e992ff7d1fb1444d697000a08dfe549cdf
   tools/lit_daily.py: 00378fd817fa81d3500a77da7ccc4000d4df37ba06bfa1d05efc28e09abe65d1
   tools/lit_digest.py: 6483a775d9ba6db35b3da90acd31f628b822f0aa378f4c0e618412584104b8ce
-  tools/lit_discover.py: 5ac246739f2eedfcfeb133f559a53e2092bb40e32797b207b85588c551bea3f8
+  tools/lit_discover.py: 24cec1a24ca1699829fdfc784d3555758d5873279513429c38c661e6bcb954b4
   tools/lit_doctor.py: 618762f37fc8d2b02b4c678a3758c0ba2c24df929e8f323df48560ffda8ab6ed
   tools/lit_extract.py: 6fb5dd7f6a6b06d589e5747d526b18916ab57ffee2ecc5ebc205221769e12954
   tools/lit_fetch.py: 63618927b56df7b8d404ad7bfcb6586ecb164459361384726a7e08897690f69b
@@ -74,6 +75,7 @@ tool_sha256:
   tools/lit_ingest.py: b8e73193bc2680ab1a6e58f6ae4cd8b65b62ede934891e32e9d2fcd565bc7951
   tools/lit_journals.py: dbd552dc2999284e23642c13796d1e4b26fc8cbc5f97d5b0ec88972f6e80522a
   tools/lit_manual_import.py: ccb088968395be2593b96d835c5b5b81981c0e3949d88cd6a4264649da77dae1
+  tools/lit_report.py: 99b6d7e7496c7963522077271ce87048c69d0fb221628d542d9ac268de813306
   tools/qc_base_check.py: 770d4f9f472f5b69fdefce31fe422ef18f7a350a4ca66ba9e5e2b292d7afb7b4
   tools/qc_evidence_base.py: 390be939b31025cf5a63460bd1f24c1080d3f1e8d474040da684d77318477bf7
   tools/qc_schema_check.py: e6487612f48ac922e3bbbb20864a3c422fb1e08f569c2d52e93b2722442dcbc0

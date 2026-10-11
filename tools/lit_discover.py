@@ -942,6 +942,8 @@ def discover(query, config, days, limit, since_date=None, known=None):
     #    实测（真实 166 篇候选）：分数只有 0.70/0.769/0.900/0.923 四种，全部 ≥ 评分下限
     #    ⇒ 五个档位的阈值一律 0 篇可滤，T0 与 T4 的判定完全相同。
     #    不报的话，读报告的人会以为 tier 正在做分级筛选。
+    # 显式 --rel-min 覆盖时，对所有刊统一用该阈值（不再按档放宽）
+    force_rel = config["defaults"].get("_force_rel_min", None)
     _inert = inert_tiers(config, force_rel=force_rel)
     if _inert:
         print(f"  [warn] 分级阈值**当前不产生任何区分**：{len(_inert)} 个档位的阈值 ≤ "
@@ -953,8 +955,6 @@ def discover(query, config, days, limit, since_date=None, known=None):
     kw = keyword_sets(query)
     issn_tier = _issn_tier_map(config)
     global_min = config["defaults"].get("abstract_min_relevance", 0.5)  # 兜底（tier_spec 已含）
-    # 显式 --rel-min 覆盖时，对所有刊统一用该阈值（不再按档放宽）
-    force_rel = config["defaults"].get("_force_rel_min", None)
     out = []
     skipped = []   # 命中去重账本、判定为"已看过"而被跳过的（供报告）
     seen_in_run = set()  # 单次 run 内按去重键再去重（同源多刊 / 检索回带重复）

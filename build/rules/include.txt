@@ -33,5 +33,6 @@ lit_batch.py
 lit_gapscan.py
 lit_doctor.py
 lit_journals.py
+lit_report.py
 # 数据文件
 journals-multidisciplinary.yaml

@@ -17,7 +17,7 @@
 | 工具 | 30+ 个 `kb_*.py` / `lit_*.py`（检索、索引、lint、文献流水线），全部 `--selftest` |
 | 纪律 | `CLAUDE.md`：页面 schema、`evidence_base`、批判性标记、元数据静默丢失防线、L1/L2/L3 分层检索 |
 | 客户端 | `mcp/server.py`：把 19 个工具暴露给任何支持 MCP 的 AI 客户端 |
-| 技能 | `.dsh/skills/`：lit-watch / lit-pipeline / kb-query / kb-lint 四个流程技能 |
+| 技能 | `.dsh/skills/`：lit-watch / lit-pipeline / kb-query / kb-lint / **kb-onboard**（首跑配置向导） |
 
 ## 快速开始
 
@@ -36,6 +36,12 @@ python /path/to/my-vault/tools/kb.py --doctor
 
 初始化会把工具、方法论、`.base` 视图、配置模板、五个根元文件写进你的库，
 并**跑一次索引构建**（空库也会产出一个合法的空索引——见下「设计要点」）。
+
+### 配好你的研究方向（首跑向导）
+
+库建好后，`tools/lit_config.yaml` 里还是占位示例。用 **`kb-onboard` 技能**做一次访谈
+（专业 / 细分方向 / 关键词 / 偏好期刊），它会生成 `profile.md` 并据此配好方向与期刊白名单。
+之后就能跑第一轮：`python tools/lit_discover.py "你的方向" "近一周" --limit 20`。
 
 ## 挂到 AI 客户端（MCP）
 

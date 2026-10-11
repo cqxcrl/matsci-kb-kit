@@ -169,7 +169,7 @@ def transform_claude(text, warn):
 
 # 随包发布的技能（源 .dsh/skills/ 下的目录名）→ kit 内相对路径。
 # 排除工程专属（kb-qc-loop/kb-review-cycle/kb-ingest-batch）与陈旧 batch-ops。
-SKILLS = ["lit-pipeline", "lit-watch", "kb-query", "kb-lint"]
+SKILLS = ["lit-pipeline", "lit-watch", "kb-query", "kb-lint", "kb-onboard"]
 SKILL_SCRUB = [
     (r"E:\\Matsci Knowledge Base", "<你的库根>"),
     (r"E:/Matsci Knowledge Base", "<你的库根>"),

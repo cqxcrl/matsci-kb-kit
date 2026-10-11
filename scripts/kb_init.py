@@ -101,6 +101,10 @@ def main():
     copy_if_absent(os.path.join(SCAFFOLD, "gitignore.template"),
                    os.path.join(tgt, ".gitignore"), args.force, log)
 
+    # 5b) profile.md（首跑访谈产物，供 /kb-onboard 填写）
+    copy_if_absent(os.path.join(SCAFFOLD, "profile.template.md"),
+                   os.path.join(tgt, "profile.md"), args.force, log)
+
     # 6) tools/ + CLAUDE.md（生成物，随 kit 发布）
     log("[5] tools/")
     copytree(os.path.join(KIT, "tools"), os.path.join(tgt, "tools"), args.force, log)

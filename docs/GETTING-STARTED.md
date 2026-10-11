@@ -40,7 +40,23 @@ python /path/to/my-vault/tools/kb.py --doctor     # 环境与索引
 python /path/to/my-vault/tools/kb_toolcheck.py    # 实跑全部工具
 ```
 
-## 5. 开始灌内容
+## 5. 配研究方向（可选，用文献流水线时做）
+
+空库的 `tools/lit_config.yaml` 只有占位示例。用 **`kb-onboard` 技能**访谈一次，即可配好
+方向与期刊白名单：
+
+> 用 kb-onboard 帮我配置研究方向
+
+它会分批问你的专业/方向/关键词/偏好期刊，生成 `profile.md`，并把 `lit_config.yaml` 的
+`automation.directions` 与 `journals` 填好。之后：
+
+```bash
+python tools/lit_doctor.py                                     # 体检
+python tools/lit_discover.py "你的方向" "近一周" --limit 20     # 第一轮检索
+python tools/lit_report.py --from-sources --days 7             # 出归纳报告
+```
+
+## 6. 开始灌内容
 
 三条路，任选：
 
@@ -57,7 +73,7 @@ python /path/to/my-vault/tools/kb_toolcheck.py    # 实跑全部工具
   完整链路见技能 `.dsh/skills/lit-watch/SKILL.md`。
 - **让 AI 读 `CLAUDE.md` 后按 ingest 流程帮你消化**。
 
-## 6. 日常
+## 7. 日常
 
 ```bash
 python tools/kb_route.py "某个问题" --json   # 分层检索（首选入口）

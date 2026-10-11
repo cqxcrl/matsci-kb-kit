@@ -18,3 +18,6 @@
 ## 致谢
 
 工具链的最初构想来自 [karpathy/llm-wiki](https://github.com/karpathy/llm-wiki)。
+
+`lit_report.py`（归纳报告生成）与 `kb-onboard` 技能（首跑配置向导）、`profile` 模板
+由早期项目 **lit-watch-workflow** 并入并去分叉（公共库由 `lit_core` 改回本工具链的 `kb_lib`）。
