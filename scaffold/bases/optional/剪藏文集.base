@@ -1,0 +1,25 @@
+# 可选视图：网页/公众号剪藏文集。
+# 需要「剪藏原始资料」也有一个总览时启用。按需改 source 过滤串。
+filters:
+  and:
+    - file.ext == "md"
+    - file.inFolder("raw")
+    - source.contains("mp.weixin.qq.com")
+properties:
+  source:
+    displayName: 来源
+  created:
+    displayName: 入库
+  summary:
+    displayName: 摘要
+views:
+  - type: table
+    name: 剪藏文集
+    order:
+      - file.name
+      - source
+      - created
+      - file.tags
+    sort:
+      - property: created
+        direction: DESC

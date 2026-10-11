@@ -1,0 +1,37 @@
+# 随 kit 发布的工具（相对 src/tools 的文件名，不含路径）
+# 核心检索层
+kb_lib.py
+kb.py
+kb_search.py
+kb_semantic_search.py
+kb_route.py
+kb_corpus.py
+kb_graph.py
+kb_backlinks.py
+kb_build_index.py
+kb_lint.py
+kb_lint_deep.py
+kb_stats.py
+kb_cite.py
+kb_tags.py
+kb_where.py
+kb_selftest.py
+kb_toolcheck.py
+kb_serve.py
+kb_dois.py
+# 文献流水线
+lit_discover.py
+lit_fetch.py
+lit_extract.py
+lit_ingest.py
+lit_finish.py
+lit_daily.py
+lit_digest.py
+lit_catalogue.py
+lit_manual_import.py
+lit_batch.py
+lit_gapscan.py
+lit_doctor.py
+lit_journals.py
+# 数据文件
+journals-multidisciplinary.yaml

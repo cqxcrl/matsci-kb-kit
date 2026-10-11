@@ -1,0 +1,24 @@
+# 统一换行：仓库内一律 LF，避免 Windows/macOS 协作时的 CRLF churn。
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.base  text eol=lf
+*.txt   text eol=lf
+
+# 二进制
+*.png   binary
+*.jpg   binary
+*.pdf   binary
+*.npy   binary
+
+# GitHub 折叠生成物的 diff（这些是派生数据）
+tools/**          linguist-generated=true
+skills/**         linguist-generated=true
+docs/METHODOLOGY.md linguist-generated=true
+docs/TOOLS.md     linguist-generated=true
+CLAUDE.md         linguist-generated=true
+kit.yaml          linguist-generated=true

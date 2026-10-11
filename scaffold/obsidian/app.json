@@ -1,0 +1,17 @@
+{
+  "newFileFolderPath": "raw/notes",
+  "attachmentFolderPath": "raw/assets",
+  "userIgnoreFilters": [
+    "_archive/",
+    "projects/",
+    "tools/",
+    "raw/pdf/",
+    "raw/assets/",
+    "wiki/.index/",
+    "wiki/log.md",
+    "wiki/log_ops.md",
+    "wiki/log_insights.md",
+    "wiki/index.md",
+    "CLAUDE.md"
+  ]
+}

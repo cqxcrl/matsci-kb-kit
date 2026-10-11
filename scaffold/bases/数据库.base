@@ -1,0 +1,36 @@
+filters:
+  and:
+    - file.inFolder("wiki")
+    - file.ext == "md"
+    - not:
+        - file.inFolder("wiki/.index")
+        - file.basename == "index" or file.basename == "log" or file.basename == "log_ops" or file.basename == "log_insights" or file.basename == "tags"
+properties:
+  type:
+    displayName: 类型
+  summary:
+    displayName: 摘要
+  file.mtime:
+    displayName: 更新时间
+views:
+  - type: table
+    name: 全库总览
+    groupBy:
+      property: type
+      direction: ASC
+    order:
+      - file.name
+      - type
+      - summary
+      - file.mtime
+  - type: table
+    name: 最近更新
+    order:
+      - file.name
+      - type
+      - file.mtime
+      - summary
+    sort:
+      - property: file.mtime
+        direction: DESC
+    limit: 50

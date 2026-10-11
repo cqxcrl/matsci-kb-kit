@@ -1,0 +1,107 @@
+# 声明式去个人化表。每项：{file, find, replace, [optional] note}
+# find 用 YAML 单引号（反斜杠按字面量处理）或块标量（多行）。
+# 变换按**列表顺序**应用；同文件多规则时，长的在前（避免短串先命中）。
+# 这是 kit 与真源的唯一差异来源——本库（真源）自身完全不动。
+#
+# 覆盖所有在 include.txt 工具中命中 leak_denylist 的位置。
+# 末尾几条把「库外兜底路径」改成终端默认，使脚本既无泄漏、又保持可运行。
+
+rules:
+  # ---------- kb_where.py：四目录检索的综述工程路径 → 通用 projects/ ----------
+  - file: kb_where.py
+    find: 'projects/AI-for-Materials-Review/references'
+    replace: 'projects/references'
+  - file: kb_where.py
+    find: 'projects/AI-for-Materials-Review/_superseded'
+    replace: 'projects/_superseded'
+  - file: kb_where.py
+    find: '已把综述工程从库根的 `AI for Materials Literature Review/`'
+    replace: '已把综述工程归档到 `projects/`'
+  - file: kb_where.py
+    find: 'projects/AI-for-Materials-Review'
+    replace: 'projects'
+  - file: kb_where.py
+    find: '`AI for Materials Literature Review/references/` 内。'
+    replace: '`projects/references/` 内。'
+
+  # ---------- kb_lib.py：注释里的旧配置/旧库路径 ----------
+  - file: kb_lib.py
+    find: '（E:/.claude/workflows/lit-watch/config.yaml）'
+    replace: '（一份已废弃的旧版配置）'
+  - file: kb_lib.py
+    find: '（E:/科研文献与知识/raw）'
+    replace: '（一个已不存在的旧库路径）'
+
+  # ---------- lit_discover.py ----------
+  - file: lit_discover.py
+    find: '（E:/科研文献与知识/raw）'
+    replace: '（一个已不存在的旧库路径）'
+  - file: lit_discover.py
+    find: '（旧版硬编码 E:/.claude/workflows/lit-watch/runs/.source_cache.json）'
+    replace: '（路径由 lit 配置给出，不写绝对路径）'
+  - file: lit_discover.py
+    find: 'lit-watch/1.0 (Matsci Knowledge Base; literature discovery)'
+    replace: 'lit-watch/1.0 (literature discovery)'
+
+  # ---------- lit_extract.py ----------
+  - file: lit_extract.py
+    find: '**E:/科研文献与知识/raw**'
+    replace: '**一个已不存在的旧库路径**'
+
+  # ---------- lit_daily.py ----------
+  - file: lit_daily.py
+    find: '`E:\\.claude\\scripts\\lit_watch_daily.py` 里那份硬编码方向的版本'
+    replace: '一份早期硬编码方向、现已废弃的版本'
+  - file: lit_daily.py
+    find: '"results_dir": a.get("results_dir") or r"E:/.claude/results",'
+    replace: '"results_dir": a.get("results_dir") or "",'
+
+  # ---------- lit_digest.py ----------
+  - file: lit_digest.py
+    find: '配置优先，缺省 E:\\.claude\\results。'
+    replace: '配置优先，缺省落在库内运行产物目录。'
+  - file: lit_digest.py
+    find: 'or r"E:/.claude/results")'
+    replace: 'or "")'
+  - file: lit_digest.py
+    find: '不写 E:\\.claude\\results 副本'
+    replace: '不写库外副本'
+
+  # ---------- lit_catalogue.py：本机库外文献区兜底 + Zotero 兜底 ----------
+  - file: lit_catalogue.py
+    find: |-
+      DEFAULT_PDF_SOURCES = {
+          "chem_mater": r"E:\Chem&Mater 文献",
+          "nihfe":      r"E:\镍铁催化剂机理探究\文献",
+      }
+    replace: 'DEFAULT_PDF_SOURCES = {}   # 由 lit_config.yaml: dedup_sources 提供；不内置个人路径'
+  - file: lit_catalogue.py
+    find: '# Zotero 数据目录兜底（真实数据在 E:\ZoteroData；旧值 C:\Users\asus\Zotero 是其符号链接）'
+    replace: '# Zotero 数据目录兜底（真实数据由 lit_config.yaml: zotero.data_dir 提供）'
+  - file: lit_catalogue.py
+    find: 'DEFAULT_ZOTERO_DIR = r"E:\ZoteroData"'
+    replace: 'DEFAULT_ZOTERO_DIR = ""'
+
+  # ---------- lit_doctor.py：机器专属探测路径 ----------
+  - file: lit_doctor.py
+    find: '  · 配置里的 `E:/Chem&Mater 文献` 递归 **0 个 PDF** → 这个"去重源"其实什么都没贡献；'
+    replace: '  · 配置里配了一个不存在的去重源 → 它其实什么都没贡献；'
+  - file: lit_doctor.py
+    find: 'g = r"E:\.claude\skills\lit-watch\SKILL.md"'
+    replace: 'g = os.path.join(os.environ.get("CLAUDE_HOME") or os.path.expanduser("~/.claude"), "skills", "lit-watch", "SKILL.md")'
+  - file: lit_doctor.py
+    find: 'DSH 看不到该 skill；重建 junction 指向 E:\\.claude\\skills\\lit-watch'
+    replace: 'DSH 看不到该 skill；请把 lit-watch 链接进全局 skills 目录'
+  - file: lit_doctor.py
+    find: 'r"E:\.claude\commands\lit-watch.md"]'
+    replace: 'os.path.join(os.path.expanduser("~/.claude"), "commands", "lit-watch.md")]'
+
+  # ---------- lit_ingest.py：注释里的库根名 ----------
+  - file: lit_ingest.py
+    find: '于是在库内嵌出 `Matsci Knowledge Base/` 影子目录，'
+    replace: '于是在库内嵌出一个以库根名命名的影子目录，'
+
+  # ---------- lit_manual_import.py：用法示例里的下载目录 ----------
+  - file: lit_manual_import.py
+    find: '--inbox "E:\\临时下载"'
+    replace: '--inbox "D:\\downloads"'

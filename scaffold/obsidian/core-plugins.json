@@ -1,0 +1,7 @@
+{
+  "bases": true,
+  "properties": true,
+  "templates": true,
+  "file-recovery": true,
+  "daily-notes": false
+}

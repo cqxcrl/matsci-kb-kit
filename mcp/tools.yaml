@@ -1,0 +1,26 @@
+# MCP 工具清单（人读；真源是 server.py 的 TOOLS 注册表）。
+# 读工具默认安全；写工具（kb_build_index）需 server 以 --allow-write 启动 +
+# 调用方传 apply=true（双钥）。
+read_only:
+  - kb_route          # 分层检索（首选）
+  - kb_search         # BM25/语义/混合
+  - kb_resolve        # 别名解析
+  - kb_where          # 四目录完备检索
+  - kb_corpus_search  # raw 全文块检索
+  - kb_graph          # 图谱
+  - kb_backlinks      # 补链建议
+  - kb_stats
+  - kb_tags
+  - kb_dois
+  - kb_cite
+  - lit_batch
+  - lit_gapscan
+  - kb_doctor
+  - kb_lint
+  - kb_selftest
+  - kb_toolcheck
+  - lit_doctor
+write:
+  - kb_build_index    # 幂等重建索引
+out_of_scope:
+  - lit_daily 等「每日发现」——调度是 OS 侧（cron / Task Scheduler），见 docs/MCP.md

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.venv*/
+build/fixtures/_tmp/
+_pycache/
+.DS_Store
+Thumbs.db

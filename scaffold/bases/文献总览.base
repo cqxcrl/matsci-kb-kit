@@ -1,0 +1,43 @@
+filters:
+  and:
+    - file.inFolder("wiki/sources")
+    - file.ext == "md"
+formulas:
+  age_days: (now() - file.ctime).days
+properties:
+  year:
+    displayName: 年份
+  journal:
+    displayName: 期刊
+  source_type:
+    displayName: 文章类型
+  summary:
+    displayName: 摘要
+  formula.age_days:
+    displayName: 入库天数
+views:
+  - type: table
+    name: 文献总览
+    groupBy:
+      property: year
+      direction: DESC
+    order:
+      - file.name
+      - year
+      - journal
+      - source_type
+      - summary
+      - file.tags
+      - formula.age_days
+    sort:
+      - property: year
+        direction: ASC
+      - property: file.name
+        direction: ASC
+  - type: cards
+    name: 文献卡片
+    order:
+      - file.name
+      - year
+      - journal
+      - summary

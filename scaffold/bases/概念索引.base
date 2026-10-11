@@ -1,0 +1,23 @@
+filters:
+  and:
+    - file.inFolder("wiki/concepts")
+    - file.ext == "md"
+properties:
+  evidence_base:
+    displayName: 证据承重
+  summary:
+    displayName: 摘要
+  updated:
+    displayName: 更新
+views:
+  - type: table
+    name: 概念索引
+    groupBy:
+      property: evidence_base
+      direction: ASC
+    order:
+      - file.name
+      - evidence_base
+      - summary
+      - file.tags
+      - updated

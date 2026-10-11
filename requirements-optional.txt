@@ -1,0 +1,7 @@
+# 可选依赖（缺省时优雅降级）
+# 语义检索首选：
+sentence-transformers
+# 语义检索降级（无 sentence-transformers 时用 TF-IDF/SVD）：
+scikit-learn
+# kb_cite --copy 剪贴板：
+pyperclip

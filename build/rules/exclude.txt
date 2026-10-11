@@ -1,0 +1,15 @@
+# 明确排除的文件（相对 src/tools），附理由。
+# 本文件只作**审计记录**：生成器以 include.txt 为白名单，这里列出的是刻意排除项。
+# 迁移/一次性工具（绑本库历史，空库无用）
+kb_deabs.py                 # 迁移期工具：把硬编码旧路径改成 __file__ 派生；本库已迁移完
+kb_restructure.py           # 受控执行本库 Phase-2 结构精简；引用历史文件
+kb_fix_frontmatter_quotes.py # 一次性修复：frontmatter 内裸引号（已修完）
+kb_baseline.py              # 本库历史验收基线（硬编码期望值）
+# 调度脚本（out of MCP scope，随 OS 侧交付文档给用户）
+lit_daily_task.ps1
+migrate-folder.ps1
+# QC 审计/修复趟（绑本库历史语料；仅保留编码方法论的少数，见 build_kit.py 的 EXTRAS）
+qc_status.py qc_ledger.py qc_batch_progress.py qc_same_text.py qc_si_sweep.py
+qc_si_template_sweep.py qc_author_gate.py qc_author_gate_apply.py qc_find_ai_deps.py
+qc_fix_authors.py qc_fix_image_syntax.py qc_fix_pdf_links.py qc_fix_workspace_refs.py
+qc_fix_yaml.py qc_link_twins.py qc_link_wrap_sweep.py qc_unwrap_author_links.py

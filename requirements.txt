@@ -1,0 +1,5 @@
+# 核心依赖（检索层 + 基础工具必需）
+pyyaml
+jieba
+numpy
+PyMuPDF

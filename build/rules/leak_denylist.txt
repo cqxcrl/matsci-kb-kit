@@ -1,0 +1,12 @@
+# fail-closed 泄漏扫描 denylist（逐行一个正则）。
+# build_kit.py 在生成后扫整个输出树，任一命中即构建失败。
+# 只列**真正的个人/身份标识**——不要放通用词（如「知识库」「Zotero」），
+# 否则全部工具源码都会命中，扫描失去意义。
+E:[\\/]
+C:\\Users\\asus
+镍铁催化剂
+Chem&Mater
+Matsci Knowledge Base
+Battery Knowledge Base
+AI-for-Materials-Review
+AI for Materials Literature Review

@@ -1,0 +1,20 @@
+[project]
+name = "matsci-kb-kit"
+version = "0.1.0"
+description = "Toolbox + methodology for building an Obsidian knowledge base: retrieval, literature pipeline, QC, MCP server."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "梁公子" }]
+dependencies = ["pyyaml", "jieba", "numpy", "PyMuPDF"]
+
+[project.optional-dependencies]
+semantic = ["sentence-transformers", "scikit-learn"]
+mcp = ["mcp>=2.0.0"]
+all = ["sentence-transformers", "scikit-learn", "pyperclip", "mcp>=2.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/"
+
+[tool.setuptools]
+packages = []

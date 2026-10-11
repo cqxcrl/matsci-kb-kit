@@ -1,0 +1,20 @@
+filters:
+  and:
+    - file.inFolder("wiki/entities")
+    - file.ext == "md"
+properties:
+  aliases:
+    displayName: 别名
+  summary:
+    displayName: 摘要
+  updated:
+    displayName: 更新
+views:
+  - type: table
+    name: 实体名录
+    order:
+      - file.name
+      - aliases
+      - summary
+      - file.tags
+      - updated

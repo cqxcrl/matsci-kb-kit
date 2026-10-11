@@ -1,0 +1,79 @@
+_generated_by: build/build_kit.py
+_note: 本 kit 是由源知识库过滤+去个人化生成的派生数据；真源不在此仓库。
+source_commit: cf3e366112406b83103055e0e75e6cef561c1c73
+built_at: '2026-10-11T13:21:29'
+note: 生成物请勿手改；改真源后重跑 build_kit.py。
+tools:
+- tools/journals-multidisciplinary.yaml
+- tools/kb.py
+- tools/kb_backlinks.py
+- tools/kb_build_index.py
+- tools/kb_cite.py
+- tools/kb_corpus.py
+- tools/kb_dois.py
+- tools/kb_graph.py
+- tools/kb_lib.py
+- tools/kb_lint.py
+- tools/kb_lint_deep.py
+- tools/kb_route.py
+- tools/kb_search.py
+- tools/kb_selftest.py
+- tools/kb_semantic_search.py
+- tools/kb_serve.py
+- tools/kb_stats.py
+- tools/kb_tags.py
+- tools/kb_toolcheck.py
+- tools/kb_where.py
+- tools/lit_batch.py
+- tools/lit_catalogue.py
+- tools/lit_daily.py
+- tools/lit_digest.py
+- tools/lit_discover.py
+- tools/lit_doctor.py
+- tools/lit_extract.py
+- tools/lit_fetch.py
+- tools/lit_finish.py
+- tools/lit_gapscan.py
+- tools/lit_ingest.py
+- tools/lit_journals.py
+- tools/lit_manual_import.py
+- tools/qc_base_check.py
+- tools/qc_evidence_base.py
+- tools/qc_schema_check.py
+tool_sha256:
+  tools/journals-multidisciplinary.yaml: 8d7bc999d4988e43fc662a9c79d8a1504cb1e0c5bd15ff8d9f6f745f84663050
+  tools/kb.py: bbd39c5affb8dabab1d47b1c792b5a143f87a48e1ca91b500b2f49536760d04f
+  tools/kb_backlinks.py: 41a1d9d60a403088f70f91500d4fdbf6519ceb45eaeeb338456f2b17cfd70543
+  tools/kb_build_index.py: ebbee57be66fd95c6b2eaba88aa558842950795837bcb99e3393e37151594a0f
+  tools/kb_cite.py: e0919beca8b21e7b04b2d08c9cd0a843602207bf137b8a83ecd9f89ec1c23adc
+  tools/kb_corpus.py: 45a5859d53a934ab59fcacdac9b99780fc1aee02aa7ea47d6cdc3a49184617f0
+  tools/kb_dois.py: fccde6811320762e5e4be90102d600277ed22adad2cae7eef830d0115c8b9016
+  tools/kb_graph.py: cdd0da6f3d902ba056526b8ff23ee5a78b538c90517bcd0611092767339fb8b0
+  tools/kb_lib.py: 7ce5fea89c312d3b745f5b92751aa9d847d0c03fc8d732bec10b3b6cfb582630
+  tools/kb_lint.py: da6893ba3f0ada40c1e74e8bb389ad5dd443da6e5c3cb14e0025657f457fa204
+  tools/kb_lint_deep.py: cb721c56747f0d6d589905898e5197b1988b138628c5a011bf73ab31b94d8a64
+  tools/kb_route.py: e77410f30c6f7014aa9d270ac26020fc5259974eb05bc74d22944ac39bdc14c8
+  tools/kb_search.py: f16459a2e97eaa28fe7682d7739e4601e16275f13495b756725330e8024fc7c1
+  tools/kb_selftest.py: 73549f5deb84b3ccf2801dd39edc59dc91941a46b76d5a750bc484f8fad32867
+  tools/kb_semantic_search.py: ea1ae0a590d485545e8b313ea4810b7f2a45609d983e8bae82cbfdfaa70f672c
+  tools/kb_serve.py: e3634ae998f4aedec27a220e283f7387b9539a4d1a4db4ef7c30f2b2b1270915
+  tools/kb_stats.py: f6f2f393c661a694d6c89acb8faa3e85786bd2f24054f221675193c213ae151d
+  tools/kb_tags.py: 54bb89a1beae46ba0533a7a72392c7003e672a7731358bc397e99e199038bf4d
+  tools/kb_toolcheck.py: 0427128a454e083cb6281cc5bf010c04d1f991cdbbb83a493b387be7107e523f
+  tools/kb_where.py: bf8c31fb9f300d8f38339a903227e476967eeb2fac436b79b77ac3ff965d82e9
+  tools/lit_batch.py: 22333345001877adf41695413932b136c6563f80daa97b7e448007dc7cfd57fb
+  tools/lit_catalogue.py: 5ede7cfb1cf6ab9aed1a6d7adb8099e992ff7d1fb1444d697000a08dfe549cdf
+  tools/lit_daily.py: 00378fd817fa81d3500a77da7ccc4000d4df37ba06bfa1d05efc28e09abe65d1
+  tools/lit_digest.py: 6483a775d9ba6db35b3da90acd31f628b822f0aa378f4c0e618412584104b8ce
+  tools/lit_discover.py: 5ac246739f2eedfcfeb133f559a53e2092bb40e32797b207b85588c551bea3f8
+  tools/lit_doctor.py: 618762f37fc8d2b02b4c678a3758c0ba2c24df929e8f323df48560ffda8ab6ed
+  tools/lit_extract.py: 6fb5dd7f6a6b06d589e5747d526b18916ab57ffee2ecc5ebc205221769e12954
+  tools/lit_fetch.py: 63618927b56df7b8d404ad7bfcb6586ecb164459361384726a7e08897690f69b
+  tools/lit_finish.py: a6f06012df64ba751b3a317f8376fbf7292f190131e386149e7b465e5a4f99ce
+  tools/lit_gapscan.py: 873be1daa644eb33d6a9469035d8e564f8f948cb0ab9094544f9176ad1ac7aaa
+  tools/lit_ingest.py: b8e73193bc2680ab1a6e58f6ae4cd8b65b62ede934891e32e9d2fcd565bc7951
+  tools/lit_journals.py: dbd552dc2999284e23642c13796d1e4b26fc8cbc5f97d5b0ec88972f6e80522a
+  tools/lit_manual_import.py: ccb088968395be2593b96d835c5b5b81981c0e3949d88cd6a4264649da77dae1
+  tools/qc_base_check.py: 770d4f9f472f5b69fdefce31fe422ef18f7a350a4ca66ba9e5e2b292d7afb7b4
+  tools/qc_evidence_base.py: 390be939b31025cf5a63460bd1f24c1080d3f1e8d474040da684d77318477bf7
+  tools/qc_schema_check.py: e6487612f48ac922e3bbbb20864a3c422fb1e08f569c2d52e93b2722442dcbc0
