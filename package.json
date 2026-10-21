@@ -1,0 +1,54 @@
+{
+  "name": "matsci-kb-kit",
+  "version": "0.2.0",
+  "description": "Toolbox + methodology for building an Obsidian knowledge base: retrieval, literature pipeline, QC, MCP server, and Sci-Assistant decision layer.",
+  "main": "index.js",
+  "bin": {
+    "matsci-kb": "./bin/matsci-kb.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/check-python-deps.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "obsidian",
+    "knowledge-base",
+    "research",
+    "materials-science",
+    "literature-pipeline",
+    "mcp",
+    "sci-assistant"
+  ],
+  "author": "梁公子",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cqxcrl/matsci-kb-kit.git"
+  },
+  "homepage": "https://github.com/cqxcrl/matsci-kb-kit#readme",
+  "bugs": {
+    "url": "https://github.com/cqxcrl/matsci-kb-kit/issues"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "files": [
+    "tools/",
+    "scripts/",
+    "scaffold/",
+    "skills/",
+    "docs/",
+    "mcp/",
+    "build/",
+    "bin/",
+    "CLAUDE.md",
+    "kit.yaml",
+    "README.md",
+    "LICENSE",
+    "NOTICE.md",
+    "requirements.txt",
+    "requirements-optional.txt",
+    "pyproject.toml"
+  ],
+  "dependencies": {}
+}

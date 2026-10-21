@@ -88,15 +88,75 @@
 | 需要 | 说明 |
 |---|---|
 | **Python ≥ 3.10** | 推荐 3.11+。`python --version` 确认 |
-| **pip** | 随 Python 附带 |
+| **Node.js ≥ 14**（npm 安装方式） | `node --version` 确认 |
+| **pip**（本地安装方式） | 随 Python 附带 |
 | **Obsidian**（可选但推荐） | 只是用来看 `.base` 视图；工具本身不依赖它 |
 | **Git**（可选但强烈推荐） | 你的库是纯文本，适合版本化 |
 
 > ⚠️ 本 kit 自身**不需要**放在你的库里面。它是「施工队」，你的库是「房子」。
 
-### 3.2 装依赖
+### 3.2 安装方式
+
+#### 方式一：npm 全局安装（推荐）
 
 ```bash
+npm install -g matsci-kb-kit
+```
+
+安装完成后，可以直接使用 `matsci-kb` 命令：
+
+```bash
+# 查看帮助
+matsci-kb help
+
+# 列出所有工具
+matsci-kb list
+
+# 初始化知识库
+matsci-kb kb_init ./my-vault
+
+# 检索知识库
+matsci-kb kb_search "电解液设计"
+
+# 运行 Sci-Assistant 工具
+matsci-kb sci_landscape --direction "电解液设计"
+```
+
+> 💡 npm 安装会自动检查 Python 依赖，缺失时会提示安装命令。
+
+#### 方式二：npm 本地安装
+
+在你的项目目录下：
+
+```bash
+npm install matsci-kb-kit
+```
+
+然后通过 `npx` 使用：
+
+```bash
+npx matsci-kb help
+npx matsci-kb kb_init ./my-vault
+```
+
+或在 `package.json` 的 scripts 中调用：
+
+```json
+{
+  "scripts": {
+    "kb:init": "matsci-kb kb_init ./my-vault",
+    "kb:search": "matsci-kb kb_search"
+  }
+}
+```
+
+#### 方式三：本地安装（从源码）
+
+如果你更喜欢直接管理 Python 依赖，可以克隆仓库后本地安装：
+
+```bash
+git clone https://github.com/cqxcrl/matsci-kb-kit.git
+cd matsci-kb-kit
 pip install -r requirements.txt
 ```
 
@@ -112,6 +172,14 @@ pip install -r mcp/requirements.txt        # 只有要用 MCP 才装
 缺了可选包不会崩，只会**优雅降级**（例如语义检索退回 TF-IDF）。
 
 ### 3.3 建库（一条命令）
+
+**npm 安装方式：**
+
+```bash
+matsci-kb kb_init /path/to/my-vault
+```
+
+**本地安装方式：**
 
 在 **kit 目录**下执行，`--target` 指向你想要的库位置：
 
