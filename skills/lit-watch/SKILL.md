@@ -61,7 +61,7 @@ PDF 收件箱**不在**上面：仍是 `raw/pdf/Manual Download/`。
 | A″ 勾选 | `lit_digest.py --list / --pick` | `picks/<日期>-<时分秒>-picks.json`（**全字段，零损失**） | 0/2 |
 | B 取全文 | `lit_fetch.py --in <picks> --outdir raw/pdf` | `raw/pdf/*.pdf` + `downloads/manifest-<ts>.md` | 0=至少一篇成功／**4=全部失败**／2=参数或输入不可用 |
 | B′ 收编 | `lit_manual_import.py` | 改名入库 + `downloads/手动导入报告.md` + 台账 | 0 |
-| C 提取 | `lit_batch.py --extract` | `raw/text/*.md`、`raw/assets/<slug>/fig_*.png`、台账 | 0 |
+| C 提取 | `lit_batch.py --extract` | `raw/text/<分类>/<标题>.md`（分类沿用 PDF 所在目录）、`raw/assets/<slug>/fig_*.png`、台账 | 0 |
 | D 建卡 | `lit_batch.py --ingest [--apply]` | `wiki/sources/*.md` **骨架** + `runs/gate-*.json` | 0=过／**1=写坏**／**2=缺补链** |
 | E 收尾 | `lit_finish.py --apply` | `index.md` 行、`log_ops.md`、BM25 索引 | 0/1 |
 | F 缺口 | `lit_gapscan.py --out` | `runs/gaps-<日期>.json` | 0/**1=降级**／2=写盘失败 |

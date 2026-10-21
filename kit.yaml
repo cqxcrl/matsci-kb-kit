@@ -1,7 +1,7 @@
 _generated_by: build/build_kit.py
 _note: 本 kit 是由源知识库过滤+去个人化生成的派生数据；真源不在此仓库。
-source_commit: 8ae3f6accc4356cc4f05cf5b5c220ddebe6b9d83
-built_at: '2026-10-11T13:45:57'
+source_commit: 457cb2c3e9f2dc35c6a4d9944c3b9ecd1f429344
+built_at: '2026-10-21T13:30:00'
 note: 生成物请勿手改；改真源后重跑 build_kit.py。
 tools:
 - tools/journals-multidisciplinary.yaml
@@ -41,6 +41,18 @@ tools:
 - tools/qc_base_check.py
 - tools/qc_evidence_base.py
 - tools/qc_schema_check.py
+- tools/sci_data_analysis.py
+- tools/sci_ecsa_qc.py
+- tools/sci_gap_scan.py
+- tools/sci_lab_match.py
+- tools/sci_landscape.py
+- tools/sci_method_chain.py
+- tools/sci_method_extract.py
+- tools/sci_progress.py
+- tools/sci_protocol_gen.py
+- tools/sci_reagent_import.py
+- tools/sci_review.py
+- tools/sci_topic_rec.py
 tool_sha256:
   tools/journals-multidisciplinary.yaml: 8d7bc999d4988e43fc662a9c79d8a1504cb1e0c5bd15ff8d9f6f745f84663050
   tools/kb.py: bbd39c5affb8dabab1d47b1c792b5a143f87a48e1ca91b500b2f49536760d04f
@@ -60,22 +72,34 @@ tool_sha256:
   tools/kb_serve.py: e3634ae998f4aedec27a220e283f7387b9539a4d1a4db4ef7c30f2b2b1270915
   tools/kb_stats.py: f6f2f393c661a694d6c89acb8faa3e85786bd2f24054f221675193c213ae151d
   tools/kb_tags.py: 54bb89a1beae46ba0533a7a72392c7003e672a7731358bc397e99e199038bf4d
-  tools/kb_toolcheck.py: 0427128a454e083cb6281cc5bf010c04d1f991cdbbb83a493b387be7107e523f
+  tools/kb_toolcheck.py: 036081e302e41a9f5fe34fac6d8e0cc4764e088da2fd1a470898826cde7eb852
   tools/kb_where.py: bf8c31fb9f300d8f38339a903227e476967eeb2fac436b79b77ac3ff965d82e9
-  tools/lit_batch.py: 22333345001877adf41695413932b136c6563f80daa97b7e448007dc7cfd57fb
-  tools/lit_catalogue.py: 5ede7cfb1cf6ab9aed1a6d7adb8099e992ff7d1fb1444d697000a08dfe549cdf
-  tools/lit_daily.py: 00378fd817fa81d3500a77da7ccc4000d4df37ba06bfa1d05efc28e09abe65d1
-  tools/lit_digest.py: 6483a775d9ba6db35b3da90acd31f628b822f0aa378f4c0e618412584104b8ce
-  tools/lit_discover.py: 24cec1a24ca1699829fdfc784d3555758d5873279513429c38c661e6bcb954b4
-  tools/lit_doctor.py: 618762f37fc8d2b02b4c678a3758c0ba2c24df929e8f323df48560ffda8ab6ed
-  tools/lit_extract.py: 6fb5dd7f6a6b06d589e5747d526b18916ab57ffee2ecc5ebc205221769e12954
+  tools/lit_batch.py: 90b13ba0205cd02fc824a9dc30a1be2cefca08ca164d8ea1ed3f91662f7312af
+  tools/lit_catalogue.py: acd42bbc5577913c9b76c8f7d19810f78a28a7c5ef912f9e6e6e95a7d97529b3
+  tools/lit_daily.py: 4968cc8c914f37deb1bc19b55d89eb9eae086e2c6107a71deb29667425806286
+  tools/lit_digest.py: 70911629cc1df8116f96e5a73a3fbe37f22445c2032458e4c7836b05902746cd
+  tools/lit_discover.py: b1e4a6a0acced8196a1d32ae9d27ff67eb5d526f6d87e11b029b6dde4660ea60
+  tools/lit_doctor.py: 1c2c960a11cc31a688b0984af9f26ec5bd137014e158bee59eb45442ea394ff9
+  tools/lit_extract.py: db8d1f5cb2e7bb93681c12a7708ca2e47cac85c916231b905361dd1cb054bd75
   tools/lit_fetch.py: 63618927b56df7b8d404ad7bfcb6586ecb164459361384726a7e08897690f69b
   tools/lit_finish.py: a6f06012df64ba751b3a317f8376fbf7292f190131e386149e7b465e5a4f99ce
   tools/lit_gapscan.py: 873be1daa644eb33d6a9469035d8e564f8f948cb0ab9094544f9176ad1ac7aaa
-  tools/lit_ingest.py: b8e73193bc2680ab1a6e58f6ae4cd8b65b62ede934891e32e9d2fcd565bc7951
+  tools/lit_ingest.py: 1e9eddd6e30aa5af44ae2a770edc3b4c4d42eea20ab8a4af9b65fdc8104b0a8b
   tools/lit_journals.py: dbd552dc2999284e23642c13796d1e4b26fc8cbc5f97d5b0ec88972f6e80522a
   tools/lit_manual_import.py: ccb088968395be2593b96d835c5b5b81981c0e3949d88cd6a4264649da77dae1
   tools/lit_report.py: 99b6d7e7496c7963522077271ce87048c69d0fb221628d542d9ac268de813306
   tools/qc_base_check.py: 770d4f9f472f5b69fdefce31fe422ef18f7a350a4ca66ba9e5e2b292d7afb7b4
   tools/qc_evidence_base.py: 390be939b31025cf5a63460bd1f24c1080d3f1e8d474040da684d77318477bf7
   tools/qc_schema_check.py: e6487612f48ac922e3bbbb20864a3c422fb1e08f569c2d52e93b2722442dcbc0
+  tools/sci_data_analysis.py: 3240355c87bcafd5754d4587f4ec996e1249694feb6712de21bbc3a2c146289b
+  tools/sci_ecsa_qc.py: 4218c00faea4c84a507014d1eb08ff63fec2b3918bb382fd7a8c3aee0c6fe85c
+  tools/sci_gap_scan.py: 2aeefd4132e3e5745216eb453a2b0d735ce92909cf800f117d3be6ddf7ab6411
+  tools/sci_lab_match.py: 65a8543588e10266d6329b1114c507794815da2d5a0bac589b12609224be1f39
+  tools/sci_landscape.py: ef6ee1c859f5a0ee73a53674cc0a56df5c7069092f7667e66bfb41063385fe54
+  tools/sci_method_chain.py: dceab06f2cb7e44f6c5f30314a88293b6ca702d3873ee1ca8b0fd3c668b71737
+  tools/sci_method_extract.py: 312882464ab2d4c55f4f52f8b59bb6cccb14aa4f4261644eedff055b26304763
+  tools/sci_progress.py: 393844618473b25f2d2f5e08b13cfd373fa834e175b328eb6840328ca62ff1be
+  tools/sci_protocol_gen.py: 87a003597c1348d56c893b8edcdc875484d786b58d9c494b228dd3a2dcd5a5f2
+  tools/sci_reagent_import.py: a35070f83dc337c705e5c0a5e4552fb0f74a7aa700001dcafae328562e094715
+  tools/sci_review.py: 8733379f29d2b956e94655d24f272f3b79787611550ccc11d4533a9c03376fb5
+  tools/sci_topic_rec.py: cc63ea46d0adcdae7cc16c60b6bce972c46c68d197eacd3cbac4f36b05992b87

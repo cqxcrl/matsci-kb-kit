@@ -18,12 +18,22 @@ journals:
   # - {issn_l: "1476-1122", name: "Nature Materials", tier: T1}
   # - {issn_l: "2050-7488", name: "J. Mater. Chem. A", tier: T2}
 
+# 阶段A 的**每刊**相关度阈值取本表 relevance_min（越顶的刊越低）；缺 tier 的刊取 default_tier。
+# ingest_depth：enhanced = 增强精读；standard = 标准精读；light = 轻精读。
+# uncapped: true = 该档文献**不被 --limit 截断**（顶刊优先，宁可多不能漏）。
+#
+# 🔴 阈值必须相对 relevance() 的**评分下限**（SCORE_FLOOR，正值最低 0.70）来设：
+#    能走到复筛的候选都已通过关键词筛选，其分数必然 ≥ 下限 ⇒ 任何 ≤ 0.70 的阈值
+#    都**永远无物可滤**，五档行为完全相同（分级形同虚设）。
+#    故 T0/T1 保持宽松（召回优先，靠 uncapped + 增强精读兜底）；
+#    T2/T3/T4 抬到下限**之上**，才能真正按关键词命中强度区分。
+#    ⚠️ 调本表前先读 `lit_discover.relevance()` 的评分下限，否则又是空转。
 tiers:
   T0: {label: "正刊/权威综述/旗舰", relevance_min: 0.40, ingest_depth: enhanced, uncapped: true}
   T1: {label: "大子刊/顶刊子刊",   relevance_min: 0.45, ingest_depth: enhanced, uncapped: true}
-  T2: {label: "领域一区 top",      relevance_min: 0.55, ingest_depth: standard}
-  T3: {label: "普通一区",          relevance_min: 0.60, ingest_depth: standard}
-  T4: {label: "二区/专业刊",       relevance_min: 0.70, ingest_depth: light}
+  T2: {label: "领域一区 top",      relevance_min: 0.80, ingest_depth: standard}
+  T3: {label: "普通一区",          relevance_min: 0.90, ingest_depth: standard}
+  T4: {label: "二区/专业刊",       relevance_min: 0.95, ingest_depth: light}
 default_tier: T3
 
 # ---------------------------------------------------------------- 2. 路径（一律相对库根）
@@ -47,6 +57,8 @@ defaults:
   max_candidates: 20
   abstract_min_relevance: 0.6
   institution_proxy: true
+  lower_tier_floor_factor: 0.5   # 截断时非 uncapped 档的**名额下限系数**（低档至少占 limit 的此比例）；
+                                 # 0 = 恢复旧行为（T0/T1 满额时低档可被挤成 0 篇）
 
 # ---------------------------------------------------------------- 4. 数据源
 # mailto 填你的真实邮箱可进 OpenAlex 礼貌池（更快、更少 429）；留空走公共池。

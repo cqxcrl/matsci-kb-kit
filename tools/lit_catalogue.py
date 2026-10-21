@@ -72,6 +72,21 @@ DEFAULT_PDF_SOURCES = {}   # 由 lit_config.yaml: dedup_sources 提供；不内�
 # Zotero 数据目录兜底（真实数据由 lit_config.yaml: zotero.data_dir 提供）
 DEFAULT_ZOTERO_DIR = ""
 
+# 🔴 scope='kb' 去重源的**默认排除前缀**（**相对该源 root**；kb 源默认 root=`raw`，
+#    故这里是 `notes/lit-watch`）：该子树是 lit-watch 的**流水线运行产物**
+#    （candidate JSON、`manifest_*.md` 失败清单、`digest.md`、`latest-digest.md`、
+#    `_backlog_forensics_*.md`）——**不是论文全文**，其首页带着**别篇**论文的 DOI。
+#    若不排除，扫描会把"某篇在失败清单里出现过的论文"当成**库内已有** ⇒ 去重集被污染
+#    ⇒ 用户手工下载该篇时被判「已在库」而**跳过**（2026-10-12 实证漏 1 篇：
+#    `local_lit_catalogue.json` 出现 `{doi: 10.1021/jacs.6c10604, title: manifest-…}`）。
+#
+#    ⚠️ 只排 `lit-watch` 子目录，**不排整个 `raw/notes`，更不排 `raw/clippings`**：
+#      · `raw/clippings/` 是**真实文献剪藏**（多数已有 source 卡），排除它会一次丢掉
+#        ~151 条**真·库内文献** ⇒ 反而造成重复下载（2026-10-12 实测评据）。
+#      · `raw/notes/ingest-*.md` 亦对应已入库文献，留着无害。
+#    用户可在 dedup_sources 的某源上用 `exclude: [...]` 覆盖本默认（传 `exclude: []` 关闭）。
+KB_DEFAULT_EXCLUDES = ("notes/lit-watch",)
+
 FIELD_WHERE = {"DOI", "TITLE", "URL"}
 
 # 扫描缓存：结构一变就 +1，旧缓存自动作废（宁可全量重扫，不可读错结构）
@@ -128,11 +143,18 @@ def resolve_existing_catalogue():
 
 
 def dedup_sources():
-    """返回去重源清单 [(id, abs_path, scope)]。
+    """返回去重源清单 [(id, abs_path, scope, excludes)]。
 
     scope='kb'   → 知识库自身：递归 raw 全树的 *.md（首页 DOI）与 *.pdf
+                   （但**跳过** excludes 里的前缀，默认见 KB_DEFAULT_EXCLUDES：
+                    流水线产物 raw/notes、剪藏 raw/clippings —— 其首页 DOI 属别篇论文）
     scope='pdfs' → 普通文献目录：递归 *.pdf
     路径相对库根（库内）或绝对（库外），由 kb_lib.VAULT 判定。
+
+    excludes：每个源可选 `exclude: [子路径, ...]`（相对该源 root 的 POSIX 前缀）。
+    · 未写 `exclude` 键 ⇒ 该源用 KB_DEFAULT_EXCLUDES（仅对 scope='kb' 生效）。
+    · 写 `exclude: []` ⇒ 完全关闭排除。
+    · 写其它列表 ⇒ 覆盖默认。非 kb 源默认不排除（pdfs 目录不会被产物污染）。
 
     🔴 配置**唯一权威**：`dedup_sources` 段缺失/为空时才回退内置默认值，且**不静默**——
     兜底的库外目录写死在 E: 盘，与配置文件里的清单**可能不一致**
@@ -157,14 +179,44 @@ def dedup_sources():
         p = p.replace("\\", "/")
         if not os.path.isabs(p):
             p = os.path.join(K.VAULT, *p.split("/"))
-        out.append((s.get("id") or "?", p, s.get("scope") or "pdfs"))
+        scope = s.get("scope") or "pdfs"
+        if "exclude" in s:
+            raw_ex = s.get("exclude") or []
+        elif scope == "kb":
+            raw_ex = list(KB_DEFAULT_EXCLUDES)
+        else:
+            raw_ex = []
+        excludes = tuple(norm_rel_exclude(e) for e in raw_ex if str(e).strip())
+        out.append((s.get("id") or "?", p, scope, excludes))
     if fell_back:
         print("[warn] lit_config.yaml 的 dedup_sources 段缺失/为空 ⇒ 本次走**硬编码兜底**，"
               "去重集可能与配置不一致：")
-        for sid, p, sc in out:
+        for sid, p, sc, _ex in out:
             print(f"         · {sid} ({sc}) = {p}")
         print("       修 lit_config.yaml 的 dedup_sources 段即可消除本告警。")
     return out
+
+
+def norm_rel_exclude(p):
+    """把排除前缀归一为 POSIX 相对路径，去掉首尾斜杠、反斜杠、`./`。"""
+    q = str(p).replace("\\", "/").strip()
+    while q.startswith("./"):
+        q = q[2:]
+    return q.strip("/")
+
+
+def _is_excluded(dp, root, excludes):
+    """dp 是 os.walk 的当前目录（绝对），root 是源根（绝对）。
+    返回 True 表示该目录应被剪枝（其下所有文件都不进去重集）。"""
+    if not excludes:
+        return False
+    rel = os.path.relpath(dp, root).replace("\\", "/")
+    if rel == ".":
+        return False
+    for ex in excludes:
+        if rel == ex or rel.startswith(ex + "/"):
+            return True
+    return False
 
 
 def zotero_dir():
@@ -501,20 +553,29 @@ def build_catalogue(cache=None, force_rescan=False):
     # 1) 本机去重源（由 lit_config.dedup_sources 给出，含知识库自身）
     #    scope='kb'   → 递归 raw 全树的 *.md（首页 DOI）+ *.pdf
     #    scope='pdfs' → 普通文献目录：递归 *.pdf（权威 DOI 取 PDF 首页）
-    for sid, root, scope in dedup_sources():
+    for sid, root, scope, excludes in dedup_sources():
         if not os.path.isdir(root):
             # 🔴 旧版静默 `continue`：去重源掉线（外置盘未挂载/目录改名）时目录条目会
             #    大幅变小，而脚本看起来"跑成功了"——下次 lit-watch 就会重复下载。
             print(f"[warn] 去重源不可用：{sid} {root}（已跳过，去重集会变小）")
             degrade(sid, root, scope, "目录不存在（外置盘未挂载/改名？）")
             continue
+        # 用 excludes 剪枝：剪掉的子树不进 os.walk（既快又不会被产物 DOI 污染）。
+        def _prune(dp):
+            if _is_excluded(dp, root, excludes):
+                return False
+            return True
         if scope == "kb":
             # 1a) 全文 md：取**首页块**的论文自身 DOI（避免抓文末参考文献）
             #     ⚠️ 排除 `_park/`（下载清单/批次笔记等非论文，其首页含多个 DOI 会污染目录）
             #     ⚠️ 2026-10-11：`raw/_park` 已解散，故本排除**当前是惰性的**（无物可排）。
             #        保留为防御；隔离件现在住在 `_archive/`，而本函数只走 `raw/` 及其它配置源，
             #        本就不会扫到归档层。
+            #     ⚠️ 2026-10-12：再加 excludes 剪枝（默认 raw/notes、raw/clippings）——见
+            #        KB_DEFAULT_EXCLUDES，堵住"lit-watch 产物里的 DOI 被当成库内文献"的洞。
             for dp, _, fns in os.walk(root):
+                if not _prune(dp):
+                    continue
                 if f"{os.sep}_park" in dp:
                     continue
                 for fn in fns:
@@ -530,6 +591,8 @@ def build_catalogue(cache=None, force_rescan=False):
                         add(key, doi, stem, p, sid, today)
             # 1b) 原件 pdf：取 PDF 首页 DOI（无则标题键）
             for dp, _, fns in os.walk(root):
+                if not _prune(dp):
+                    continue
                 for fn in fns:
                     if not fn.lower().endswith(".pdf"):
                         continue
@@ -540,6 +603,8 @@ def build_catalogue(cache=None, force_rescan=False):
                         add(key, doi, Path(fn).stem, p, sid, today)
         else:
             for dp, _, fns in os.walk(root):
+                if not _prune(dp):
+                    continue
                 for fn in fns:
                     if not fn.lower().endswith(".pdf"):
                         continue
@@ -836,6 +901,43 @@ def run_selftest():
                 scan_cache_path().replace("\\", "/").endswith("raw/notes/lit-watch/state/"
                                                               "catalogue_scan_cache.json"),
                 f"-> {scan_cache_path()}")
+            # excludes：scope='kb' 默认带 KB_DEFAULT_EXCLUDES（堵产物 DOI 污染）；
+            # pdfs 源默认不带。回归夹具对应 2026-10-12 的"manifest DOI 被当库内文献"事故。
+            chk("kb 源默认排除 notes/lit-watch（相对源根）",
+                set(kb[0][3]) == set(KB_DEFAULT_EXCLUDES), f"-> {kb[0][3]}")
+            chk("pdfs 源默认不排除", srcs[1][3] == (), f"-> {srcs[1][3]}")
+
+        # 显式 exclude 覆盖：传 [] 关闭，传自定义列表覆盖默认
+        fake_ex = {"paths": fake["paths"], "zotero": {},
+                   "dedup_sources": [{"id": "kb_raw", "path": "raw", "scope": "kb",
+                                      "exclude": []}]}
+        with mock.patch.object(K, "VAULT", tmpv), \
+                mock.patch.object(K, "load_lit_config", side_effect=lambda *a, **k: fake_ex):
+            s0 = dedup_sources()[0]
+            chk("exclude: [] 关闭默认排除", s0[3] == (), f"-> {s0[3]}")
+        fake_ex2 = {"paths": fake["paths"], "zotero": {},
+                    "dedup_sources": [{"id": "kb_raw", "path": "raw", "scope": "kb",
+                                       "exclude": ["notes/lit-watch"]}]}
+        with mock.patch.object(K, "VAULT", tmpv), \
+                mock.patch.object(K, "load_lit_config", side_effect=lambda *a, **k: fake_ex2):
+            s0 = dedup_sources()[0]
+            chk("自定义 exclude 覆盖默认", s0[3] == ("notes/lit-watch",), f"-> {s0[3]}")
+
+        # ---- 剪枝纯函数（正反例）----
+        base = os.path.join(tmpv, "raw")
+        chk("_is_excluded 命中 notes/lit-watch 子树",
+            _is_excluded(os.path.join(base, "notes", "lit-watch", "daily"), base,
+                         ("notes/lit-watch",)))
+        chk("_is_excluded 命中 notes/lit-watch 本身",
+            _is_excluded(os.path.join(base, "notes", "lit-watch"), base, ("notes/lit-watch",)))
+        chk("反例 _is_excluded 不误伤 text",
+            not _is_excluded(os.path.join(base, "text", "01-电池与电解液"), base,
+                             ("notes/lit-watch",)))
+        chk("反例 _is_excluded 不误伤 raw/clippings（真文献剪藏）",
+            not _is_excluded(os.path.join(base, "clippings"), base, ("notes/lit-watch",)))
+        chk("反例 _is_excluded 前缀不越界（notes 不算 notes/lit-watch）",
+            not _is_excluded(os.path.join(base, "notes"), base, ("notes/lit-watch",)))
+        chk("_is_excluded 源根自身不排除", not _is_excluded(base, base, ("notes/lit-watch",)))
 
         # 配置里 dedup_sources 段缺失 ⇒ 允许兜底，但必须是 raw（不是 `.`）且打印实际路径
         fake_nb = {"paths": fake["paths"], "dedup_sources": [], "zotero": {}}
@@ -989,7 +1091,7 @@ def run_selftest():
         me = sys.modules[__name__]
         ghost = os.path.join(tmpv, "不存在的外置盘")
         with mock.patch.object(me, "dedup_sources",
-                               return_value=[("ghost", ghost, "pdfs")]), \
+                               return_value=[("ghost", ghost, "pdfs", ())]), \
                 mock.patch.object(me, "zotero_meta", return_value=({}, "locked")), \
                 mock.patch.object(me, "zotero_storage",
                                   return_value=os.path.join(tmpv, "nostorage")):
@@ -1090,7 +1192,7 @@ def main():
           f"  Zotero 元数据 {stats['zotero_hits']}hit/{stats['zotero_misses']}miss"
           f"  状态={zstatus}")
     print(f"总条目(合并后): {len(entries)}  含完整DOI: {n_doi}  一稿多载体: {n_multi}  累计载体: {n_files}")
-    sc = ", ".join(f"{s[0]}({s[2]})" for s in dedup_sources())
+    sc = ", ".join(f"{s[0]}({s[2]})" for s in dedup_sources())  # 兼容：4 元组仍可按索引取
     print(f"扫描源: {sc}  + zotero({zotero_dir()})")
 
     if degraded:

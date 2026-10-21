@@ -583,17 +583,13 @@ def relevance(title, abstract, kw_tokens):
 def relevance_ok(rel, rel_min):
     """相关度是否过该刊阈值（纯函数，便于 selftest 不联网钉住分级语义）。
 
-    🔴 **分级阈值当前对选择没有任何影响**（2026-10-10 用真实数据实测，非推测）：
-    取当天 4 个方向的 **166 篇候选**统计 `relevance` 取值，只有 4 个值——
-    0.70(66) ／ 0.769(2) ／ 0.900(94) ／ 0.923(4)；而 `SCORE_FLOOR = 0.70`。
-    逐 tier 判定「会被滤掉几篇」：**T0 0 篇、T1 0 篇、T2 0 篇、T3 0 篇、T4 0 篇**；
-    两两对比（T0 vs T4 等）判定不同的论文均为 **0 篇**。
-    ⇒ 不是"几乎不产生区分"，而是**完全不产生区分**：五个档位行为完全相同。
-
-    根因是结构性的：能走到这一步的候选**已经通过了关键词筛选**，其分数必然 ≥ 下限，
-    而 0.40–0.70 的阈值全都 ≤ 下限 ⇒ 永远无物可滤。
-    **未擅自下调 depth 权重**（那会改变真实召回，须先由上层拍板）；
-    改为由 `inert_tiers()` 在每轮运行时**把这个事实报出来**，避免"分级在起作用"的错觉。
+    🔴 历史（2026-10-10 实测，已由 2026-10-12 的 B 修复）：
+    当时阈值表是 T0@0.40 / T1@0.45 / T2@0.55 / T3@0.60 / T4@0.70，**全部 ≤ `SCORE_FLOOR=0.70`**
+    （评分下限），而候选分数必然 ≥ 下限（它们已过关键词筛选）⇒ 五档"完全不产生区分"。
+    2026-10-12（B）把 T2/T3/T4 抬到下限**之上**（0.80/0.90/0.95），分级在复筛层**真正生效**；
+    T0/T1 仍保持宽松（召回优先）。`inert_tiers()` 会在运行时报出**仍**无物可滤的档
+    （现仅 T0/T1），避免"分级在起作用"的错觉。
+    ⚠️ 改阈值前先读 `relevance()` 的评分下限——阈值必须相对**下限**设，否则又是空转。
     """
     try:
         return float(rel) >= float(rel_min)
@@ -770,13 +766,37 @@ def order_by_relevance(items):
     return sorted(items, key=lambda x: -float(x.get("relevance") or 0.0))
 
 
+def _lower_tier_floor_factor(config):
+    """非 uncapped 档的**名额下限系数**（低档至少占 limit 的这个比例）。
+
+    缺省 0.5；设 0 恢复旧行为（低档可被顶刊挤成 0）；越界值夹到 [0,1]。
+    """
+    try:
+        v = float((config.get("defaults") or {}).get("lower_tier_floor_factor", 0.5))
+    except (TypeError, ValueError):
+        v = 0.5
+    return max(0.0, min(1.0, v))
+
+
 def rank_and_truncate(out, config, limit):
     """排序 + 分级截断（纯函数，便于 selftest 不联网钉住规则）。
 
-    截断规则（2026-10-06 分级）：T0/T1 为 uncapped（顶刊宁可多不能漏，全保留），
-    其余按**相关度**填满到 limit；旧行为是无差别 `out[:limit]`，会用低档高产刊
-    把顶刊挤掉。
     返回的展示顺序：先按档位（T0 在前），再相关度降序、新文献优先。
+
+    🔴 2026-10-12 修订（此前的规则会把 digest 压成"只有 T0/T1"）：
+      旧规则 `rest[:max(0, limit - len(top))]`：T0/T1 uncapped 全保留，而低档只填
+      `limit - len(top)` 个。当 T0/T1 篇数 ≥ limit（实测 materials 方向 T0+T1=135 > limit=15），
+      `limit - len(top)` 为负 ⇒ **T2/T3/T4 一篇不剩**，digest 100% 是 T0/T1，
+      于是"看起来期刊范围极窄（全是 JACS/Angew）"——实为**呈现层被顶刊挤没**，
+      低档命中（Sci.Rep./ACS Catal./Adv. Funct. Mater.…）明明存在却一个不出现。
+
+      新规则：给非 uncapped 档保一个**名额下限**，同时**不牺牲 T0/T1 的 uncapped**——
+        · floor = min(n_lower, int(max(limit, len(top)) * factor))  # 低档至少留 floor 篇
+          但不超低档实际篇数（低档只有 1 篇时不凭空造名额）
+        · rest_keep = rest[: max(limit - len(top), floor)]          # ≥ floor，且顶刊少时补足到 limit
+        · kept = **全部 top** + rest_keep                            # 顶刊一篇不砍（uncapped 不变）
+      效果：T0/T1 仍全保留；低档**至少露脸 floor 篇**、顶刊不足时还回填到 limit，不再被挤成 0。
+      factor 由 `defaults.lower_tier_floor_factor` 配置（设 0 恢复旧行为）。
     """
     ranked = order_by_relevance(out)
     # 🔴 旧实现 `top = [...]; rest = [c for c in ranked if c not in top]`：
@@ -792,8 +812,14 @@ def rank_and_truncate(out, config, limit):
         if spec is None:
             spec = spec_cache[tier] = tier_spec(config, tier)
         (top if spec["uncapped"] else rest).append(c)
-    rest = rest[:max(0, limit - len(top))]
-    kept = order_by_relevance(top + rest)
+    top = order_by_relevance(top)      # 顶刊也按相关度降序
+    rest = order_by_relevance(rest)
+
+    factor = _lower_tier_floor_factor(config)
+    n_lower = len(rest)
+    floor = min(n_lower, int(max(limit, len(top)) * factor))
+    rest_keep = rest[:max(limit - len(top), floor)]
+    kept = top + rest_keep             # top 全保留：uncapped 语义不变
     return sorted(kept, key=lambda x: tier_rank(x.get("journal_tier", "T3")))
 
 
@@ -1163,9 +1189,9 @@ def selftest():
                    "ingest_depth": "enhanced", "uncapped": True},
             "T1": {"label": "子刊", "relevance_min": 0.45,
                    "ingest_depth": "enhanced", "uncapped": True},
-            "T2": {"label": "一区", "relevance_min": 0.55, "ingest_depth": "standard"},
-            "T3": {"label": "普通一区", "relevance_min": 0.60, "ingest_depth": "standard"},
-            "T4": {"label": "二区", "relevance_min": 0.70, "ingest_depth": "light"},
+            "T2": {"label": "一区", "relevance_min": 0.80, "ingest_depth": "standard"},
+            "T3": {"label": "普通一区", "relevance_min": 0.90, "ingest_depth": "standard"},
+            "T4": {"label": "二区", "relevance_min": 0.95, "ingest_depth": "light"},
         },
         "default_tier": "T3",
         "defaults": {"lookback_days": 7, "max_candidates": 20,
@@ -1207,7 +1233,7 @@ def selftest():
     good = (relevance_ok(weak, tier_spec(cfg, "T0")["relevance_min"])
             and not relevance_ok(weak, tier_spec(cfg, "T4")["relevance_min"]))
     print(f"  [{'ok' if good else 'FAIL'}] 弱命中 rel=0.50：T0 存活 / T4 被滤"
-          f"（**纯函数语义**；注意真实候选拿不到 0.50 这么低的分数）")
+          f"（**纯函数语义**；真实候选低于 0.70 不会进入）")
     ok = ok and good
     good = relevance_ok(0.70, 0.70) and not relevance_ok(0.6999, 0.70)
     print(f"  [{'ok' if good else 'FAIL'}] 阈值边界：等于阈值算过、略低算不过")
@@ -1217,9 +1243,14 @@ def selftest():
     # 实测事实：真实候选分数下限 SCORE_FLOOR=0.70，而全部五档阈值都 ≤ 0.70
     # ⇒ 五档一律无物可滤，T0 与 T4 行为完全相同。这条夹具钉住该判定，
     # 一旦将来下调 depth 权重（下限跌破阈值），断言会 FAIL，提醒"分级开始起作用了、去更新文档"。
+    # 2026-10-12（B）后：T2/T3/T4 阈值抬到 SCORE_FLOOR 之上 ⇒ 只有 T0/T1 仍 inert。
     inert = dict(inert_tiers(cfg))
-    good = set(inert) == {"T0", "T1", "T2", "T3", "T4"}
-    print(f"  [{'ok' if good else 'FAIL'}] inert_tiers 认定五档当前均无物可滤 -> {inert}")
+    good = set(inert) == {"T0", "T1"}
+    print(f"  [{'ok' if good else 'FAIL'}] inert_tiers 判定：仅 T0/T1 无物可滤（B 后）-> {inert}")
+    ok = ok and good
+    # 正向：T2/T3/T4 阈值已 > SCORE_FLOOR ⇒ 不 inert（分级真正生效）
+    good = all(t not in inert for t in ("T2", "T3", "T4"))
+    print(f"  [{'ok' if good else 'FAIL'}] 正向：T2/T3/T4 阈值 > 评分下限 ⇒ 分级生效")
     ok = ok and good
     good = SCORE_FLOOR == 0.70
     print(f"  [{'ok' if good else 'FAIL'}] SCORE_FLOOR 与 relevance() 的 depth 下限一致"
@@ -1274,6 +1305,39 @@ def selftest():
     kept3 = rank_and_truncate(t0, cfg, 1)
     good = len(kept3) == 3
     print(f"  [{'ok' if good else 'FAIL'}] T0 uncapped：limit=1 仍保留全部 3 篇 -> {len(kept3)}")
+    ok = ok and good
+
+    # ---- 2026-10-12 名额下限（A：低档不再被顶刊挤成 0）----
+    # 复现缺陷：T0/T1 篇数 ≥ limit ⇒ 旧规则 rest[:limit-len(top)] 为负 ⇒ 低档 0 篇。
+    many_top = [{"title": f"top{i}", "relevance": 0.9, "publication_date": "2026-09-01",
+                 "journal_tier": "T0"} for i in range(20)]
+    lows = [{"title": f"low{i}", "relevance": 0.8 - i / 100, "publication_date": "2026-09-01",
+             "journal_tier": "T3"} for i in range(20)]
+    keptA = rank_and_truncate([dict(c) for c in many_top + lows], cfg, 10)
+    n_low = sum(1 for c in keptA if c["journal_tier"] == "T3")
+    n_top = sum(1 for c in keptA if c["journal_tier"] == "T0")
+    good = n_low >= 5                                    # floor = 0.5*max(10,20) = 10 ... 见下
+    print(f"  [{'ok' if good else 'FAIL'}] A: T0/T1 满额时低档仍露脸 -> T3={n_low} T0={n_top} "
+          f"(共 {len(keptA)})")
+    ok = ok and good
+    good = n_top == 20                                   # 顶刊 uncapped 仍全保留
+    print(f"  [{'ok' if good else 'FAIL'}] A: 顶刊 uncapped 20 篇全保留 -> {n_top}")
+    ok = ok and good
+    good = len(keptA) == 20 + min(20, int(max(10, 20) * 0.5))   # top20 全留 + 低档 floor10
+    print(f"  [{'ok' if good else 'FAIL'}] A: 总数 = 顶刊20(uncapped 全留) + 低档下限10 = 30 -> {len(keptA)}")
+    ok = ok and good
+    # 反例：低档只有 1 篇 ⇒ 名额下限不超过实际篇数，不凭空造
+    keptB = rank_and_truncate([dict(c) for c in many_top] + [lows[0]], cfg, 10)
+    n_low_b = sum(1 for c in keptB if c["journal_tier"] == "T3")
+    good = n_low_b == 1
+    print(f"  [{'ok' if good else 'FAIL'}] A 反例：低档仅 1 篇不给超量名额 -> T3={n_low_b}")
+    ok = ok and good
+    # 反例：factor=0 ⇒ 恢复旧行为（低档被挤成 0）
+    cfg0 = {**cfg, "defaults": {**cfg.get("defaults", {}), "lower_tier_floor_factor": 0}}
+    keptC = rank_and_truncate([dict(c) for c in many_top + lows], cfg0, 10)
+    n_low_c = sum(1 for c in keptC if c["journal_tier"] == "T3")
+    good = n_low_c == 0
+    print(f"  [{'ok' if good else 'FAIL'}] A 反例：factor=0 恢复旧行为（低档=0）-> T3={n_low_c}")
     ok = ok and good
 
     print("=== selftest", "PASS ===" if ok else "FAIL ===")

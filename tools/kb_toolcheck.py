@@ -211,9 +211,14 @@ def _now_ns():
 
 
 def _run(args, cwd=VAULT):
+    # 🔴 子进程强制 utf-8：本机 Python 默认按 GBK 编码 stdout，若被检查脚本的
+    #    selftest/--help 输出含 ⊂/⇒ 等非 GBK 字符，会抛 UnicodeEncodeError，
+    #    被误判为「工具损坏」（kb_build_index / qc_unwrap_author_links 曾各中一次）。
+    #    PYTHONIOENCODING 经 env 透传，且对脚本内部 subprocess 调用亦生效。
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     try:
         r = subprocess.run(args, capture_output=True, timeout=TIMEOUT, text=True,
-                           encoding="utf-8", errors="replace", cwd=cwd)
+                           encoding="utf-8", errors="replace", cwd=cwd, env=env)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except subprocess.TimeoutExpired:
         return None, "TIMEOUT"

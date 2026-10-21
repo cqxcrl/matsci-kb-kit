@@ -415,6 +415,73 @@ def resolve_page_collision(src_dir, page, new_doi, quiet=False):
     return f"{base}-{n}", False
 
 
+# ---------------------------------------------------------------- 同源去重闸门（2026-10-11）
+# 🔴 由来（真实事故）：2026-10-11 的「历史积压清理」批次重新建卡，与库内**既有页**
+#    产生 9 对同 DOI 重复页。旧逻辑只做「页名碰撞」检测（resolve_page_collision），
+#    对「**不同页名、同一篇文献**」完全无感——因为批次新提取件的 raw 回链指向
+#    `raw/text/`，而旧页指向 `raw/clippings`/`raw/pdf`，`existing_raw` 集合对不上，
+#    于是同一篇文献被建了第二张卡。因此必须在**建卡前**用 DOI（+归一标题）与库内
+#    全部 source 页比对，命中即跳过。
+
+def norm_title(s):
+    """标题归一：去括号补充语、只留字母数字与汉字，长度 <10 视为不可用（返回 ""）。"""
+    t = re.sub(r"[（(].*?[)）]", "", s or "")
+    t = re.sub(r"[^a-z0-9一-鿿]+", "", t.lower())
+    return t if len(t) >= 10 else ""
+
+
+def build_existing_index(src_dir):
+    """扫描库内**全部** source 页，建 {归一DOI: 页名} 与 {归一标题: 页名} 两张表。
+
+    用于建卡前判重：同 DOI 已在库（无论页名是否相同）⇒ 不得再建第二张卡。
+    标题表仅用于**软告警**（两篇不同文献可能有相近标题，不能据此跳过）。
+    读不动的页静默跳过（元数据坏页由 kb_lint 归口，这里不重复报错）。
+    """
+    by_doi, by_title = {}, {}
+    if not src_dir or not os.path.isdir(src_dir):
+        return by_doi, by_title
+    for f in sorted(os.listdir(src_dir)):
+        if not f.endswith(".md"):
+            continue
+        name = f[:-3]
+        try:
+            fmr, body = K.split_frontmatter(K.read_text(os.path.join(src_dir, f)))
+            fm = K.parse_frontmatter(fmr)
+        except Exception:                          # noqa: BLE001
+            continue
+        d = K.norm_doi(fm.get("doi"))
+        if d:
+            by_doi.setdefault(d, name)
+        m = re.search(r"^#\s+(.+)$", body or "", re.M)
+        title = m.group(1) if m else ""
+        if not title:
+            al = fm.get("aliases") or []
+            title = str(al[0]) if al else ""
+        nt = norm_title(title)
+        if nt:
+            by_title.setdefault(nt, name)
+    return by_doi, by_title
+
+
+def find_duplicate(doi, title, by_doi, by_title, self_page):
+    """判新卡是否与库内既有页同源。返回 (kind, other_page)：'doi'/'title'/None。
+
+    · DOI 命中且命中页不是自己 ⇒ ('doi', 既有页) —— **硬命中，调用方应跳过**
+    · 仅标题命中（无 DOI） ⇒ ('title', 既有页) —— **软命中，仅告警，不跳过**
+    """
+    d = K.norm_doi(doi)
+    if d:
+        hit = by_doi.get(d)
+        if hit and hit != self_page:
+            return "doi", hit
+    nt = norm_title(title)
+    if nt:
+        hit = by_title.get(nt)
+        if hit and hit != self_page:
+            return "title", hit
+    return None, None
+
+
 def build_card(meta, raw_rel, cfg=None, tier=None):
     """生成 source 页内容（骨架）。返回 (frontmatter_dict, page_name, body_text, notes)。
 
@@ -908,6 +975,60 @@ def selftest():
     print(f"  [{'ok' if c5 else 'FAIL'}] 出站链接口径（页面算、raw 不算、代码块不算）")
     ok = ok and c5
 
+    # 8d) 同源去重闸门（2026-10-11）：同 DOI 库内已有 ⇒ 命中；不同 DOI/标题 ⇒ 不命中。
+    #     夹具自带桩目录，不读生产 wiki/sources。
+    import uuid as _uuid2
+    tsrc2 = os.path.join(HERE, f"_selftest_dup_{_uuid2.uuid4().hex[:8]}")
+    os.makedirs(tsrc2, exist_ok=True)
+    try:
+        with open(os.path.join(tsrc2, "2026-Old-Page-Nature.md"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(render_frontmatter({"type": "source", "doi": "10.1038/dup.1"})
+                     + "# Existing Canonical Title\n")
+        bd, bt = build_existing_index(tsrc2)
+        # 正例：同 DOI ⇒ 硬命中，指向既有页
+        k1, p1 = find_duplicate("10.1038/dup.1", "完全不同的标题任意文字", bd, bt,
+                                "2026-New-Page-Nature")
+        good = (k1 == "doi" and p1 == "2026-Old-Page-Nature")
+        print(f"  [{'ok' if good else 'FAIL'}] 闸门正例 同 DOI → 硬命中（{k1},{p1}）")
+        ok = ok and good
+        # 正例：DOI 尾标点差异仍算同一篇（必须走 norm_doi）
+        k1b, _ = find_duplicate("10.1038/dup.1。", "x", bd, bt, "2026-N")
+        good = k1b == "doi"
+        print(f"  [{'ok' if good else 'FAIL'}] 闸门正例 DOI 尾标点差异仍命中（{k1b}）")
+        ok = ok and good
+        # 反例：不同 DOI + 不同标题 ⇒ 不命中（不得误杀新文献）
+        k2, p2 = find_duplicate("10.1038/other.9", "Another Totally Different Paper",
+                                bd, bt, "2026-N")
+        good = (k2 is None and p2 is None)
+        print(f"  [{'ok' if good else 'FAIL'}] 闸门反例 不同 DOI/标题 → 不命中（{k2}）")
+        ok = ok and good
+        # 反例：命中页正是自己 ⇒ 不算重复（幂等场景，靠 exists 处理）
+        k3, _ = find_duplicate("10.1038/dup.1", "Existing Canonical Title", bd, bt,
+                               "2026-Old-Page-Nature")
+        good = k3 is None
+        print(f"  [{'ok' if good else 'FAIL'}] 闸门反例 命中页=自己 → 不判重复（{k3}）")
+        ok = ok and good
+        # 软命中：无 DOI、标题归一相同 ⇒ 只告警不跳过
+        k4, p4 = find_duplicate("", "Existing Canonical Title", bd, bt, "2026-New")
+        good = (k4 == "title" and p4 == "2026-Old-Page-Nature")
+        print(f"  [{'ok' if good else 'FAIL'}] 闸门软命中 同标题无 DOI → 仅告警（{k4}）")
+        ok = ok and good
+        # 归一：<10 字符的短标题不得进入标题表（防误杀）
+        good = norm_title("短") == "" and norm_title("Existing Canonical Title") != ""
+        print(f"  [{'ok' if good else 'FAIL'}] 标题归一拒绝过短标题")
+        ok = ok and good
+    finally:
+        for f in os.listdir(tsrc2):
+            try:
+                os.remove(os.path.join(tsrc2, f))
+            except Exception:                     # noqa: BLE001
+                pass
+        try:
+            os.rmdir(tsrc2)
+        except Exception:                         # noqa: BLE001
+            pass
+
     # 9) 入库后自动重跑去重清单：两个被调工具必须**真实存在**（否则静默 no-op）
     dep_ok = all(os.path.exists(os.path.join(HERE, t))
                  for t in ("kb_dois.py", "lit_catalogue.py"))
@@ -1043,6 +1164,8 @@ def main():
     ap.add_argument("--with-index", action="store_true",
                     help="入库后额外重建 BM25 检索索引（默认只重跑去重清单）")
     ap.add_argument("--no-links", action="store_true", help="不自动建议补链")
+    ap.add_argument("--allow-duplicate", action="store_true",
+                    help="绕过同源去重闸门（同 DOI 也强行建卡；默认关闭）")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -1079,19 +1202,30 @@ def main():
                         m = re.search(r"\[\[(raw/[^\]]+)\]\]", str(s))
                         if m:
                             existing_raw.add(m.group(1))
-        for f in sorted(os.listdir(text_dir)) if os.path.isdir(text_dir) else []:
-            if not f.endswith(".md"):
-                continue
-            rel = f"{backlink_prefix}/{f}".replace("\\", "/")
-            if rel not in existing_raw:
-                files.append(rel)
+        # 🔴 2026-10-11：raw/text 已分 7 个分类子目录，须递归（否则子目录里的全文
+        #    全部被判「未建卡」而被重复建卡）。输出用相对 text_dir 的路径。
+        for dp, _dn, fns in (os.walk(text_dir) if os.path.isdir(text_dir) else []):
+            for f in sorted(fns):
+                if not f.endswith(".md"):
+                    continue
+                sub = os.path.relpath(os.path.join(dp, f), text_dir).replace("\\", "/")
+                rel = f"{backlink_prefix}/{sub}"
+                if rel not in existing_raw:
+                    files.append(rel)
 
     if not files:
         print("[ok] 没有待建卡的全文（raw/text 下均已建卡）")
         return 0
 
     print(f"\n{'（干跑）' if not args.apply else ''}待建卡 {len(files)} 篇\n")
-    planned, written = [], []
+    # 🔴 同源去重闸门：建卡**前**扫一遍库内全部 source 页（DOI/标题），命中即跳过。
+    #    见 find_duplicate/BUILD_EXISTING_INDEX 的由来注释（2026-10-11 九对重复页事故）。
+    exist_doi, exist_title = build_existing_index(src_dir)
+    if args.allow_duplicate:
+        exist_doi, exist_title = {}, {}      # 逃生阀：清空索引 ⇒ 闸门失效
+    print(f"[i] 同源去重闸门：库内已知 DOI {len(exist_doi)} 条 / 标题 {len(exist_title)} 条"
+          f"{'（--allow-duplicate 已关闭）' if args.allow_duplicate else ''}\n")
+    planned, written, skipped_dup = [], [], []
     # 🔴 检索索引**只加载一次**（旧版每页调一次 suggest_links ⇒ 每页重读 400 KB meta +
     #    5 MB bm25；一批 72 页就是 72 次）。索引缺失时降级为"无建议"，绝不中止批次。
     link_index = None
@@ -1125,6 +1259,18 @@ def main():
             meta["doi"] = cand.get("doi") or meta["doi"]
         tier = resolve_tier(cand, meta, cfg)
         fm, page, body, notes = build_card(meta, rel, cfg=cfg, tier=tier)
+        # 🔴 同源去重闸门：与库内既有页同 DOI ⇒ 跳过（不再建第二张卡）。
+        #    软命中（仅标题相同）只告警、不跳过——不同文献可能标题相近。
+        dkind, dpage = find_duplicate(fm["doi"], meta.get("title") or fm.get("aliases", [""])[0],
+                                      exist_doi, exist_title, page)
+        if dkind == "doi":
+            print(f"  [同源跳过] {page}")
+            print(f"           ← {rel}")
+            print(f"           DOI {fm['doi']} 库内已有：[[{dpage}]]（同源，不再建卡）")
+            skipped_dup.append((page, dpage, fm["doi"]))
+            continue
+        if dkind == "title":
+            print(f"  [i] 标题与库内 [[{dpage}]] 相近（无 DOI，未跳过，请核对是否同源）：{page}")
         # 🔴 target 必须是**相对库根**的路径（`wiki/sources/<page>.md`）。
         #   此前写成 `f"{src_dir}/{page}.md"`，而 src_dir 已是绝对路径 ⇒ 落盘时
         #   再 os.path.join(K.VAULT, *target.split("/")) 会拼出
@@ -1224,6 +1370,11 @@ def main():
         return 0
     else:
         print(f"\n（干跑结束，共 {len(planned)} 篇。确认后加 --apply）")
+    if skipped_dup:
+        print(f"[i] 同源跳过 {len(skipped_dup)} 篇（库内已有同 DOI 页，未重复建卡）：")
+        for page, other, doi in skipped_dup[:10]:
+            print(f"     · {page} ≡ [[{other}]]（{doi}）")
+        print("     ⇒ 若要覆盖重建，加 --allow-duplicate（谨慎：会与既有页并存成重复页）")
     return 0
 
 

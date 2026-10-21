@@ -49,7 +49,7 @@ rules:
       | 目录 | 层 | 说明 |
       |---|---|---|
       | `wiki/` | 知识层 | **724 页**：`concepts/`(129) `entities/`(60) `sources/`(503) `topics/`(7) `outputs/`(25) ＋ 根下**元文件** `index.md` `tags.md` `log*.md` ＋ `.index/`（派生数据，可重建） |
-      | `raw/` | 资料层 | `pdf/`（**530 个 PDF＝`raw/` 全树计数**；其中 `raw/pdf/` 内 495）`text/`(全文提取 md) `clippings/`(剪藏) `assets/`(正文图) `notes/`(批次笔记与 lit-watch 运行产物) |
+      | `raw/` | 资料层 | `pdf/`（**530 个 PDF＝`raw/` 全树计数**；其中 `raw/pdf/` 内 495，按 7 分类分子目录）`text/`(全文提取 md，**2026-10-11 起按同名 7 分类分子目录**) `clippings/`(剪藏) `assets/`(正文图) `notes/`(批次笔记与 lit-watch 运行产物) |
       | `tools/` | 工具层 | `kb_*.py` 检索层 ｜ `qc_*.py` 质检层 ｜ `lit_*.py` **文献获取层** |
       | `projects/` | 工程层 | `AI-for-Materials-Review/`（综述稿工程，与知识层分离） |
       | `_archive/` | 归档层 | **只移不删**；登记册见 `_archive/README.md`。**5 组**：`restructure/`(结构迁移记录与备份) `lit-watch/`(文献流水线历史) `qc/`(QC 工作区归档) `retired/`(退役工具/技能/脚本/规范 + 隔离区 `quarantine/`) `scratchpad/`(临时件) |

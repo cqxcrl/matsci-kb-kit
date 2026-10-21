@@ -357,8 +357,8 @@ def check_backlog(cfg=None):
     pdf_dir = cfg["paths"]["pdf_dir"]
     text_dir = cfg["paths"]["text_dir"]
     n_pdf = _count(os.path.join(pdf_dir, "**", "*.pdf")) if os.path.isdir(pdf_dir) else 0
-    n_txt = len([f for f in os.listdir(text_dir) if f.lower().endswith(".md")]) \
-        if os.path.isdir(text_dir) else 0
+    # 🔴 2026-10-11：raw/text 已分 7 个分类子目录，全文计数必须递归（glob **）。
+    n_txt = _count(os.path.join(text_dir, "**", "*.md")) if os.path.isdir(text_dir) else 0
     n_card = len([f for f in os.listdir(os.path.join(K.VAULT, "wiki", "sources"))
                   if f.lower().endswith(".md")])
     out.append(R("三段规模", "info",

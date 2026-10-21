@@ -34,5 +34,18 @@ lit_gapscan.py
 lit_doctor.py
 lit_journals.py
 lit_report.py
+# Sci-Assistant 决策层（v0 完成 2026-10-21）
+sci_landscape.py
+sci_gap_scan.py
+sci_topic_rec.py
+sci_method_extract.py
+sci_protocol_gen.py
+sci_lab_match.py
+sci_progress.py
+sci_data_analysis.py
+sci_ecsa_qc.py
+sci_review.py
+sci_method_chain.py
+sci_reagent_import.py
 # 数据文件
 journals-multidisciplinary.yaml

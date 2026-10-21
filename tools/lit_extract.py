@@ -71,6 +71,15 @@ class PdfExtractError(Exception):
         self.msg = msg
 
 
+# raw/pdf 与 raw/text 共用的 7 个主题分类（两侧目录名必须逐字相同）。
+# 新提取件的 md 落点沿用 PDF 所在分类目录名（见 extract_pdf 的 md_path 推导）。
+RAW_TEXT_CATEGORIES = (
+    "01-电池与电解液", "02-AI方法与机器学习势", "03-LLM与化学智能体",
+    "04-自驱动实验室与自动化", "05-催化与电催化", "06-多孔材料与网状化学",
+    "99-其他与交叉领域",
+)
+
+
 def slugify(title):
     """文件名安全化：去非法字符，空格->'-'，保留中英文和数字。"""
     s = re.sub(r'[\\/:*?"<>|\r\n]+', ' ', title)
@@ -311,7 +320,18 @@ def extract_pdf(pdf, out="", assets=None, raw_dir=None, dpi=150, main_pages=None
     slug = slugify(title)
 
     # 落点先算出来，好在**导出图之前**就判定是否允许覆盖（避免白写一堆图）
-    md_path = Path(out) if out else Path(raw_dir) / f"{title}.md"
+    # 🔴 2026-10-11：raw/text 已按 raw/pdf 的 7 分类分目录；新提取件**沿用 PDF 所在分类**，
+    #    使两层结构对齐（否则新件又落回 raw/text 根，结构回潮）。仅当 PDF 位于分类子目录
+    #    （形如 raw/pdf/<分类>/x.pdf）时才加一级；PDF 已在 raw/pdf 根（历史散件）则保持旧行为。
+    #    显式 --out 时完全尊重调用方，不做任何改写。
+    if out:
+        md_path = Path(out)
+    else:
+        cat = Path(pdf).parent.name
+        if cat in RAW_TEXT_CATEGORIES:
+            md_path = Path(raw_dir) / cat / f"{title}.md"
+        else:
+            md_path = Path(raw_dir) / f"{title}.md"
     if not should_overwrite(md_path, force):
         # 码 4：目标 md 已存在且未加 --force。这不是"失败"，而是"已提取"——
         # lit_batch 必须把它记成 ok（how=md-exists），否则该 PDF 会永远 pending。

@@ -173,20 +173,25 @@ def md_doi_map():
 
     🔴 必须用 `K.norm_doi`：实测库里 15 条 DOI 尾部粘连了中文标点（`10.1021/...）`），
     用裸正则会把「）正文」一起吃进去，导致对账永远匹配不上并误判为「未提取」。
+
+    🔴 2026-10-11：`raw/text/` 已按 7 分类分目录，故必须**递归**遍历（os.walk），
+    键为**相对 text_dir 的正斜杠路径**（如 `01-电池与电解液/x.md`）。写台账时
+    用它拼 `raw/text/<回链>`；下游 `md_names` 另按 basename 建索引以兼容同名判定。
     """
     m = {}
     d = text_dir()
     if not os.path.isdir(d):
         return m
-    for fn in os.listdir(d):
-        if not fn.lower().endswith(".md"):
-            continue
-        p = os.path.join(d, fn)
-        try:
-            head = K.read_text(p)[:4000]
-        except OSError:
-            continue
-        m[fn] = K.norm_doi(head)
+    for dp, _dn, fn in os.walk(d):
+        for f in fn:
+            if not f.lower().endswith(".md"):
+                continue
+            p = os.path.join(dp, f)
+            try:
+                head = K.read_text(p)[:4000]
+            except OSError:
+                continue
+            m[os.path.relpath(p, d).replace("\\", "/")] = K.norm_doi(head)
     return m
 
 
@@ -216,22 +221,79 @@ def tokens(s):
     return set(w for w in re.findall(r"[a-z0-9]+", (s or "").lower()) if len(w) >= 4)
 
 
+def card_dois():
+    """库内**已有卡片**的 DOI 集合（来自 wiki/.index/dois.json 的 by_doi）。
+
+    用途（2026-10-11 新增）：PDF 从未提取成 text，但同 DOI 的卡片已由
+    `raw/clippings/` 路径建好 —— 这类 PDF 不应反复报"待提取"。见 patch 说明。
+    读不到（文件缺失/格式变）时返回空集，退化为旧行为，不炸。
+    """
+    p = os.path.join(K.VAULT, "wiki", ".index", "dois.json")
+    try:
+        with open(p, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:                                          # noqa: BLE001
+        return set()
+    by = data.get("by_doi") or {}
+    return {str(k).lower().strip() for k in by}
+
+
+def cards_raw_stems():
+    """库内**已有卡片**引用的 raw 文件（clippings/pdf/text）文件名归一化词干集合。
+
+    用途（2026-10-11 新增）：一篇论文的卡片常引 `raw/clippings/`（公众号/官网页剪藏）
+    或 `raw/pdf/` 路径、而**不引 `raw/text/`**（该 PDF 从未提取成全文 md）。这类 PDF
+    会被 pending_pdfs() 反复报"待提取"，即便卡片已存在。此处收集卡片所引 raw 文件词干，
+    供 reconcile() 做"该 PDF 已被某卡片覆盖"的标题级兜底判定。
+
+    归一化同 tokens 思路：小写、去非字母数字。返回 (norm_stem, 原卡片名) 的 dict；
+    读不到任何卡片时返回空 dict，退化为旧行为，不炸。
+    """
+    out = {}
+    d = os.path.join(K.VAULT, "wiki", "sources")
+    if not os.path.isdir(d):
+        return out
+    for fn in os.listdir(d):
+        if not fn.lower().endswith(".md"):
+            continue
+        try:
+            txt = K.read_text(os.path.join(d, fn))
+        except OSError:
+            continue
+        for m in re.finditer(
+                r"\[\[raw/(?:clippings|pdf|text)/([^\]\|]+?\.(?:md|pdf))", txt):
+            stem = os.path.splitext(os.path.basename(m.group(1)))[0]
+            ns = re.sub(r"[^a-z0-9]+", "", stem.lower())
+            if ns:
+                out.setdefault(ns, fn)
+    return out
+
+
 def reconcile(quiet=False):
     """建立/刷新台账：判定每个 PDF 是否已有对应全文。返回 (ledger, stats)。"""
     led = load_ledger()
     md_map = md_doi_map()
+    # md_map 的键现为**相对 text_dir 的路径**（含分类子目录，如 `01-电池与电解液/x.md`）。
+    # 下面三处索引既存 basename 也存 relpath，写台账时一律用 relpath（对子目录安全）。
     md_by_doi = {}
     for fn, doi in md_map.items():
         if doi:
             md_by_doi.setdefault(doi, fn)
-    md_names = {os.path.splitext(f)[0].lower(): f for f in md_map}
+    md_names = {os.path.splitext(os.path.basename(f))[0].lower(): f for f in md_map}
+    md_rel = {f: f for f in md_map}          # relpath -> relpath（供词元兜底回填）
+    # 🆕 2026-10-11：库内已有卡片的 DOI（clippings 路径建卡、无 text md）。
+    existing_card_dois = card_dois()
+    # 🆕 2026-10-11：库内已有卡片引用的 raw 文件（pdf/clippings）词干 —— 覆盖
+    #     「PDF 无 DOI 或 DOI 未入库、且卡片只引 clippings/pdf 不引 text」的假积压。
+    card_raw = cards_raw_stems()
     # 🔴 词元集**在这里预计算一次**（{md 文件名: 词元集}）。
     #    旧版把 `tokens(os.path.splitext(fn)[0])` 放在"每个 PDF × 每个 md"的双层循环里，
     #    实测 495 PDF × 402 md ≈ 20 万次重复分词，对账慢到让人以为卡死。
-    md_tok = {fn: tokens(os.path.splitext(fn)[0]) for fn in md_map}
+    md_tok = {fn: tokens(os.path.splitext(os.path.basename(fn))[0]) for fn in md_map}
 
     pdfs = walk_pdfs()
-    stats = {"pdf": len(pdfs), "already": 0, "pending": 0, "no_doi": 0}
+    stats = {"pdf": len(pdfs), "already": 0, "pending": 0, "no_doi": 0,
+             "card_covered": 0}
     for p in pdfs:
         key = rel(p)
         rec = led["pdf"].get(key) or {}
@@ -258,6 +320,32 @@ def reconcile(quiet=False):
                                "at": datetime.datetime.now().isoformat(timespec="seconds")}
             stats["already"] += 1
             continue
+        # 3b) 2026-10-11 新增：PDF 无 text md，但同 DOI 的**卡片已存在**
+        #     （该卡片由 raw/clippings/ 路径建卡）。此类不应报"待提取"。
+        #     标 how="card-doi"，**不设 text**（全文未提取，卡片为剪藏级证据）。
+        if doi and doi in existing_card_dois:
+            led["pdf"][key] = {**rec, "ok": True, "how": "card-doi", "doi": doi,
+                               "at": datetime.datetime.now().isoformat(timespec="seconds")}
+            stats["already"] += 1
+            stats["card_covered"] += 1
+            continue
+        # 3c) 2026-10-11 新增：卡片已引用**同名的 raw 文件**（clippings/pdf），
+        #     即便该 PDF 无 DOI 或 DOI 未入库，也说明它已被某卡片覆盖。
+        #     归一化词干双向包含匹配；标 how="card-raw"，**不设 text**。
+        ns = re.sub(r"[^a-z0-9]+", "", stem.lower())
+        if len(ns) >= 20:
+            hit = None
+            for rns, card in card_raw.items():
+                if len(rns) >= 20 and (rns in ns or ns in rns):
+                    hit = card
+                    break
+            if hit:
+                led["pdf"][key] = {**rec, "ok": True, "how": "card-raw",
+                                   "doi": doi, "card": hit,
+                                   "at": datetime.datetime.now().isoformat(timespec="seconds")}
+                stats["already"] += 1
+                stats["card_covered"] += 1
+                continue
         # 4) 标题词重叠兜底（阈值高，且要求 ≥3 词命中）
         best, bs = None, 0.0
         pt = tokens(stem)
@@ -482,16 +570,80 @@ def cards_source_links():
     return out
 
 
+def cards_identifiers():
+    """库内**已有卡片**的标识词干：文件名 + H1 标题 + aliases（归一化）。
+
+    用途（2026-10-11 新增）：一篇论文的卡片常以**中文短名**命名（如「2020-自主移动
+    机器人化学家-Nature」），而 `raw/text/` 下是**英文全名**（"A mobile robotic chemist
+    - Nature - 2020"）。此时 cards_source_links() 认不出（卡片未必引该 text 路径），
+    该全文被 pending_cards() 误报"待建卡"。此处收集卡片名/H1/别名词干做标题级兜底。
+    """
+    out = {}
+    d = os.path.join(K.VAULT, "wiki", "sources")
+    if not os.path.isdir(d):
+        return out
+    for fn in os.listdir(d):
+        if not fn.lower().endswith(".md"):
+            continue
+        try:
+            txt = K.read_text(os.path.join(d, fn))
+        except OSError:
+            continue
+        vals = [fn[:-3]]
+        m = re.search(r"^#\s+(.+)$", txt, re.M)
+        if m:
+            vals.append(m.group(1))
+        for m in re.finditer(r"^aliases:\n((?:[ \t]*-[ \t]*.+\n)+)", txt, re.M):
+            vals += [l.strip().lstrip("- ").strip().strip('"')
+                     for l in m.group(1).splitlines()]
+        for m in re.finditer(r"^aliases:\s*\[(.*)\]\s*$", txt, re.M):
+            vals += [x.strip().strip('"') for x in m.group(1).split(",")]
+        for v in vals:
+            nv = re.sub(r"[^a-z0-9]+", "", v.lower())
+            if nv:
+                out.setdefault(nv, fn)
+    return out
+
+
 def pending_cards():
-    """已提取但还没有 source 卡引用的全文 md（相对库根路径）。"""
+    """已提取但还没有 source 卡引用的全文 md（相对库根路径）。
+
+    除按 `[[raw/text/...]]` 直引判定外，追加两个标题级兜底（2026-10-11）：
+    A) 该全文文件名 vs 已有卡片的文件名/H1/别名（覆盖中文短名卡 vs 英文全名 text）；
+    B) 该全文文件名 vs 已有卡片引用的 raw 文件（clippings/pdf）词干（覆盖卡片只引
+       剪藏件/PDF 的情形）。二者任一命中即视为「已被卡片覆盖」，不再报待建卡。
+    """
     linked = cards_source_links()
+    card_ids = cards_identifiers()
+    card_raw = cards_raw_stems()
     out = []
     d = text_dir()
     if not os.path.isdir(d):
         return out
-    for fn in sorted(os.listdir(d)):
-        if fn.lower().endswith(".md") and fn.lower() not in linked:
-            out.append("raw/text/" + fn)
+    # 🔴 2026-10-11：raw/text 已分 7 个分类子目录，必须递归；`linked` 存的是
+    #    **小写 basename**，故按 basename 比对，输出用相对 text_dir 的路径。
+    for dp, _dn, fns in os.walk(d):
+        for fn in sorted(fns):
+            if not fn.lower().endswith(".md"):
+                continue
+            if fn.lower() in linked:
+                continue
+            ns = re.sub(r"[^a-z0-9]+", "", fn[:-3].lower())
+            if len(ns) >= 20:
+                covered = False
+                for nv in card_ids:
+                    if len(nv) >= 20 and (nv in ns or ns in nv):
+                        covered = True
+                        break
+                if not covered:
+                    for rns in card_raw:
+                        if len(rns) >= 20 and (rns in ns or ns in rns):
+                            covered = True
+                            break
+                if covered:
+                    continue
+            out.append("raw/text/" + os.path.relpath(os.path.join(dp, fn), d)
+                       .replace("\\", "/"))
     return out
 
 
@@ -513,8 +665,8 @@ def status(led=None, quiet=False):
     led = led or load_ledger()
     pdfs = walk_pdfs()
     td = text_dir()
-    txts = [f for f in os.listdir(td) if f.lower().endswith(".md")] \
-        if os.path.isdir(td) else []
+    txts = [os.path.join(dp, f) for dp, _dn, fn in os.walk(td) for f in fn
+            if f.lower().endswith(".md")] if os.path.isdir(td) else []
     pend_pdf = pending_pdfs(led)
     pend_card = pending_cards()
     cards = os.path.join(K.VAULT, "wiki", "sources")
