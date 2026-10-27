@@ -450,10 +450,12 @@ def _empty_vault_fixture():
             for d in ("wiki/concepts", "wiki/entities", "wiki/sources",
                       "wiki/topics", "wiki/outputs", "raw/pdf", "raw/text"):
                 os.makedirs(os.path.join(td, d), exist_ok=True)
+            env = dict(os.environ, PYTHONIOENCODING="utf-8")
             bi = subprocess.run(
                 [__import__("sys").executable,
                  os.path.join(td, "tools", "kb_build_index.py")],
-                capture_output=True, text=True, cwd=td)
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=td, env=env)
             # 🆕 2026-10-15：`meta_fm.json` 侧车也必须在四件套里 —— 它是检索层
             #    取可靠性限定词的来源，缺了 L2 就会静默丢限定词（本库最忌的失效形态）。
             _need = ("meta.json", "meta_full.json", "bm25.json", "meta_fm.json")
@@ -467,7 +469,8 @@ def _empty_vault_fixture():
             sr = subprocess.run(
                 [__import__("sys").executable,
                  os.path.join(td, "tools", "kb_search.py"), "x"],
-                capture_output=True, text=True, cwd=td)
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=td, env=env)
             good_search = sr.returncode == 0          # 关键：不是 exit 2
             print(f"  [{'ok' if good_search else 'FAIL'}] 空库检索不 exit(2)："
                   f"exit={sr.returncode}")
