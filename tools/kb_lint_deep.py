@@ -441,6 +441,41 @@ def check_tool_integrity(vault_root):
         except Exception as e:  # noqa
             out.append((f"tools/{fn}", "ERROR", "E3-compile-fail",
                         f"{fn} 编译失败: {str(e).splitlines()[0][:80]}"))
+
+    # ---- 项目工具（2026-10-23 扩围）--------------------------------------
+    # 由来：`projects/*/ingest/tools/*.py` 此前既不在本族、也不在 kb_toolcheck，
+    # 是全库唯一完全没有门禁的代码区。实证代价：`batch_digests.py` 无参数解析、
+    # 一进来就写 166 个文件，长期无人发现。
+    # 这里只做**静态**判定（真跑由 kb_toolcheck 负责）；E4 专抓「写盘但无 --apply」。
+    for fp in sorted(glob.glob(os.path.join(
+            vault_root, "projects", "*", "ingest", "tools", "*.py"))):
+        fn = os.path.basename(fp)
+        rel = os.path.relpath(fp, vault_root).replace("\\", "/")
+        txt = open(fp, encoding="utf-8", errors="replace").read()
+        try:
+            import py_compile
+            py_compile.compile(fp, doraise=True)
+        except Exception as e:  # noqa
+            out.append((rel, "ERROR", "E3-compile-fail",
+                        f"{fn} 编译失败: {str(e).splitlines()[0][:80]}"))
+            continue
+        # E4：写盘门禁。判据只看「有写文件动作」∧「无 --apply/--dry 开关」。
+        # 语料里写盘的真实形态只有两类（open(...,'w'/'a') 与 Path.write_text），
+        # 不试图枚举 os.replace/json.dump —— 宁可漏报，不用宽正则会制造假红。
+        # ⚠️ 不能用 `open\s*\([^)]*["'][wa]`：`[^)]*` 遇到 `open(os.path.join(...), "w")`
+        #    里的内层右括号就停住 ⇒ 这类最常见的写法**全部漏报**（2026-10-23 实测：
+        #    plan_batches_v2 因此逃过 E4）。改成「open( 之后 200 字符内出现 'w'/'a'」。
+        writes = bool(re.search(r"""open\s*\([^\n]{0,200}?["'][wa]b?["']""", txt)) \
+            or "write_text(" in txt
+        gated = ("--apply" in txt) or ("--dry" in txt) or ("dry-run" in txt)
+        if writes and not gated:
+            out.append((rel, "WARN", "E4-write-no-apply",
+                        f"{fn} 有写盘动作但无 --apply/--dry 门禁（CLAUDE.md：写盘脚本须默认干跑）"))
+        # E1 只对「自称有 CLI」的项目工具生效：一次性历史脚本没有 CLI 是事实，
+        # 不该把每份归档脚本都变成一条 INFO（噪声会淹没真发现）。
+        if ("selftest" not in txt) and ("argparse" in txt):
+            out.append((rel, "INFO", "E1-no-selftest",
+                        f"{fn} 有 CLI 但无 --selftest"))
     return out
 
 
@@ -494,6 +529,17 @@ _META_NAMES = {"index", "log", "log_ops", "log_insights"}
 def run_deep_extended(pages, vault_root):
     issues = []
     sources_meta = {os.path.basename(r).rsplit(".", 1)[0]: pages[r][0] for r in pages}
+    # 2026-10-22：项目卡已纳入检索层，概念页可直接以它们为 sources:。
+    # 若 B3 只看 wiki 页，引用项目卡的概念页会被误报 evidence_base 过时
+    # （实测：膜电极组件MEA 现值 strong，但 B3 重算成 mixed）。
+    # 与 qc_evidence_base.load_source_pages() 共用同一取数口径；wiki 同名优先。
+    try:
+        import qc_evidence_base as _QE
+        for _nm, (_fm, _b) in _QE.load_source_pages().items():
+            if _fm.get("type") == "source":
+                sources_meta.setdefault(_nm, _fm)
+    except Exception as _e:
+        print(f"[warn] 项目卡未纳入 B3 取数（{_e}）")
     known_keys = build_known_keys(pages)
 
     for rel in sorted(pages):
@@ -717,6 +763,36 @@ def run_selftest():
             got = check_tool_integrity(probe)
             chk("E3 语法坏文件真被抓出（夹具真的调用了检查器）",
                 any(c == "E3-compile-fail" for _, _, c, _ in got))
+
+            # E4（2026-10-23）：项目工具「写盘但无 --apply」须报；有 --apply 的不得报。
+            # 正反例成对——只测「该报的报了」会漏掉「不该报的乱报」。
+            pdir = os.path.join(probe, "projects", "PX", "ingest", "tools")
+            os.makedirs(pdir, exist_ok=True)
+            with open(os.path.join(pdir, "writer_ungated.py"), "w",
+                      encoding="utf-8") as _f:
+                _f.write("import argparse\n"
+                         "open('x.txt', 'w').write('x')\n")
+            with open(os.path.join(pdir, "writer_gated.py"), "w",
+                      encoding="utf-8") as _f:
+                _f.write("import argparse\n"
+                         "ap = argparse.ArgumentParser()\n"
+                         "ap.add_argument('--apply', action='store_true')\n"
+                         "a = ap.parse_args()\n"
+                         "if a.apply:\n"
+                         "    open('x.txt', 'w').write('x')\n")
+            # 回归夹具（2026-10-23）：旧正则 `open\([^)]*["'][wa]` 在内层右括号处截断，
+            # 导致 `open(os.path.join(...), "w")` 这种最常见写法**全部漏报**
+            # （实测：plan_batches_v2.py 因此逃过 E4）。反例只走这一条路径。
+            with open(os.path.join(pdir, "writer_nested.py"), "w",
+                      encoding="utf-8") as _f:
+                _f.write("import os\n"
+                         "open(os.path.join('d', 'x.txt'), 'w').write('x')\n")
+            got2 = check_tool_integrity(probe)
+            e4 = {rel for rel, _lv, c, _m in got2 if c == "E4-write-no-apply"}
+            chk("E4 项目工具「写盘无 --apply」被报出", any("writer_ungated" in x for x in e4))
+            chk("E4 嵌套括号 open(os.path.join(...),'w') 也被报出",
+                any("writer_nested" in x for x in e4))
+            chk("E4 反例 有 --apply 的门禁脚本不报", not any("writer_gated" in x for x in e4))
         finally:
             _sh.rmtree(probe, ignore_errors=True)
     else:
@@ -789,8 +865,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    try:                                                       # noqa: SIM105
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:                                          # noqa: BLE001
-        pass
+    K.console_encoding()
     sys.exit(main())

@@ -27,32 +27,22 @@ import json
 import argparse
 
 # Windows 控制台默认 GBK，强制 UTF-8 输出（含化学式上下标/特殊符号）
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kb_lib as K
+K.console_encoding()
 
-# 类型 → wiki 子目录名。**不能靠加 s 拼接**：
-#   entity → "entitys" 不存在（正确是 entities）。
-#   2026-10-04 实测：--json 对 entity 命中返回的 path 100% 不存在，
-#   Agent 据此路径读取必然失败。
-TYPE_DIR = {
-    "concept": "concepts",
-    "entity": "entities",
-    "source": "sources",
-    "topic": "topics",
-    "output": "outputs",
-}
+# 类型 → wiki 子目录名。**不能靠加 s 拼接**（entity → "entitys" 不存在）。
+# 🔴 2026-10-14：类型 → 目录的映射**已收敛到 `kb_lib.TYPE_DIR`**（诊断 P1-4）。
+#    此前本文件与 `kb_route.py` 各有一份，且两处带着同样的「entitys 不是 entities」注释
+#    ——正是本库 `qc_same_text` 纪律（一个更正平均 3–7 处副本）没覆盖到自己代码的情形。
+#    这里只保留 `TYPE_DIR` 这个**别名**，以免既有调用方（与读者）措手不及。
+TYPE_DIR = K.TYPE_DIR
 
 
 def page_path(name, ptype):
     """返回页面相对 vault 的路径；类型未知时返回空串（不要猜）。"""
-    d = TYPE_DIR.get(ptype)
-    return f"wiki/{d}/{name}.md" if d else ""
+    return K.page_path_for_type(name, ptype)
 
 
 def load_index():
@@ -253,18 +243,23 @@ def _run_semantic(query, k, as_json, type_filter, meta):
 
 
 def _run_hybrid(query, k, as_json, type_filter, meta):
-    """混合检索模式：BM25 + 语义 RRF 融合。"""
+    """兼容入口：RRF 后必须经本地 CrossEncoder 精排。"""
+    import kb_rag
     try:
-        import kb_semantic_search as SEM
-    except ImportError:
-        print("[!] kb_semantic_search.py 不存在，回退到纯 BM25", file=sys.stderr)
-        # 回退到纯 BM25
-        return _run_bm25_fallback(query, k, as_json, type_filter, meta)
-    results = SEM.hybrid_search(query, top_k=k)
-    if type_filter:
-        types = [t.strip() for t in type_filter.split(",") if t.strip()]
-        results = [(n, s) for n, s in results if meta_of(meta, n)[4] in types]
-    _print_search_results(query, results, meta, as_json, mode="混合")
+        data = kb_rag.retrieve(
+            query, k=k, mode="hybrid",
+            type_filter=[t.strip() for t in type_filter.split(",") if t.strip()])
+    except kb_rag.RetrievalUnavailable as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        return 3
+    if as_json:
+        print(K.json_dumps(data, ensure_ascii=False, indent=1))
+    else:
+        print(f'[混合+精排] 查询: "{query}"   命中 {data["count"]} 条\n')
+        for item in data["results"]:
+            print(f"{item['rank']:>2}. [{item['type']}] {item['name']}   {item['score']:.4f}")
+            if item["summary"]:
+                print(f"    {item['summary'][:150]}")
     return 0
 
 
@@ -392,7 +387,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("query", nargs="?", default="", help="查询语句")
     ap.add_argument("-k", type=int, default=10, help="返回条数")
-    ap.add_argument("--type", default="", help="过滤类型，逗号分隔：concept,entity,source,topic,output")
+    ap.add_argument("--type", default="",
+                    help="过滤类型，逗号分隔：concept,entity,source,topic,output,experiment")
     ap.add_argument("--json", action="store_true", help="JSON 输出")
     ap.add_argument("--resolve", action="store_true", help="只做别名解析")
     ap.add_argument("--stats", action="store_true", help="索引概览")

@@ -24,13 +24,10 @@ import math
 import argparse
 from collections import defaultdict
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kb_lib as K
+K.console_encoding()
 
 
 def load_full():

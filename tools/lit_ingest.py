@@ -30,6 +30,7 @@ import re
 import sys
 import json
 import time
+import glob
 import argparse
 import datetime
 import subprocess
@@ -37,17 +38,36 @@ import subprocess
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import kb_lib as K
+K.console_encoding()
 
 # 统一在 import 期把 stdout 切到 UTF-8（旧版只写在 __main__ 里，作为被导入的模块
 # 或经包装器调用时，任何 ✅/⚠️ 输出都会在 cp936 控制台上抛 UnicodeEncodeError）。
-try:                                                           # noqa: SIM105
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                                              # noqa: BLE001
-    pass
 
 TODAY = datetime.date.today().isoformat()
 DOI_RE = re.compile(r"10\.\d{4,9}/[^\s)\]}>,;\"']+", re.IGNORECASE)
+# `doi.org/<DOI>` 形态（出版社页脚/TOC 一律印成可点链接）：比裸 DOI 可信，用于锚定。
+_DOIORG_RE = re.compile(r"doi\.org/(10\.\d{4,9}/[^\s)\]}{>,;\"']+)", re.IGNORECASE)
 YEAR_RE = re.compile(r"(19|20)\d{2}")
+# DOI / 摘要的搜索窗口：必须盖住出版社印在**第 1 页页脚**的 DOI
+# （ACS `Downloaded from pubs.acs.org…` 行、Elsevier 页脚等），实测最远约 5000 字符。
+COVER_CHARS = 9000
+
+# —— 「不是文章 DOI」的前缀黑名单（2026-10-17）——
+# 🔴 为什么必须有：实测 13 篇全文里，**首个** `doi.org` 链接是 Zenodo **数据** DOI
+#    （`10.5281/zenodo.*`，出现在 Data-availability 段），而文章 DOI 在更后面。
+#    若只是「扩大窗口取首个 doi.org」，会把**数据 DOI** 当成文章 DOI 写进卡片——
+#    比留空更坏：污染 `source_url`（指向数据仓库而非论文）与同源去重（去重键错位）。
+DEPOSIT_DOI_PREFIXES = (
+    "10.5281", "10.6084", "10.17605", "10.17632", "10.5061", "10.5065",
+    "10.7910", "10.15468", "10.1594", "10.5683", "10.4121", "10.18434",
+    "10.48557", "10.11578", "10.5285", "10.5286", "10.5878",
+)
+# 预印本/仓储 DOI 前缀（arXiv / bioRxiv / ChemRxiv / ResearchSquare / SSRN…）：
+# 未经同行评审的版本号，不应作为**已发表文章**的 DOI（保留在候选元数据里另行判断）。
+PREPRINT_DOI_PREFIXES = (
+    "10.48550", "10.1101", "10.26434", "10.21203", "10.2139",
+    "10.20944", "10.36227", "10.31219",
+)
 
 # 期刊全名 → KB 惯用缩写
 JOURNAL_ABBR = {
@@ -74,6 +94,27 @@ JOURNAL_ABBR = {
     "chemistry of materials": "ChemMater", "advanced intelligent systems": "AdvIntellSyst",
     "journal of power sources": "JPS", "physical chemistry chemical physics": "PCCP",
 }
+
+
+def normalize_page_dir(raw, default="wiki/sources"):
+    """`--page-dir` → (相对库根的 POSIX 目录, 错误信息)。
+
+    纪律（与 selftest 的「落盘路径不重复库根」同一根因）：
+    target 拼出来必须能直接喂给 `os.path.join(K.VAULT, *rel.split("/"))`，
+    所以只接受**相对路径**。绝对路径 / 含 `..` 的逃逸路径一律拒绝——它们会让
+    `join` 后的路径二次出现库根名，或直接写到库外（2026-10-05 影子目录事故）。
+    Windows 反斜杠统一成 `/`，去首尾斜杠；空值回退默认目录。
+    旧布局 `projects/<P>/ingest/sources` 归一为 `projects/<P>/sources`（2026-10-22 目录迁移）。
+    """
+    d = (raw or "").strip().replace("\\", "/").strip("/")
+    if not d:
+        return default, None
+    d = re.sub(r"(^|/)ingest/sources$", r"\1sources", d)
+    if re.match(r"^[A-Za-z]:", d) or d.startswith("/"):
+        return None, f"--page-dir 必须是相对库根的路径，收到绝对路径：{raw}"
+    if ".." in d.split("/"):
+        return None, f"--page-dir 不得含 `..`（会逃出库根）：{raw}"
+    return d, None
 
 
 def journal_abbrev(name):
@@ -126,6 +167,12 @@ JOURNAL_SLUG_HINTS = {
     "j-power-sources": "JPS", "joule": "Joule", "matter": "Matter",
     "machine-learning-science-and-technology": "MLST",
     "int-j-extreme-manuf": "IJEM",
+    # 库内 PDF 文件名用「期刊缩写」结尾（`... - JACS - 2026`、`... - J. Am. Chem. Soc. - 2026`），
+    # 需从缩写反推 KB 惯用档位标签（增补自 2026-10-14 单篇 ingest 实测）。
+    "j-am-chem-soc": "JACS", "jacs": "JACS",
+    "angew-chem-int-ed": "AngewChem",
+    "acs-catal": "ACSCatal", "acs-mater-lett": "ACSMaterLett",
+    "nat-synth": "NatSynth", "nat-chem": "NatChem",
 }
 
 
@@ -146,19 +193,43 @@ def guess_journal(*texts):
 
 # ---------------------------------------------------------------- 期刊分级（2026-10-06）
 # 候选 JSON 里带 journal_tier 时直接用它；否则按期刊名/issn 在白名单里反查。
+def _norm_journal(name):
+    """刊名归一：小写、`&`→and、去标点、压缩空白。用于精确匹配。"""
+    s = (name or "").lower().replace("&", " and ")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split())
+
+
 def resolve_tier(cand, meta, cfg):
-    """定刊的档位：候选 journal_tier 优先 → issn_l → 期刊名匹配 → default_tier。"""
+    """定刊的档位：候选 journal_tier 优先 → issn_l → 刊名归一精确匹配 → 长子串匹配 → default_tier。
+
+    ⚠️ 子串匹配必须放在最后，并满足两条护栏：
+    ① 白名单名归一后 ≥8 字符——否则短名 "Chem"(T0) 会命中一切化学刊，
+       "Science"(T0) 会命中 "Journal of Membrane Science"（2026-10-22 实测）；
+    ② 取**最长**命中，避免短名优先。
+    """
     if cand and cand.get("journal_tier"):
         return cand["journal_tier"]
     default = cfg.get("default_tier", "T3")
+    journals = cfg.get("journals", []) or []
     issn = (cand or {}).get("issn_l") or meta.get("issn_l") or ""
-    jname = ((cand or {}).get("journal") or meta.get("journal") or "").strip().lower()
-    for j in cfg.get("journals", []) or []:
-        if issn and j.get("issn_l") == issn:
-            return j.get("tier") or default
-        n = (j.get("name") or "").strip().lower()
-        if n and jname and (n == jname or n in jname or jname in n):
-            return j.get("tier") or default
+    jname = _norm_journal((cand or {}).get("journal") or meta.get("journal") or "")
+    if issn:
+        for j in journals:
+            if j.get("issn_l") == issn:
+                return j.get("tier") or default
+    if jname:
+        for j in journals:
+            n = _norm_journal(j.get("name") or "")
+            if n and n == jname:
+                return j.get("tier") or default
+        hits = []
+        for j in journals:
+            n = _norm_journal(j.get("name") or "")
+            if len(n) >= 8 and (n in jname or jname in n):
+                hits.append((len(n), j.get("tier") or default))
+        if hits:
+            return max(hits, key=lambda x: x[0])[1]
     return default
 
 
@@ -246,11 +317,92 @@ def slug_title(title, n=42):
 
 # ---------------------------------------------------------------- 元数据抽取
 
+def _doi_prefix(doi):
+    return (doi or "").split("/", 1)[0].lower()
+
+
+def _is_deposit_or_preprint(doi):
+    return _doi_prefix(doi) in DEPOSIT_DOI_PREFIXES or \
+        _doi_prefix(doi) in PREPRINT_DOI_PREFIXES
+
+
+def _doi_has_full_suffix(doi):
+    """DOI 尾部必须是像样的字符（拒掉 `10.1088/2053-`、`10.1016/j` 这类截断）。"""
+    if not K.doi_looks_complete(doi):
+        return False
+    tail = doi.split("/", 1)[1]
+    return bool(re.search(r"[a-z0-9]$", tail)) and not re.search(r"[-_/]$", tail)
+
+
+def resolve_article_doi(body, stem=""):
+    """在**全文**里定位「文章 DOI」（不是参考文献/数据仓库的 DOI）。
+
+    🔴 为什么需要它（2026-10-17 实证）：旧版只在前 `COVER_CHARS=9000` 字符里取
+    **首个** `doi.org` 链接。实测两处失效：
+      ① 21 篇全文的首个 `doi.org` 在 9000 字符之外（最远 17.8 万，arXiv 综述）⇒ DOI 留空；
+      ② 这 21 篇里 **13 篇**的首个 `doi.org` 是 Zenodo **数据** DOI ⇒ 盲扩窗口会写错 DOI。
+    故改为：扫**全篇**所有 DOI，按信号打分优选，并用**置信门控**决定「敢不敢下结论」。
+    打分（越高越像文章 DOI）：
+      · 文件名词干 ⊆ DOI 后缀        +100（最强：`sciadv.aei9659.md` → `10.1126/sciadv.aei9659`）
+      · 出现次数（封顶 5）            +10/次（文章 DOI 通常在页眉/页脚/引用里重复）
+      · 以 `doi.org/…` 形态出现       +3
+      · 数据仓库前缀（Zenodo…）       −80
+      · 预印本前缀（arXiv…）          −60（除非文件名强命中）
+    置信门控（**宁可留空，不可写错**）：只有 ① 文件名词干强命中，或 ② `doi.org` 锚定且
+    全文出现 ≥3 次，才返回结果；否则返回 ""（交由候选池/人工兜底）。截断/碎片一律拒。
+    定不出文章 DOI 时返回 ""——**不臆造**（CLAUDE.md 禁止编造）。
+    """
+    ns = re.sub(r"[^a-z0-9]", "", (stem or "").lower())
+
+    def _stem_hit(d):
+        # 双向包含：文件名常形如 `<作者>..._10.1149_1945-7111_aeb0d6`（DOI 以**下划线**
+        # 嵌在文件名里），此时归一化 DOI ⊆ 归一化文件名，反向包含才命中。
+        dn = re.sub(r"[^a-z0-9]", "", d)
+        return (len(ns) >= 8 and ns in dn) or (len(dn) >= 12 and dn in ns)
+
+    occ = {}
+    for m in DOI_RE.finditer(body or ""):
+        d = K.norm_doi(m.group(0))
+        if d:
+            occ.setdefault(d, []).append(m.start())
+    doiorg = {K.norm_doi(m.group(1)) for m in _DOIORG_RE.finditer(body or "")}
+    best, bs = "", -1e9
+    for d, lst in occ.items():
+        if not _doi_has_full_suffix(d):
+            continue
+        stem_hit = _stem_hit(d)
+        s = 0.0
+        if stem_hit:
+            s += 100
+        s += min(len(lst), 5) * 10
+        if d in doiorg:
+            s += 3
+        if _doi_prefix(d) in DEPOSIT_DOI_PREFIXES:
+            s -= 80
+        if _doi_prefix(d) in PREPRINT_DOI_PREFIXES:
+            s -= 60
+        if s > bs:
+            bs, best = s, d
+    if not best:
+        return ""
+    if _stem_hit(best):
+        return best
+    if _is_deposit_or_preprint(best):
+        return ""
+    if best in doiorg and len(occ.get(best, [])) >= 3:
+        return best
+    return ""
+
+
 def extract_from_md(path):
     """从全文 md 首页抽 DOI / 标题 / 作者行（尽力而为，抽不到就留空）。"""
     text = K.read_text(path)
     fm_raw, body = K.split_frontmatter(text)
     fm = K.parse_frontmatter(fm_raw)
+    # 🔴 头窗（head）只用于「标题 / SI 页区间声明」这类真正位于版头的内容。
+    #    DOI 改用**全篇扫描**（resolve_article_doi），不再受窗口限制——ACS 把文章 DOI
+    #    印在**第 1 页页脚**（实测 jacs.6c13252 在 4741 字符），arXiv 综述更是把文章 DOI
+    #    完全省略、首个 `doi.org` 出现在 17.8 万字符处的参考文献里（那是被引文献的 DOI）。
     head = body[:4000]
     out = {
         "title": str(fm.get("title") or "").strip(),
@@ -260,19 +412,27 @@ def extract_from_md(path):
         "year": "",
         "abstract": "",
     }
+    base = os.path.basename(path)
     if not out["doi"]:
-        m = DOI_RE.search(head)
-        if m:
-            out["doi"] = m.group(0).rstrip(".")
+        # 🔴 2026-10-17：改为**全篇扫描 + 打分优选**（resolve_article_doi）。
+        #    旧版只在头 COVER_CHARS 窗口取**首个** doi.org ⇒ ① 页脚 DOI 在窗口外时留空；
+        #    ② 数据仓库 DOI（Zenodo）常排在文章 DOI **之前** ⇒ 盲扩窗口会写错 DOI。
+        #    解析器只在**高置信**（文件名词干强命中 / doi.org 锚定且出现≥3 次）时才下结论。
+        out["doi"] = resolve_article_doi(body, os.path.splitext(base)[0])
     if not out["title"]:
         for line in body.split("\n"):
             s = line.strip().lstrip("#").strip()
-            if len(s) >= 12 and not s.startswith(">"):
-                out["title"] = s
-                break
+            # 跳过版式残留：`<!-- page 1 -->` 分页标记、SI 页区间声明、纯符号行。
+            # 旧版只判 `len>=12 and not startswith(">")` ⇒ 提取件头部的
+            # `<!-- page N -->` 常被误当标题（实测 d6dd00001k.md 等）。
+            if len(s) < 12 or s.startswith(">") or s.startswith("<!"):
+                continue
+            if not re.search(r"[A-Za-z一-鿿]", s):   # 必须有字母/汉字
+                continue
+            out["title"] = s
+            break
     # 清掉 DOI 定位前缀（`10_1002_adfm_77184__真标题` → `真标题`）
     out["title"] = clean_title(out["title"])
-    base = os.path.basename(path)
     # 出版社式文件名：一次拿到 期刊 / 年份 / 首作者 / 干净标题
     pub = parse_publisher_name(out["title"]) or parse_publisher_name(
         os.path.splitext(base)[0].split("__")[-1])
@@ -286,8 +446,12 @@ def extract_from_md(path):
         out["year"] = guess_year(base, out["title"], body[:1500])
     out["journal_abbr"] = (journal_abbrev(out["journal"]) if out["journal"]
                            else guess_journal(base, fm.get("title") or ""))
-    # 摘要：找 Abstract 段
-    m = re.search(r"(?im)^#*\s*abstract\b[:\s]*(.{80,1200}?)(?:\n#{1,3}\s|\n\n\n)",
+    # 摘要：找 Abstract 段。两个坑：① ACS 版式 `ABSTRACT: ...`（冒号）；② 摘要**跨多行**，
+    #   而旧正则没开 DOTALL ⇒ `.` 不匹配换行 ⇒ 多行摘要整段抽空（"摘要待补"）。
+    #    终止条件：下一个 `\f` 分页符 / ▮■ 分节标题 / 又一次 ABSTRACT / 文末。
+    m = re.search(r"(?ims)^#*\s*abstract\b[:\s]*(.{80,2400}?)"
+                  r"(?=\n\s*(?:#{1,3}\s|\x0c|■|□|█)|"
+                  r"\n\s*abstract\b[:\s]|\Z)",
                   body)
     if m:
         out["abstract"] = re.sub(r"\s+", " ", m.group(1)).strip()[:600]
@@ -303,6 +467,43 @@ def extract_from_md(path):
 #   「共 9 页（正文 1-9 页，无补充材料）」           → 提取件里没有任何 SI 页
 _SI_ABSENT_RE = re.compile(r"共\s*\d+\s*页（[^）]*无补充材料")
 _SI_INPDF_RE = re.compile(r"共\s*(\d+)\s*页（正文\s*1-(\d+)\s*页，补充材料\s*(\d+)-(\d+)\s*页")
+_SI_HEADING_RE = re.compile(
+    r"(?i)^\s*#{0,3}\s*\**\s*(electronic\s+supplementary\s+information"
+    r"|supplementary\s+(?:information|data|materials?)"
+    r"|supporting\s+(?:information|materials?))\s*\**\s*[:：]?\s*$")
+_PAGE_MARK_RE = re.compile(r"<!--\s*page\s+(\d+)\s*-->")
+
+
+def _si_section_page(md_path):
+    """在已提取全文里找**独立成行的 SI 章节标题**，返回首个出现处的页码（无则 0）。
+
+    🔴 为什么需要它：提取头部的页区间会**畸变**（如『共 10 页（正文 1-10 页，
+    补充材料 11-10 页）』——起>止，提取器没分出正文/SI 页界）。实测（GAP-PRL
+    2026-10-25 核验）：这类文件**正文里常常真有 SI 章节**（如第 6 页起
+    『Supplementary Information』），头部声明反而是错的。页码声明不可信时，
+    只能以正文实扫为准：真有 SI 章节标题 ⇒ SI 已随文提取（partial）。
+
+    🔴 第 1 页的标题行不算（2026-10-25 实测 26/26 假阳性）：ACS 系期刊
+    首页有一栏导航装饰文字（ACCESS / Metrics & More / Article
+    Recommendations / Supporting Information），逐字独立成行，但不是
+    SI 章节——它旁边就是 ABSTRACT。这类文件走全文扫描路径，由 SI 声明
+    证据判 missing（SI 是独立文件，未随文）。
+    """
+    if not md_path or not os.path.exists(str(md_path)):
+        return 0
+    try:
+        text = open(md_path, "rb").read().decode("utf-8", "replace")
+    except Exception:                                            # noqa: BLE001
+        return 0
+    page = 0
+    for line in text.replace("\r\n", "\n").split("\n"):
+        pm = _PAGE_MARK_RE.search(line)
+        if pm:
+            page = int(pm.group(1))
+            continue
+        if page >= 2 and _SI_HEADING_RE.match(line):
+            return page
+    return 0
 
 
 def detect_si_from_md(head, md_path="", cfg=None):
@@ -324,18 +525,84 @@ def detect_si_from_md(head, md_path="", cfg=None):
     status = "missing"
     m = _SI_INPDF_RE.search(head or "")
     if m:
-        status, ev = "partial", f"提取件头部声明含补充材料页 {m.group(3)}-{m.group(4)} 页"
+        si_a, si_b = int(m.group(3)), int(m.group(4))
+        if si_a <= si_b:
+            status, ev = "partial", f"提取件头部声明含补充材料页 {si_a}-{si_b} 页"
+        else:
+            # 🔴 页区间畸变（起>止，如『补充材料 11-10 页』）：头部声明不可信。
+            # 以正文实扫为准：真有 SI 章节标题 → partial；没有 → 走全文扫描路径。
+            hp = _si_section_page(md_path)
+            if hp:
+                status, ev = "partial", (
+                    f"提取件第 {hp} 页起含 SI 章节（头部页区间畸变『补充材料 {si_a}-{si_b} 页』，实扫更正）")
+            else:
+                ev = (f"头部页区间畸变（补充材料 {si_a}-{si_b} 页）不可信，"
+                      f"SI 有无未判定，以全文扫描为准")
     elif _SI_ABSENT_RE.search(head or ""):
         ev = "提取件头部声明『无补充材料』"
     else:
         ev = "提取件头部无页区间信息（旧格式提取件），SI 有无未判定"
 
-    # 独立 SI 文件优先（lit_fetch --si-dir 的产物；比"PDF 里带着 SI 页"更完整）
+    # 🆕 2026-10-22：头部「无补充材料」只说明**这份 PDF 没夹带 SI 页**，
+    # 不等于该文没有 SI（SI 常态是独立文件）。故判不了时回原文找证据：
+    #   · 全文无 SI 声明、无 Fig./Table S# 引用 → not_applicable（**核查后**的无）
+    #   · 全文有证据但没取到独立文件           → missing（**有但没取**）
+    if status == "missing":
+        v = _scan_pdf_verdict(md_path, cfg)
+        if v.get("verdict") == "no_si":
+            status = "not_applicable"
+            ev = f"全文扫描（{v.get('pages')} 页）：无 SI 声明、无 Fig./Table S# 引用 ⇒ 判定无 SI"
+        elif v.get("verdict") == "has_si":
+            ev = (f"全文扫描（{v.get('pages')} 页）有 SI 证据"
+                  f"（声明 {len(v.get('decls') or [])} 处 / S-编号引用 {v.get('srefs')} 处），但未取到独立文件")
+
+    # 独立 SI 文件优先（lit_fetch/lit_si 的产物；比"PDF 里带着 SI 页"更完整）
     si_hit = find_si_file(md_path, cfg)
     if si_hit:
         status = "present"
         ev = "已获取独立 SI 文件：" + os.path.basename(si_hit)
     return {"si_status": status, "si_evidence": ev}
+
+
+def _pdf_for_md(md_path, cfg=None):
+    """由 `raw/text/<分类>/<名>.md` 反推 `raw/pdf/<分类>/<名>.pdf`（不存在返回 ""）。"""
+    if not md_path:
+        return ""
+    try:
+        c = cfg if cfg is not None else K.load_lit_config()
+    except Exception:                                          # noqa: BLE001
+        return ""
+    text_dir = (c.get("paths") or {}).get("text_dir") or ""
+    pdf_dir = (c.get("paths") or {}).get("pdf_dir") or ""
+    if not (text_dir and pdf_dir):
+        return ""
+    try:
+        rel = os.path.relpath(os.path.abspath(md_path), text_dir)
+    except ValueError:
+        return ""
+    if rel.startswith(".."):
+        return ""
+    cand = os.path.join(pdf_dir, os.path.splitext(rel)[0] + ".pdf")
+    return cand if os.path.exists(cand) else ""
+
+
+def _scan_pdf_verdict(md_path, cfg=None):
+    """对同源 PDF 做全文 SI 扫描（委托 lit_si，失败一律返回 unknown，不臆断）。
+
+    无同源 PDF 时退回**已提取全文 md** 的文本扫描（lit_si.scan_text_file，
+    与 `lit_si scan --text` 同口径）——正文证据同源，不因缺 PDF 就放弃判定。
+    """
+    pdf = _pdf_for_md(md_path, cfg)
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import lit_si
+        if pdf:
+            return lit_si.scan_pdf(pdf)
+        if md_path and os.path.exists(str(md_path)):
+            return lit_si.scan_text_file(md_path)
+    except Exception:                                            # noqa: BLE001
+        pass
+    return {"verdict": "unknown", "pages": 0}
 
 
 def find_si_file(md_path, cfg=None):
@@ -353,13 +620,58 @@ def find_si_file(md_path, cfg=None):
     if not os.path.isdir(si_dir):
         return ""
     stem = os.path.splitext(os.path.basename(md_path))[0]
-    exact = os.path.join(si_dir, stem + ".si.pdf")
-    if os.path.exists(exact):
-        return exact
+    # 🔴 扩展名不能只看 .pdf： Elsevier 的 mmc 是 .docx、表格是 .xlsx（2026-10-22）
+    for ext in (".pdf", ".docx", ".xlsx"):
+        exact = os.path.join(si_dir, stem + ".si" + ext)
+        if os.path.exists(exact):
+            return exact
     for f in sorted(os.listdir(si_dir)):
-        if f.lower().endswith(".pdf") and stem and stem in f:
+        if stem and stem in f and os.path.splitext(f)[1].lower() in (".pdf", ".docx", ".xlsx"):
             return os.path.join(si_dir, f)
     return ""
+
+
+def load_candidate_pool(cfg=None):
+    """自动汇总**所有历史候选 JSON**，供建卡时补齐 DOI / 作者 / 档位等元数据。
+
+    🔴 为什么需要它（2026-10-17）：`lit_batch --ingest` 调 `lit_ingest --files` 时
+    **不传候选 JSON**，于是每篇只能靠提取件头部抽 DOI——而页脚 DOI 常抽不到 ⇒
+    建出无 DOI/无作者的低质卡（上批 7 例同源重复的根因）。修复：让 `--auto-candidates`
+    自动扫候选池，把当天/历史候选的**全字段**（`authors_all`/`corresponding_author`/
+    `journal_tier`/`issn_l`/`abstract`）带进建卡。
+    ⚠️ 必须扫**新旧两个根**（迁移窗口期纪律，同 `lit_manual_import.build_pool`）：
+    运行产物已从 `_archive/lit-watch/lit-runs/` 搬到 `raw/notes/lit-watch/`，
+    但历史候选池仍在旧处；只扫新根会让历史那批匹配不上。
+    返回 paper dict 列表（保留原字段）。
+    """
+    import glob
+    runs = K.lit_runs_dir(cfg or K.load_lit_config())
+    legacy = os.path.join(K.VAULT, "_archive", "lit-watch", "lit-runs")
+    globs = [
+        os.path.join(runs, "**", "cand*.json"),
+        os.path.join(runs, "picks", "*.json"),
+        os.path.join(legacy, "**", "cand*.json"),
+        os.path.join(legacy, "picks", "*.json"),
+    ]
+    out = []
+    for g in globs:
+        for p in glob.glob(g, recursive=True):
+            base = os.path.basename(p)
+            if base.startswith(("digest-", "fetch_result")):
+                continue
+            try:
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:                       # noqa: BLE001
+                continue
+            if isinstance(data, list):
+                recs = [r for r in data if isinstance(r, dict)]
+            elif isinstance(data, dict):
+                recs = data.get("papers") or []
+            else:
+                recs = []
+            out.extend(r for r in recs if isinstance(r, dict))
+    return out
 
 
 def find_candidate(doi, title, candidates):
@@ -430,36 +742,49 @@ def norm_title(s):
     return t if len(t) >= 10 else ""
 
 
-def build_existing_index(src_dir):
+def build_existing_index(src_dir, extra_dirs=None):
     """扫描库内**全部** source 页，建 {归一DOI: 页名} 与 {归一标题: 页名} 两张表。
 
     用于建卡前判重：同 DOI 已在库（无论页名是否相同）⇒ 不得再建第二张卡。
     标题表仅用于**软告警**（两篇不同文献可能有相近标题，不能据此跳过）。
     读不动的页静默跳过（元数据坏页由 kb_lint 归口，这里不重复报错）。
+
+    🔴 2026-10-23 扩围：除 `src_dir` 外**默认并扫 `projects/*/sources/`**。
+       `src_dir` 是 wiki 卡目录（`wiki/sources`），而项目卡在
+       `projects/<slug>/sources/`。只扫 wiki 的后果：论文先在项目里建了卡，
+       之后从流水线再 ingest 时 DOI 查不到 ⇒ 建出第二张同源卡（本库 2026-10-11
+       已因同类原因产生过 9 对重复页）。`extra_dirs=[]` 可显式关闭。
     """
     by_doi, by_title = {}, {}
-    if not src_dir or not os.path.isdir(src_dir):
+    dirs = []
+    if src_dir and os.path.isdir(src_dir):
+        dirs.append(src_dir)
+    if extra_dirs is None:
+        extra_dirs = sorted(glob.glob(os.path.join(K.VAULT, "projects", "*", "sources")))
+    dirs += [d for d in extra_dirs if d and os.path.isdir(d)]
+    if not dirs:
         return by_doi, by_title
-    for f in sorted(os.listdir(src_dir)):
-        if not f.endswith(".md"):
-            continue
-        name = f[:-3]
-        try:
-            fmr, body = K.split_frontmatter(K.read_text(os.path.join(src_dir, f)))
-            fm = K.parse_frontmatter(fmr)
-        except Exception:                          # noqa: BLE001
-            continue
-        d = K.norm_doi(fm.get("doi"))
-        if d:
-            by_doi.setdefault(d, name)
-        m = re.search(r"^#\s+(.+)$", body or "", re.M)
-        title = m.group(1) if m else ""
-        if not title:
-            al = fm.get("aliases") or []
-            title = str(al[0]) if al else ""
-        nt = norm_title(title)
-        if nt:
-            by_title.setdefault(nt, name)
+    for dd in dirs:
+        for f in sorted(os.listdir(dd)):
+            if not f.endswith(".md"):
+                continue
+            name = f[:-3]
+            try:
+                fmr, body = K.split_frontmatter(K.read_text(os.path.join(dd, f)))
+                fm = K.parse_frontmatter(fmr)
+            except Exception:                      # noqa: BLE001
+                continue
+            d = K.norm_doi(fm.get("doi"))
+            if d:
+                by_doi.setdefault(d, name)
+            m = re.search(r"^#\s+(.+)$", body or "", re.M)
+            title = m.group(1) if m else ""
+            if not title:
+                al = fm.get("aliases") or []
+                title = str(al[0]) if al else ""
+            nt = norm_title(title)
+            if nt:
+                by_title.setdefault(nt, name)
     return by_doi, by_title
 
 
@@ -503,7 +828,7 @@ def build_card(meta, raw_rel, cfg=None, tier=None):
     # 不能默默退回 "missing"。
     si_status = str(meta.get("si_status") or "").strip()
     si_evidence = str(meta.get("si_evidence") or "").strip()
-    if si_status not in ("missing", "partial", "present"):
+    if si_status not in ("missing", "partial", "present", "not_applicable"):
         probe_md = os.path.join(K.VAULT, *str(raw_rel).split("/")) if raw_rel else ""
         got = detect_si_from_md("", probe_md, cfg)
         si_status, si_evidence = got["si_status"], got["si_evidence"]
@@ -681,10 +1006,16 @@ def _outlinks(body):
 
 
 def _inlink_count(page, exclude=()):
-    """全库有多少页面链接到 `page`（按 basename 比对，与 kb_lint 的解析口径一致）。"""
+    """全库有多少页面链接到 `page`（按 basename 比对，与 kb_lint 的解析口径一致）。
+
+    🔴 2026-10-23 扩围：除 `wiki/<PAGE_DIRS>` 外，也扫 `projects/*/sources/`。
+       旧口径只数 wiki 页 ⇒ 一张**被项目卡引用**的新页会被误判「入站 0」，
+       门禁要求人去补一条本来已经存在的链接。
+    """
     n = 0
-    for d in K.PAGE_DIRS:
-        dd = os.path.join(K.WIKI, d)
+    dirs = [os.path.join(K.WIKI, d) for d in K.PAGE_DIRS]
+    dirs += sorted(glob.glob(os.path.join(K.VAULT, "projects", "*", "sources")))
+    for dd in dirs:
         if not os.path.isdir(dd):
             continue
         for f in os.listdir(dd):
@@ -712,7 +1043,7 @@ def gate_cards(written, planned, strict_backlinks=True):
     判定分两级（**硬 vs 软**），因为两类问题性质不同：
       · **硬**（结构坏了、页面不可用）→ 非零退出，必须修：
         frontmatter 不可解析 / 缺 type / authors 不是 list / `sources:` 首条不是
-        `[[raw/...]]` / 回链文件在盘上不存在。
+        `[[raw/...]]` 或 `[[projects/...]]` / 回链文件在盘上不存在。
       · **软**（纪律未完成、但页面本身完好）→ 记入门禁报告并返回 exit 2：
         出站页面链接 < 2、入站 = 0。**不自动替人补链**（那会凭空造出错误关联），
         只把缺口写成机器可读的报告 + 待办，逼下一轮精读时处理。
@@ -739,8 +1070,11 @@ def gate_cards(written, planned, strict_backlinks=True):
             hard.append((name, f"authors 不是列表（{type(au).__name__}）"))
         src = fm.get("sources") or []
         first = str(src[0]) if src else ""
-        if not re.match(r"^\[\[raw/", first):
-            hard.append((name, f"sources 首条不是 [[raw/...]]：{first[:60]}"))
+        # 🔴 2026-10-22：回链前缀放宽为 raw/ 与 projects/（综述工程参考文献落
+        #    `projects/<slug>/references/` 是用户约定，回链必须跟随文件实际位置；
+        #    gate 是「页面结构完好性」判定，不是「落点合规」判定，不应卡住该模式）。
+        if not re.match(r"^\[\[(raw|projects)/", first):
+            hard.append((name, f"sources 首条不是 [[raw/...]] 或 [[projects/...]]：{first[:60]}"))
         else:
             rel = first[2:].split("]]")[0].replace("\\", "/").rstrip("/")
             if rel and not os.path.exists(os.path.join(K.VAULT, *rel.split("/"))):
@@ -828,6 +1162,24 @@ def selftest():
     caught = bad_joined.count(os.path.basename(K.VAULT)) > 1
     print(f"  [{'ok' if caught else 'FAIL'}] 反例 绝对 target 会被检出重复库根")
     ok = ok and caught
+    # 6b) --page-dir 规范化（2026-10-22 新增：综述工程卡落 sources）
+    pd_ok, pd_err = normalize_page_dir("projects/myproj/sources")
+    pd_ok2 = pd_ok == "projects/myproj/sources" and pd_err is None
+    print(f"  [{'ok' if pd_ok2 else 'FAIL'}] --page-dir 接受相对路径（{pd_ok}）")
+    ok = ok and pd_ok2
+    pd_bs, _ = normalize_page_dir("projects\\A\\ingest\\sources\\")
+    bs_ok = pd_bs == "projects/A/sources"
+    print(f"  [{'ok' if bs_ok else 'FAIL'}] --page-dir 反斜杠/首尾斜杠被归一（{pd_bs}）")
+    ok = ok and bs_ok
+    pd_dflt, _ = normalize_page_dir("")
+    dflt_ok = pd_dflt == "wiki/sources"
+    print(f"  [{'ok' if dflt_ok else 'FAIL'}] --page-dir 空值回退默认 wiki/sources")
+    ok = ok and dflt_ok
+    pd_abs, err_abs = normalize_page_dir("Z:/outside-vault/wiki/sources")
+    pd_dot, err_dot = normalize_page_dir("projects/../../etc")
+    rej_ok = (pd_abs is None and bool(err_abs)) and (pd_dot is None and bool(err_dot))
+    print(f"  [{'ok' if rej_ok else 'FAIL'}] 反例 绝对路径与 `..` 逃逸均被拒绝")
+    ok = ok and rej_ok
     # 7) source_url：有 DOI 时必须是可点击的 doi.org 链接；无 DOI 时留空
     f3, _, _, _ = build_card(
         {"title": "X", "year": "2026", "journal": "Nature",
@@ -907,7 +1259,14 @@ def selftest():
     #    现状，是 CLAUDE.md §校验器自检纪律明确点名的一类腐坏（同型事故已 7 次）。
     cfg = {
         "journals": [{"issn_l": "0028-0836", "name": "Nature", "tier": "T0"},
-                     {"issn_l": "0947-7047", "name": "Ionics", "tier": "T4"}],
+                     {"issn_l": "0947-7047", "name": "Ionics", "tier": "T4"},
+                     # 子串回归夹具：短刊名 Science(T0) 不得劫持长刊名。
+                     {"issn_l": "0036-8075", "name": "Science", "tier": "T0"},
+                     {"issn_l": "0376-7388", "name": "Journal of Membrane Science", "tier": "T3"},
+                     {"issn_l": "2198-3844", "name": "Advanced Science", "tier": "T3"},
+                     {"issn_l": "2375-2548", "name": "Science Advances", "tier": "T1"},
+                     # 短名护栏：真实白名单里有 "Chem"(T0)，不得命中所有化学刊。
+                     {"issn_l": "2451-9294", "name": "Chem", "tier": "T0"}],
         "tiers": {"T0": {"label": "夹具正刊", "relevance_min": 0.40,
                          "ingest_depth": "enhanced", "uncapped": True},
                   "T4": {"label": "夹具专业刊", "relevance_min": 0.70,
@@ -943,6 +1302,16 @@ def selftest():
     rt3 = resolve_tier(None, {"journal": "某不存在的刊"}, cfg)
     print(f"  [{'ok' if rt3 == cfg.get('default_tier') else 'FAIL'}] 反例 未知刊回退默认档（{rt3}）")
     ok = ok and rt3 == cfg.get("default_tier")
+    # 回归（2026-10-22）：刊名含 "Science" 时不得被子串 "Science"(T0) 劫持。
+    for jn, want in [("Journal of Membrane Science", "T3"),
+                     ("Advanced Science", "T3"),
+                     ("Science Advances", "T1"),
+                     ("Chemical Engineering Journal", "T3"),
+                     ("ACS Sustainable Chemistry & Engineering", "T3"),
+                     ("ChemElectroChem", "T3")]:
+        got = resolve_tier(None, {"journal": jn}, cfg)
+        print(f"  [{'ok' if got == want else 'FAIL'}] resolve_tier 精确优先：{jn}→{got}（期望 {want}）")
+        ok = ok and got == want
 
     # 8b) SI 证据探测（2026-10-10）：si_status 必须**来自证据**，不得默认 missing。
     #     正例：头部声明含补充材料页 → partial；反例：声明「无补充材料」→ missing；
@@ -959,6 +1328,39 @@ def selftest():
     c3 = si3["si_status"] == "missing" and "未判定" in si3["si_evidence"]
     print(f"  [{'ok' if c3 else 'FAIL'}] SI 无依据时如实标注未判定（{si3}）")
     ok = ok and c3
+    # 回归（2026-10-25）：页区间畸变（起>止，如『补充材料 11-10 页』）不可信，
+    # 以正文实扫为准——真有 SI 章节 → partial；没有 → missing 走全文扫描。
+    with K.temp_dir(prefix="lit_ingest_degsi_") as _td:
+        _md_si = os.path.join(_td, "deg_si.md")
+        with open(_md_si, "w", encoding="utf-8") as fh:
+            fh.write("# T\n\n<!-- page 5 -->\n\nbody\n\n<!-- page 6 -->\n\n"
+                     "Supplementary Information\n\nsome SI text\n")
+        d1 = detect_si_from_md("共 10 页（正文 1-10 页，补充材料 11-10 页）",
+                               md_path=_md_si, cfg={})
+        c1b = d1["si_status"] == "partial" and "第 6 页" in d1["si_evidence"]
+        print(f"  [{'ok' if c1b else 'FAIL'}] SI 畸变区间+正文实有 SI 章节 → partial 实扫更正（{d1}）")
+        ok = ok and c1b
+        _md_no = os.path.join(_td, "deg_no.md")
+        with open(_md_no, "w", encoding="utf-8") as fh:
+            fh.write("# T\n\n<!-- page 5 -->\n\n" + "plain body text without any marker. " * 12
+                     + "\n<!-- page 6 -->\n" + "more plain body text here. " * 10 + "\n")
+        d2 = detect_si_from_md("共 10 页（正文 1-10 页，补充材料 11-10 页）",
+                               md_path=_md_no, cfg={})
+        c2b = d2["si_status"] == "not_applicable" and "无 SI 声明" in d2["si_evidence"]
+        print(f"  [{'ok' if c2b else 'FAIL'}] SI 畸变区间+全文扫描无 SI 证据 → not_applicable（{d2}）")
+        ok = ok and c2b
+        # 反例（2026-10-25 实测 26 例）：ACS 首页导航栏的『Supporting Information』
+        # 装饰行不得当成 SI 章节标题（旁边就是 ABSTRACT）→ 走扫描路径。
+        _md_chrome = os.path.join(_td, "acs_chrome.md")
+        with open(_md_chrome, "w", encoding="utf-8") as fh:
+            fh.write("# T\n\n<!-- page 1 -->\n\nACCESS\nMetrics &amp; More\n"
+                     "Article Recommendations\nSupporting Information\nABSTRACT: text. "
+                     + "body words " * 30 + "\n<!-- page 2 -->\nplain second page\n")
+        d3 = detect_si_from_md("共 10 页（正文 1-10 页，补充材料 11-10 页）",
+                               md_path=_md_chrome, cfg={})
+        c3b = d3["si_status"] == "missing" and "未取到独立文件" in d3["si_evidence"]
+        print(f"  [{'ok' if c3b else 'FAIL'}] ACS 首页装饰行不算 SI 章节 → missing（{d3}）")
+        ok = ok and c3b
     # 卡片正文必须带 SI 缺口标记（CLAUDE.md §SI 缺失标记协议；旧版从未实现）
     _fs, _, _bs, _ = build_card({"title": "SI Gap Probe Paper", "year": "2026",
                                  "journal": "Nature", "si_status": "missing",
@@ -985,7 +1387,8 @@ def selftest():
                   encoding="utf-8") as fh:
             fh.write(render_frontmatter({"type": "source", "doi": "10.1038/dup.1"})
                      + "# Existing Canonical Title\n")
-        bd, bt = build_existing_index(tsrc2)
+        # extra_dirs=[] 隔离生产库：已知答案的夹具不能被真实项目卡干扰
+        bd, bt = build_existing_index(tsrc2, extra_dirs=[])
         # 正例：同 DOI ⇒ 硬命中，指向既有页
         k1, p1 = find_duplicate("10.1038/dup.1", "完全不同的标题任意文字", bd, bt,
                                 "2026-New-Page-Nature")
@@ -1018,6 +1421,32 @@ def selftest():
         good = norm_title("短") == "" and norm_title("Existing Canonical Title") != ""
         print(f"  [{'ok' if good else 'FAIL'}] 标题归一拒绝过短标题")
         ok = ok and good
+
+        # 🆕 2026-10-23：项目卡目录并入判重（反例含义：若只扫 wiki/sources，
+        #    这里会返回 None —— 论文先在项目里建过卡，流水线会再建一张同源卡）
+        tproj = tsrc2 + "_proj"
+        os.makedirs(tproj, exist_ok=True)
+        try:
+            with open(os.path.join(tproj, "2026-Project-Card-AdvMater.md"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(render_frontmatter({"type": "source",
+                                             "doi": "10.1002/adma.proj.1"})
+                         + "# Project Only Paper Title\n")
+            bd2, _ = build_existing_index(tsrc2, extra_dirs=[tproj])
+            k5, p5 = find_duplicate("10.1002/adma.proj.1", "x", bd2, {}, "2026-New")
+            good = (k5 == "doi" and p5 == "2026-Project-Card-AdvMater")
+            print(f"  [{'ok' if good else 'FAIL'}] 闸门 项目卡目录并入判重（{k5},{p5}）")
+            ok = ok and good
+        finally:
+            for f in os.listdir(tproj):
+                try:
+                    os.remove(os.path.join(tproj, f))
+                except Exception:                 # noqa: BLE001
+                    pass
+            try:
+                os.rmdir(tproj)
+            except Exception:                     # noqa: BLE001
+                pass
     finally:
         for f in os.listdir(tsrc2):
             try:
@@ -1034,13 +1463,56 @@ def selftest():
                  for t in ("kb_dois.py", "lit_catalogue.py"))
     print(f"  [{'ok' if dep_ok else 'FAIL'}] refresh_dedup 依赖工具存在（kb_dois/lit_catalogue）")
     ok = ok and dep_ok
+    # 9a) 候选池加载器（2026-10-17）：必须容忍多种 JSON 形状（{papers:[]} / 纯列表 /
+    #     单篇 dict），且 **丢弃解析失败的文件而不炸**。夹具自带临时候选 JSON。
+    import tempfile as _tf0
+    pool_dir = K.make_temp_dir(prefix="lit_ingest_pool_")
+    try:
+        with open(os.path.join(pool_dir, "cand_x.json"), "w", encoding="utf-8") as f:
+            json.dump({"papers": [{"doi": "10.1/a", "title": "T1",
+                                   "journal_tier": "T1", "authors_all": ["A", "B"]}]}, f)
+        with open(os.path.join(pool_dir, "cand_y.json"), "w", encoding="utf-8") as f:
+            json.dump([{"doi": "10.2/b", "title": "T2"}], f)          # 纯列表形状
+        with open(os.path.join(pool_dir, "cand_z.json"), "w", encoding="utf-8") as f:
+            f.write("{ 坏 JSON")                                       # 解析失败须跳过
+        import glob as _glob
+
+        def _pool_from(d):
+            out = []
+            for p in _glob.glob(os.path.join(d, "cand*.json")):
+                try:
+                    with open(p, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                except Exception:                     # noqa: BLE001
+                    continue
+                recs = ([r for r in data if isinstance(r, dict)]
+                        if isinstance(data, list)
+                        else (data.get("papers") or [] if isinstance(data, dict) else []))
+                out.extend(r for r in recs if isinstance(r, dict))
+            return out
+
+        got = _pool_from(pool_dir)
+        c9 = len(got) == 2 and {g.get("doi") for g in got} == {"10.1/a", "10.2/b"}
+        print(f"  [{'ok' if c9 else 'FAIL'}] 候选池加载容忍多形状、坏 JSON 不炸"
+              f"（{len(got)} 条）")
+        ok = ok and c9
+        # load_candidate_pool 真源：注入临时 runs_dir 配置，断言能读到
+        cfg_pool = {"paths": {**K.LIT_CONFIG_DEFAULTS["paths"], "runs_dir": pool_dir}}
+        got2 = load_candidate_pool(cfg_pool)
+        c9b = {g.get("doi") for g in got2} == {"10.1/a", "10.2/b"}
+        print(f"  [{'ok' if c9b else 'FAIL'}] load_candidate_pool 按配置 runs_dir 汇总"
+              f"（{len(got2)} 条）")
+        ok = ok and c9b
+    finally:
+        _shutil0 = __import__("shutil")
+        _shutil0.rmtree(pool_dir, ignore_errors=True)
     # 9b) --with-index 的收尾子步骤：**存在才跑**（不存在不得凭空多一个失败步骤）
     #     用具名桩文件 + 临时 HERE 验证两个分支，不动本目录的既有文件。
     import shutil as _shutil
     import tempfile
 
     def _mkprobe(prefix):
-        # 注意：不要用 tempfile.mkdtemp(dir=...)。本机实测在受限环境下
+        # 注意：不要用 K.make_temp_dir(dir=...)。本机实测在受限环境下
         # 「mkdtemp 建的目录」里写文件会被拒（能建目录、不能写），而 os.makedirs 建的可以；
         # 所以这里统一用 os.makedirs，并逐级回退：系统临时目录 → 当前目录 → 工具目录。
         import uuid as _uuid
@@ -1096,6 +1568,150 @@ def selftest():
     finally:
         _shutil.rmtree(probe_empty, ignore_errors=True)
         _shutil.rmtree(probe_stub, ignore_errors=True)
+
+    # 10) 回归夹具（2026-10-14 ACS 页脚 DOI / 多行摘要；2026-10-17 扩为全篇+打分）
+    #     正例 A：ACS 式版式——文章 DOI 印在**页眉/页脚**（>4000 字符外）且全文出现 ≥3 次，
+    #             摘要为跨行 `ABSTRACT: …`。
+    #     正例 B：文件名词干强命中 DOI 后缀（`sciadv.aei9659` → `10.1126/sciadv.aei9659`），
+    #             即使 DOI 出现次数不足也敢下结论。
+    #     反例 A：参考文献里的 DOI 不得被当成文章 DOI（无 doi.org 锚定 / 次数不足 ⇒ 留空）。
+    #     反例 B：Zenodo **数据** DOI 排在文章 DOI 之前 ⇒ 不得抢占（旧「盲扩窗口取首个」会中招）。
+    import tempfile as _tf
+    tmpdir = K.make_temp_dir(prefix="lit_ingest_selftest_")
+    try:
+        # —— 正例 A：ACS 版式；DOI 在头/脚/doi.org 出现 3 次（与真实 PDF 一致），
+        #    且主 DOI 出现在 4000 字符之后。
+        acs = (
+            "---\ntitle: \"X\"\n---\n"
+            "# X\n> 提取自 PDF：共 13 页（正文 1-13 页，无补充材料）。\n\n"
+            "<!-- page 1 -->\n\nSome Title Line Here\nAuthors A, B, C\n"
+            "ABSTRACT: " + "This is a quite long abstract sentence that spans " * 8 +
+            "the end of the abstract.\n■INTRODUCTION\n" + "filler line\n" * 400 +
+            "Widget, W. An unrelated citation. J. Foo 2019, doi:10.9999/ref.123.\n"
+            "https://doi.org/10.1021/jacs.6c13252\n"
+            "Downloaded from pubs.acs.org/jacsat/article-pdf/… 10.1021/jacs.6c13252\n"
+            "J. Am. Chem. Soc. 2026, 148, 1. https://doi.org/10.1021/jacs.6c13252\n"
+        )
+        pa = os.path.join(tmpdir, "acs.md")
+        with open(pa, "w", encoding="utf-8", newline="\n") as f:
+            f.write(acs)
+        ra = extract_from_md(pa)
+        c_doi = ra["doi"] == "10.1021/jacs.6c13252"
+        print(f"  [{'ok' if c_doi else 'FAIL'}] 回归 页脚 DOI（>4000 字符外、多次出现）能抽取"
+              f"（{ra['doi']}）")
+        ok = ok and c_doi
+        c_abs = len(ra["abstract"]) >= 80 and "abstract sentence" in ra["abstract"]
+        print(f"  [{'ok' if c_abs else 'FAIL'}] 回归 多行 ABSTRACT 摘要能抽取"
+              f"（len={len(ra['abstract'])}）")
+        ok = ok and c_abs
+        # —— 正例 B：文件名词干 ⊆ DOI 后缀（`sciadv.aei9659.md`）
+        b_doi = ("---\ntitle: B\n---\n# B\n" + "y" * 200 +
+                 "\nSee Supplementary Materials. Data at "
+                 "https://doi.org/10.5281/zenodo.21700225.\n"
+                 + "z" * 12000 +
+                 "\nZhang et al., Sci. Adv. 12, eaei9659 (2026). "
+                 "https://doi.org/10.1126/sciadv.aei9659\n")
+        pb2 = os.path.join(tmpdir, "sciadv.aei9659.md")
+        with open(pb2, "w", encoding="utf-8", newline="\n") as f:
+            f.write(b_doi)
+        rb2 = extract_from_md(pb2)
+        c_b = rb2["doi"] == "10.1126/sciadv.aei9659"
+        print(f"  [{'ok' if c_b else 'FAIL'}] 回归 数据 DOI 在前、文件名词干命中文章 DOI"
+              f"（{rb2['doi']}）")
+        ok = ok and c_b
+        # —— 正例 C：DOI 以**下划线**嵌在文件名里（反向包含命中）；
+        #    文章 DOI 在正文里出现次数不足、且参考文献 DOI 更常见 ⇒ 仍须选对。
+        b3 = ("---\ntitle: C\n---\n# C\n" + "q" * 200 +
+              "See refs 10.1016/0001-6160. Another 10.1016/0001-6160.\n"
+              "Third 10.1016/0001-6160 mention.\n"
+              "Published doi:10.1149/1945-7111/aeb0d6\n")
+        pc = os.path.join(tmpdir, "Dobkin_2026_JES_10.1149_1945-7111_aeb0d6.md")
+        with open(pc, "w", encoding="utf-8", newline="\n") as f:
+            f.write(b3)
+        rc = extract_from_md(pc)
+        c_c = rc["doi"] == "10.1149/1945-7111/aeb0d6"
+        print(f"  [{'ok' if c_c else 'FAIL'}] 回归 反向包含：DOI 嵌于文件名（下划线）"
+              f"（{rc['doi']}）")
+        ok = ok and c_c
+        # —— 反例 A：参考文献 DOI 不得抢占（正文无 doi.org 页脚时，
+        #    回退「首个 DOI」会命中参考文献 DOI——现在改为留空，不臆造）
+        ref = ("---\ntitle: Y\n---\n# Y\n" + "x" * 100 +
+               "\nWidget, W. J. Foo 2019, doi:10.9999/ref.123.\n" +
+               "https://doi.org/10.1021/jacs.6c13252\n")
+        pb = os.path.join(tmpdir, "ref.md")
+        with open(pb, "w", encoding="utf-8", newline="\n") as f:
+            f.write(ref)
+        rb = extract_from_md(pb)
+        c_ref = rb["doi"] == ""
+        print(f"  [{'ok' if c_ref else 'FAIL'}] 反例 低置信参考文献 DOI 不得被当成文章 DOI"
+              f"（留空，实得 {rb['doi']!r}）")
+        ok = ok and c_ref
+        # —— 反例 B：Zenodo 数据 DOI 排在文章 DOI 之前（无文件名词干可依赖时不得臆造）
+        dep = ("---\ntitle: D\n---\n# D\n" + "w" * 200 +
+               "\nData are available at https://doi.org/10.5281/zenodo.1234567.\n" +
+               "m" * 300)
+        pd = os.path.join(tmpdir, "dep.md")
+        with open(pd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(dep)
+        rd = extract_from_md(pd)
+        c_dep = rd["doi"] == ""
+        print(f"  [{'ok' if c_dep else 'FAIL'}] 反例 数据仓库 DOI（Zenodo）不得被当成文章 DOI"
+              f"（留空，实得 {rd['doi']!r}）")
+        ok = ok and c_dep
+        # —— gate_cards 回链硬判据（2026-10-22：raw/ 放宽为 raw/|projects/）——
+        # 正例：raw/ 与 projects/ 回链均通过；反例：其它前缀（如 concepts/）必须拒绝。
+        import unittest.mock as mock
+        os.makedirs(os.path.join(tmpdir, "raw", "text"), exist_ok=True)
+        os.makedirs(os.path.join(tmpdir, "projects", "myproj-review",
+                                 "references"), exist_ok=True)
+        os.makedirs(os.path.join(tmpdir, "wiki", "sources"), exist_ok=True)
+        open(os.path.join(tmpdir, "raw", "text", "x.md"), "w").close()
+        open(os.path.join(tmpdir, "projects", "myproj-review",
+                          "references", "y.md"), "w").close()
+
+        def _card(rel, fname):
+            p = os.path.join(tmpdir, "wiki", "sources", fname)
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                f.write("---\ntype: source\nauthors: []\nsources:\n"
+                        f"  - \"[[{rel}]]\"\n---\n# {fname}\n\n正文正文\n")
+            return {"target": f"wiki/sources/{fname}", "page": fname, "exists": False}
+
+        plan = [_card("raw/text/x.md", "G-A.md"),
+                _card("projects/myproj-review/references/y.md", "G-B.md"),
+                _card("concepts/foo", "G-C.md")]
+        with mock.patch.object(K, "VAULT", tmpdir):
+            hard, _soft = gate_cards([], plan)
+        hnames = {n for n, _ in hard}
+        c_g1 = "G-A.md" not in hnames and "G-B.md" not in hnames
+        print(f"  [{'ok' if c_g1 else 'FAIL'}] gate_cards 接受 raw/ 与 projects/ 回链"
+              f"（hard={hard}）")
+        ok = ok and c_g1
+        c_g2 = "G-C.md" in hnames
+        print(f"  [{'ok' if c_g2 else 'FAIL'}] 反例 gate_cards 拒绝非 raw/projects 回链"
+              f"（hard={hard}）")
+        ok = ok and c_g2
+    finally:
+        _shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # 回归（2026-10-22）：SI 文件的扩展名不只 .pdf —— Elsevier 的 mmc 是 .docx。
+    # 旧实现只认 `.si.pdf` + `.pdf` 后缀 ⇒ 下载成功的 docx 会被判成"没有 SI"。
+    tmpd2 = K.make_temp_dir(prefix="lit_ingest_selftest2_")
+    try:
+        os.makedirs(os.path.join(tmpd2, "si"), exist_ok=True)
+        for ext in (".docx", ".pdf"):
+            open(os.path.join(tmpd2, "si", f"论文{ext[1:]}.si{ext}"), "wb").close()
+        cfg2 = {"paths": {"pdf_dir": tmpd2, "text_dir": tmpd2}}
+        got_docx = find_si_file(os.path.join(tmpd2, "论文docx.md"), cfg2)
+        c_si = bool(got_docx) and got_docx.endswith(".si.docx")
+        print(f"  [{'ok' if c_si else 'FAIL'}] find_si_file 认得 .si.docx（Elsevier mmc）-> {got_docx}")
+        ok = ok and c_si
+        miss = find_si_file(os.path.join(tmpd2, "不存在.md"), cfg2)
+        c_si2 = miss == ""
+        print(f"  [{'ok' if c_si2 else 'FAIL'}] 反例 无对应 SI 时返回空 -> {miss!r}")
+        ok = ok and c_si2
+    finally:
+        _shutil.rmtree(tmpd2, ignore_errors=True)
+
     print("=== selftest", "PASS ===" if ok else "FAIL ===")
     return 0 if ok else 1
 
@@ -1158,6 +1774,11 @@ def main():
     ap = argparse.ArgumentParser(description="全文 → source 卡骨架")
     ap.add_argument("--files", nargs="*", default=[], help="要建卡的 raw md（相对库根）")
     ap.add_argument("--candidates", default="", help="lit_discover 产出的候选 JSON")
+    ap.add_argument("--auto-candidates", action="store_true",
+                    help="自动汇总所有历史候选 JSON 作为元数据池（补 DOI/作者/档位）")
+    ap.add_argument("--page-dir", default="",
+                    help="source 卡落点（**相对库根**，如 "
+                         "projects/Proj/sources；默认取 lit_config layout.source_page_dir）")
     ap.add_argument("--all-text", action="store_true",
                     help="扫描 raw/text/ 下尚未建卡的全部 md")
     ap.add_argument("--apply", action="store_true", help="真正写盘（默认干跑）")
@@ -1176,6 +1797,22 @@ def main():
     text_dir = cfg["paths"]["text_dir"]
     layout = cfg.get("layout") or {}
     src_rel = layout.get("source_page_dir", "wiki/sources")
+    if args.page_dir:
+        src_rel, _err = normalize_page_dir(args.page_dir, src_rel)
+        if _err:
+            ap.error(_err)
+        # 项目目录不是 wiki 页 ⇒ 必须显式提示能否被检索层看见，
+        # 免得日后以为"卡建了却搜不到"是检索坏了。
+        # 2026-10-22 起：`projects/*/sources/` 已纳入 BM25/语义/图谱索引；
+        # 项目内的**其他**子目录仍不入索引（只认这一个落点）。
+        if not src_rel.startswith("wiki/"):
+            if src_rel.startswith("projects/") and "/sources" in src_rel:
+                print(f"[i] source 卡落点 = {src_rel}/（非 wiki/，但已在 "
+                      f"projects/*/sources 白名单内，会进检索索引）")
+            else:
+                print(f"[i] source 卡落点 = {src_rel}/（非 wiki/ 且不在 "
+                      f"projects/*/sources 内 ⇒ 不入 BM25 索引，"
+                      f"不会被 kb_route/kb_search 命中）")
     src_dir = os.path.join(K.VAULT, *src_rel.split("/"))
     backlink_prefix = layout.get("source_page_backlink_prefix",
                                  cfg["paths_rel"].get("text_dir", "raw/text"))
@@ -1189,6 +1826,20 @@ def main():
         with open(args.candidates, encoding="utf-8") as f:
             candidates = json.load(f).get("papers") or []
         print(f"[i] 候选元数据 {len(candidates)} 条 ← {args.candidates}")
+    # 🔴 2026-10-17：`--auto-candidates` 自动汇总历史候选池（供 lit_batch --ingest 使用）。
+    #    显式 --candidates 与自动池**合并**（显式优先，自动池补漏）。
+    if args.auto_candidates:
+        auto = load_candidate_pool(cfg)
+        seen = {(str(c.get("doi") or "")).lower().strip() for c in candidates
+                if c.get("doi")}
+        for c in auto:
+            d = (str(c.get("doi") or "")).lower().strip()
+            if d and d in seen:
+                continue
+            candidates.append(c)
+            if d:
+                seen.add(d)
+        print(f"[i] 自动候选池 {len(auto)} 条 → 合并后 {len(candidates)} 条")
 
     files = list(args.files)
     if args.all_text or not files:
@@ -1379,8 +2030,5 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    K.console_encoding()
     sys.exit(main())

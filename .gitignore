@@ -6,3 +6,8 @@ build/fixtures/_tmp/
 _pycache/
 .DS_Store
 Thumbs.db
+
+# 去个人化规则本身含源库专名（库名/工程名/研究方向/本机路径），
+# 发布它们等于把生成器要抹掉的东西原样公开。仓库只留 *.example 模板。
+# 详见 build/rules/README.md。
+build/rules/private/

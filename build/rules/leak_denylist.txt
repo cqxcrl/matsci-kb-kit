@@ -1,12 +1,19 @@
-# fail-closed 泄漏扫描 denylist（逐行一个正则）。
-# build_kit.py 在生成后扫整个输出树，任一命中即构建失败。
-# 只列**真正的个人/身份标识**——不要放通用词（如「知识库」「Zotero」），
-# 否则全部工具源码都会命中，扫描失去意义。
-E:[\\/]
-C:\\Users\\asus
-镍铁催化剂
-Chem&Mater
-Matsci Knowledge Base
-Battery Knowledge Base
-AI-for-Materials-Review
-AI for Materials Literature Review
+# 通用泄漏 denylist（逐行一个正则，re.search 语义）——**随仓库发布**。
+#
+# 这一份只放「不含任何真实专名、也不会误伤 kit 自身占位符」的**形态**规则：
+# 谁 clone 这个仓库、把 --src 指向自己的库，这几条都立刻对他有用。
+# 源库专名（库名/工程名/研究方向/文献卡 slug）在 build/rules/private/leak_denylist.txt，
+# 那份 gitignored——两份在 scan_leaks() 里合并后一起跑。
+#
+# 🔴 收录门槛：必须在本 kit 树上 **0 命中**。刻意**不收**下面两类，因为实测全是误伤：
+#    · 泛盘符路径 `[A-Za-z]:[\\/]` —— 命中 189 处，全是 https:// 的尾巴、
+#      浏览器可执行文件路径（C:\Program Files\...）、SSRF 反例（file:///C:/Windows/win.ini）
+#      与文档占位符（D:\downloads / D:\MyVault）。这些都不是隐私。
+#    · 邮箱地址 —— 命中 3 处，全是**反面教材与自检夹具**：lit_fetch.py 里
+#      说明「为什么不能写死 CONTACT_EMAIL」时举的 lit.watch@example.org、
+#      以及 selftest 的 real@lab.edu。真邮箱请写进 private/ 那份。
+
+# ① 带用户名的家目录（最高价值的一类：直接暴露本机账户名）
+[A-Za-z]:\\+Users\\+[^\\/"']+
+/Users/[^/\s"']+
+/home/[^/\s"']+

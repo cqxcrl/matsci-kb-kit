@@ -15,6 +15,7 @@
 用法：
   python tools/sci_protocol_gen.py --goal "锌负极 沉积" --top 3
   python tools/sci_protocol_gen.py --goal "锌负极 沉积" --category 合成
+  python tools/sci_protocol_gen.py --goal "锌 电解液" --top 3 --no-chain-bonus  # N6：关掉链加分
   python tools/sci_protocol_gen.py --choose "source:<卡名>"
   python tools/sci_protocol_gen.py --selftest
 """
@@ -30,6 +31,7 @@ TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS_DIR)
 
 import kb_lib as K  # noqa: E402
+import sci_links as LK  # noqa: E402  课题主键（只读纯函数；schema 唯一来源）
 K.console_encoding()
 
 CONFIG_REL = "projects/sci-assistant/config/sci_assistant_config.yaml"
@@ -86,6 +88,9 @@ def _method_text(m):
             if isinstance(it, dict):
                 parts.extend(str(it.get(k) or "") for k in
                              ("name", "metric", "value", "role") if it.get(k))
+    # 方向归因（2026-10-21）：`directions` 是卡片级事实，让「锌沉积」这类方向
+    # 能选中名字里不含该词的方法（如「可控应力台架」「XPS/TOF-SIMS」）
+    parts.extend(str(x) for x in (m.get("directions") or []))
     return " ".join(parts)
 
 
@@ -115,10 +120,16 @@ def _goal_tokens(goal):
     return list(dict.fromkeys(chunks))
 
 
-def select_methods(methods, goal, category=None, top=3):
+def select_methods(methods, goal, category=None, top=3, chain=None):
     """按目标词选方法：要求目标词**基本全中**（≥80%），再按命中数/证据质量排序。
 
     只命中一个泛词（如"沉积"）不算匹配——实测会把锂电电解液论文当成锌沉积方案。
+
+    `chain` = `build_chain_context()` 的产物（None ⇒ 不做链加分，行为与旧版逐位相同）。
+    排序键 = (match, final_score, name)，其中 `final_score = rank_score + chain_bonus`：
+      · match 仍是最前一级 ⇒ 链加分**推翻不了**目标词匹配数（不把弱相关方法顶上来）；
+      · 同一 match 档内，`final_score` 只是 `rank_score` 加一个常数偏移，所以
+        **chain_bonus 全为 0 时排序与旧的 `(-match, -(quoted-2*bad), name)` 完全相同**。
     """
     tokens = _goal_tokens(goal)
     if not tokens:
@@ -136,7 +147,29 @@ def select_methods(methods, goal, category=None, top=3):
         quoted, bad = method_quote_stats(m)
         scored.append({"method": m, "match": len(hits), "quoted": quoted,
                        "bad": bad, "rank_score": round(len(hits) * 10 + quoted - 2 * bad, 3)})
-    scored.sort(key=lambda x: (-x["match"], -(x["quoted"] - 2 * x["bad"]),
+    # N6 链加分：只当排序/展示字段，**不动** match / quoted / bad 这些事实字段
+    enabled = bool(chain and chain.get("enabled"))
+    info = (chain or {}).get("info") or {}
+    for s in scored:
+        ci = info.get(s["method"]["method_id"]) if enabled else None
+        if ci:
+            s["chain_position"] = ci.get("position")
+            s["chain_bonus"] = round(float(ci.get("bonus") or 0.0), 3)
+            s["chain_upstream"] = ci.get("upstream") or []
+            s["chain_basis"] = ci.get("basis") or ""
+        elif enabled:
+            # 在链上没有任何边：位置确实是 0/0（不是"未知"）
+            s["chain_position"] = {"upstream": 0, "downstream": 0}
+            s["chain_bonus"] = 0.0
+            s["chain_upstream"] = []
+            s["chain_basis"] = "无上游（chains.json 无边指向本方法）"
+        else:
+            s["chain_position"] = None
+            s["chain_bonus"] = 0.0
+            s["chain_upstream"] = []
+            s["chain_basis"] = ""
+        s["final_score"] = round(s["rank_score"] + s["chain_bonus"], 3)
+    scored.sort(key=lambda x: (-x["match"], -x["final_score"],
                                x["method"]["name_zh"]))
     # 有带引文的候选时，不把 0 引文的 L1 混进对比表（L1 只作补充）
     if any(s["quoted"] > 0 for s in scored):
@@ -333,12 +366,273 @@ def render_chain_section(selected_ids, limit=8):
     rows = term[:limit] + weak[:max(0, min(4, limit - len(term[:limit])))]
     L = ["## 方法链（产出 → 输入）", "",
          "> 由 `sci_method_chain.py` 生成，每条边两侧的 quote 都已通过原文连续子串校验。",
-         "> 「术语共享」= 产出物与输入物共享具体名词；「类别级（弱）」= 只按方法类别衔接，"
-         "**不保证同一材料体系**。依赖关系是推断，不是作者明示的因果。", ""]
+         "> 「术语共享」= 产出物与输入物共享**具体型号/代号**（MTFP、NEDL、SRCE 这类），"
+         "或产物名字面相同；盐/溶剂/单位这类通用词**不算**共享。"
+         "「类别级（弱）」= 只按方法类别衔接，**不保证同一材料体系**。依赖关系是推断，不是作者明示的因果。", ""]
     for e in rows[:limit]:
         tag = "术语共享" if e.get("evidence_level") == "term" else "类别级（弱）"
         L.append(f"- {e['from_name']} —产出「{e['artifact']}」→ {e['to_name']}"
                  f"（需要「{e['matched_input']}」）｜ {tag}")
+    L.append("")
+    return "\n".join(L)
+
+
+# ---------------------------------------------------------------- N6：方法链驱动排序（chain bonus）
+#
+# 诊断意见#2 差距7：候选只按「目标词命中 + 证据引文数」排序，**完全不看它在方法链上的位置**——
+# 一个上游方法实验室根本跑不起来的候选，可能因为引文多而排在前面。
+# 本节只做三件事：① 数上下游（chain_position）；② 给「上游能落地」的候选加分（chain_bonus）；
+# ③ 把加分依据写进策略层报告。
+# 🔴 quote 校验 / 判断层 / G1–G4·G6 审核门 / `render_strategy` 既有小节一律不动；
+#    加分只进排序（同一 match 档内）与展示，`--no-chain-bonus` 时归零、排序与旧行为逐位相同。
+#
+# 加分公式（可复算）：
+#   chain_bonus = min(4.0, Σ_上游 ( 边权重 × 上游得分 ))
+#   边权重：术语共享（evidence_level=term）1.0 ｜ 类别级（弱）0.5
+#   上游得分：实验室 available 2.0 ｜ partial 1.0 ｜ 其余（missing / 不在方法库 / 无法判定）0
+#   同一上游有多条边只算一次（取最强的那条）；只算**一跳**上游，不做传递闭包。
+
+PROFILE_REL = "projects/sci-assistant/config/lab_profile.yaml"
+CHAIN_BONUS_AVAILABLE = 2.0     # 上游方法实验室可执行
+CHAIN_BONUS_PARTIAL = 1.0       # 上游部分可执行（可借/送检/需审批/同类未核对）
+CHAIN_WEAK_EDGE_FACTOR = 0.5    # 类别级（弱）边的权重
+CHAIN_BONUS_CAP = 4.0           # 单候选加分上限
+
+
+def _edge_from(e):
+    """chains.json 实测字段是 `from`/`to`；`source`/`target` 是旧说法，两种都认。"""
+    return str(e.get("from") or e.get("source") or "")
+
+
+def _edge_to(e):
+    return str(e.get("to") or e.get("target") or "")
+
+
+def load_chain_edges(path=None):
+    """读 chains.json 的依赖边；返回 (edges, 降级原因)。文件缺失/坏掉**不抛**，返回空表+原因。"""
+    p = path or os.path.join(K.VAULT, CHAIN_REL)
+    if not os.path.isfile(p):
+        return [], f"无 `{CHAIN_REL}`"
+    try:
+        data = json.loads(K.read_text(p))
+    except Exception as e:                       # 坏 JSON 也只降级，不让主流程崩
+        return [], f"`{CHAIN_REL}` 解析失败（{type(e).__name__}: {e}）"
+    edges = [e for e in (data.get("edges") or [])
+             if isinstance(e, dict) and _edge_from(e) and _edge_to(e)]
+    if not edges:
+        return [], f"`{CHAIN_REL}` 里没有可用边"
+    return edges, ""
+
+
+def load_lab(profile_path=None):
+    """读实验室档案；返回 (profile, 降级原因)。
+
+    复用 `sci_lab_match` 的加载器（含采购入库合并），不另写解析。
+    该文件若暂时不可用（被并发编辑 / 缺依赖），**降级返回 (None, 原因)**，不抛。
+    """
+    p = profile_path or os.path.join(K.VAULT, PROFILE_REL)
+    if not os.path.isfile(p):
+        return None, f"无 `{PROFILE_REL}`"
+    try:
+        import sci_lab_match as LM
+        return LM.load_profile(p) or {}, ""
+    except Exception as e:                       # 匹配器/加载器不可用 ⇒ 只是不加分
+        return None, (f"实验室档案加载器不可用（sci_lab_match："
+                      f"{type(e).__name__}），上游可用性无法判定")
+
+
+def _lm_match(method, profile):
+    """默认匹配器：直接调 `sci_lab_match.match_method`（延迟导入，避免模块级耦合）。"""
+    import sci_lab_match as LM
+    return LM.match_method(method, profile)
+
+
+def lab_grade(method, profile, matcher=None):
+    """把一个方法的「需求 × 实验室档案」折成方法级可用性：available / partial / missing。
+
+    口径（报告里逐项可复算）：
+      · 只看 **设备 / 表征 / 计算** 三类需求——试剂清单未登记，缺试剂 ≠ 设备不可用；
+      · 无 missing 且无 partial ⇒ available；有任一落点但未全满足 ⇒ partial；
+        一项落点都没有 ⇒ missing；该方法本身没有这三类需求 ⇒ no-need（无从判定，不给分）。
+    非 available/partial 一律得 0 分，所以「档案没写」不会被当成「实验室有」。
+    """
+    if not profile:
+        return "no-profile", "无实验室档案（lab_profile.yaml 缺失或为空）"
+    try:
+        rows, _summary = (matcher or _lm_match)(method, profile)
+    except Exception as e:                       # 匹配器本身不可用（含被并发编辑打断）
+        return "unknown", f"实验室匹配器不可用（{type(e).__name__}）"
+    rel = [r for r in (rows or [])
+           if r.get("kind") in ("equipment", "characterization", "compute")]
+    if not rel:
+        return "no-need", "该方法未列设备/表征/计算需求"
+    st = [str(r.get("status") or "missing") for r in rel]
+    if all(s == "available" for s in st):
+        return "available", ""
+    if any(s in ("available", "partial", "purchased") for s in st):
+        return "partial", ""
+    return "missing", "设备/表征/计算需求在档案里一项落点都没有"
+
+
+def _chain_basis(ups, bonus, total):
+    """一句话说明加分来源（哪条上游、边级别、可用性如何）。"""
+    if not ups:
+        return "无上游（chains.json 无边指向本方法）"
+    parts = []
+    for u in ups:
+        lvl = "术语共享" if u.get("evidence_level") == "term" else "类别级（弱）"
+        if not u.get("in_db"):
+            parts.append(f"{u['name_zh']}（{lvl}，不在方法库 → 0）")
+        elif u.get("points"):
+            parts.append(f"{u['name_zh']}（{lvl}，{u['availability']} × {u['weight']:g} "
+                         f"= {u['points']:g}）")
+        else:
+            parts.append(f"{u['name_zh']}（{lvl}，{u.get('availability') or '未知'} → 0）")
+    tail = f"合计 {total:g}"
+    if total > bonus:
+        tail += f" → 封顶 {bonus:g}"
+    return "；".join(parts) + "；" + tail
+
+
+def chain_info_for(method_id, edges, profile, by_id, matcher=None):
+    """算一个方法的链位置与链加分（只算一跳）。
+
+    返回 {"position": {"upstream": n, "downstream": n}, "upstream": [...], "bonus": x, "basis": "..."}
+    "上游" = 边**指向本方法**（`to == method_id`）；"下游" = 边**从本方法出发**。
+    """
+    ins = [e for e in edges if _edge_to(e) == method_id]
+    outs = [e for e in edges if _edge_from(e) == method_id]
+    # 同一上游可能有多条边：只算一次，取最强的那条（术语共享优先于类别级）
+    ups = {}
+    for e in ins:
+        src = _edge_from(e)
+        weight = 1.0 if e.get("evidence_level") == "term" else CHAIN_WEAK_EDGE_FACTOR
+        lvl = e.get("evidence_level") or "category"
+        cur = ups.get(src)
+        if cur is None:
+            ups[src] = {"method_id": src, "name_zh": e.get("from_name") or src,
+                        "evidence_level": lvl, "weight": weight, "edges": 1}
+        else:
+            cur["edges"] += 1
+            if weight > cur["weight"]:
+                cur["weight"], cur["evidence_level"] = weight, lvl
+    ups_list, total = [], 0.0
+    for src in sorted(ups):
+        rec = ups[src]
+        m = by_id.get(src)
+        rec["in_db"] = bool(m)
+        if not m:                                # 上游不在方法库 ⇒ 无法核可用性，也不加分
+            rec.update(availability="not-in-db", points=0.0, reason="不在方法库")
+        else:
+            grade, why = lab_grade(m, profile, matcher)
+            rec["name_zh"] = m.get("name_zh") or rec["name_zh"]
+            rec["availability"] = grade
+            rec["reason"] = why
+            base = {"available": CHAIN_BONUS_AVAILABLE,
+                    "partial": CHAIN_BONUS_PARTIAL}.get(grade, 0.0)
+            rec["points"] = round(rec["weight"] * base, 3)
+        total += rec["points"]
+        ups_list.append(rec)
+    total = round(total, 3)
+    bonus = round(min(CHAIN_BONUS_CAP, total), 3)
+    dn_names = {}
+    for e in outs:
+        dn_names.setdefault(_edge_to(e), e.get("to_name") or _edge_to(e))
+    downs = sorted(dn_names)
+    return {"method_id": method_id,
+            "position": {"upstream": len(ups_list), "downstream": len(downs)},
+            "upstream": ups_list,
+            "downstream_ids": downs,
+            "downstream_names": [dn_names[d] for d in downs],
+            "bonus": bonus,
+            "basis": _chain_basis(ups_list, bonus, total)}
+
+
+def build_chain_context(methods, edges, profile, degraded=None, matcher=None,
+                        enabled=True):
+    """为「出现在链上的方法」预计算链位置/加分；返回 {enabled, degraded, info}。
+
+    `enabled=False` 时**什么都不算**（info 为空）——`--no-chain-bonus` 走这条路，
+    保证排序与未启用该功能时逐位相同。
+    """
+    if not enabled:
+        return {"enabled": False, "degraded": list(degraded or []), "info": {}}
+    by_id = {m.get("method_id"): m for m in methods if isinstance(m, dict)}
+    ends = sorted({mid for e in edges for mid in (_edge_from(e), _edge_to(e)) if mid})
+    info = {mid: chain_info_for(mid, edges, profile, by_id, matcher) for mid in ends}
+    return {"enabled": True, "degraded": list(degraded or []), "info": info}
+
+
+def render_chain_bonus_section(selected, ctx):
+    """策略层报告末尾追加的「链位置与链加分」小节（关闭/降级时也写明原因）。"""
+    L = ["", "## 链位置与链加分（N6）", ""]
+    if not (ctx and ctx.get("enabled")):
+        L += ["> 已按 `--no-chain-bonus` 关闭：本次**不做**链加分，"
+              "候选排序与未启用该功能时完全一致。", ""]
+        return "\n".join(L)
+    L += ["> 加分 = Σ(上游方法得分 × 边权重)，单候选上限 "
+          f"{CHAIN_BONUS_CAP:g}。上游 = `chains.json` 里**指向本候选**的边；"
+          "边权重：术语共享 1.0、类别级（弱）0.5；上游得分：实验室 `available` "
+          f"{CHAIN_BONUS_AVAILABLE:g}、`partial` {CHAIN_BONUS_PARTIAL:g}，"
+          "不在方法库或不可执行 0。",
+          "> 🔴 加分**只调排序**、不改证据分 `rank_score`；match（目标词命中）仍是最前一级"
+          "排序键，加分只在**同一 match 档内**起作用。上游可用性按「设备/表征/计算」判，"
+          "试剂清单未登记不计入。「上游数/下游数」= **不同方法的个数**"
+          "（同一方法多条边只算一个）。", ""]
+    L.append("| # | 方法 | 上游数 | 下游数 | 链加分 | 计入后分数 | 加分依据 |")
+    L.append("|---|---|---|---|---|---|---|")
+    for i, s in enumerate(selected, 1):
+        cp = s.get("chain_position") or {}
+        L.append(f"| {i} | {s['method'].get('name_zh')} | {cp.get('upstream', 0)} | "
+                 f"{cp.get('downstream', 0)} | {float(s.get('chain_bonus') or 0):g} | "
+                 f"{float(s.get('final_score') or s.get('rank_score') or 0):g} | "
+                 f"{s.get('chain_basis') or '—'} |")
+    deg = ctx.get("degraded") or []
+    if deg:
+        L += ["", "**降级说明（本次为什么没加分 / 为什么分数恒为 0）**", ""]
+        L += [f"- {d}" for d in deg]
+    L.append("")
+    return "\n".join(L)
+
+
+# ---------------------------------------------------------------- 切入点出处（§五.1 课题主键）
+#
+# 为什么记快照而不是活引用：C1 重跑会改写 entry_points.json，而策略层要回答
+# 「当初为什么选这条切入点、为什么没选别的」——那是**当时**的判断。
+# 快照 schema 的唯一来源是 `sci_links.snapshot_entry()`，本文件只负责渲染与保留。
+
+def pick_entry_ref(old_strategy, new_ref):
+    """新引用优先；未给新引用时**保留旧 strategy.json 里的**（重生成不擦除出处）。"""
+    if new_ref:
+        return new_ref
+    return (old_strategy or {}).get("entry_point_ref")
+
+
+def render_entry_ref_section(ref):
+    """「切入点出处」小节；无引用时返回空串（不改变既有报告内容）。"""
+    if not ref:
+        return ""
+    L = ["", "## 切入点出处（C1 主键）", ""]
+    L.append(f"- 主键：`{ref.get('id')}`（方向 `{ref.get('topic')}` ｜ "
+             f"子方向 `{ref.get('sub_direction')}`）")
+    L.append(f"- 选定当时：名次 {ref.get('rank_at_selection')} ｜ 可行性 "
+             f"{ref.get('feasibility_score_at_selection')}"
+             f"（{ref.get('feasibility_at_selection') or '—'}）｜ "
+             f"信号 {ref.get('signal') or '—'}")
+    if ref.get("rationale"):
+        L.append(f"- 当时理由：{ref['rationale']}")
+    alts = ref.get("alternatives") or []
+    if alts:
+        L.append("")
+        L.append("| 当时落选 | 名次 | 可行性 | 信号 |")
+        L.append("|---|---|---|---|")
+        for a in alts:
+            L.append(f"| {a.get('sub_direction')} | {a.get('rank')} | "
+                     f"{a.get('feasibility_score')} | {a.get('signal') or '—'} |")
+    L.append("")
+    L.append(f"> 快照（{ref.get('captured_at') or '—'}，来源 `{ref.get('source') or '—'}`）："
+             "C1 重跑**不会**改本块。要换切入点，重跑一次并带 `--entry`；"
+             "当前/快照的分数差异用 `python tools/sci_links.py --trace <课题>` 看。")
     L.append("")
     return "\n".join(L)
 
@@ -431,6 +725,244 @@ def render_operation(m):
     return "\n".join(L)
 
 
+# ---------------------------------------------------------------- N4：导出到 wiki/experiments/
+
+EXPERIMENTS_REL = "wiki/experiments"
+
+
+def experiments_dir():
+    return os.path.join(K.VAULT, EXPERIMENTS_REL)
+
+
+def load_judgements_for(method_id, judges_path):
+    """取该方法的判断层条目；没给文件或没这条就返回空 dict。"""
+    if not judges_path:
+        return {}
+    p = judges_path if os.path.isabs(judges_path) else os.path.join(K.VAULT, judges_path)
+    if not os.path.isfile(p):
+        return {}
+    with open(p, encoding="utf-8") as f:
+        payload = json.load(f)
+    for rec in payload.get("judgements") or []:
+        if (rec.get("method_id") or "") == method_id:
+            return rec
+    return {}
+
+
+def chain_edges_for(method_id):
+    p = os.path.join(K.VAULT, CHAIN_REL)
+    if not os.path.isfile(p):
+        return []
+    with open(p, encoding="utf-8") as f:
+        edges = json.load(f).get("edges") or []
+    return [e for e in edges
+            if e.get("from") == method_id or e.get("to") == method_id]
+
+
+def experiment_gates(m, judged, lab_summary, page_exists, overwrite, lab_rows=None):
+    """N4 的**机械审核门**（G1–G4 + G6 挡写盘；G5 方法链是提示项）。
+
+    为什么是这几道：wiki/ 是全库检索的知识层，写进去就会被 `kb-query` 当证据用；
+    所以宁可挡住，也不能把「只有半截证据 + 没判断层 + 没核对实验室条件」的方案页塞进去。
+
+    🔴 G4 判的是「**核对过**」而不是「没有缺件」：实验方案本来就可能要外借设备，
+    要求算法把缺件清零等于逼人编。缺件只在页里逐条列出 + 进审核清单。
+    """
+    quoted, bad = method_quote_stats(m)
+    n_judge = sum(len(judged.get(k) or []) for k in
+                  ("advantages", "conditions", "limitations"))
+    missing = (lab_summary or {}).get("missing", 0)
+    has_items = bool((m.get("materials") or []) or (m.get("equipment") or []))
+    gates = [
+        ("G1", bool(m.get("name_zh") and m.get("category") and m.get("source_ref")),
+         "方法记录完整（名称 / 类别 / 来源卡）",
+         f"category={m.get('category')}｜source={m.get('source_ref')}"),
+        ("G2", quoted >= 5 and bad * 4 <= quoted,
+         "证据引文充足（≥5 条 quote，且「数字未进引文」的条目 ≤1/4）",
+         f"quote={quoted}｜⚠️ 数字未进引文={bad}"),
+        ("G3", n_judge >= 3,
+         "判断层已合成（优势/条件/局限 ≥3 条，quote 已逐条校验）", f"judge={n_judge}"),
+        ("G4", (not has_items) or bool(lab_rows),
+         "实验室条件已核对（材料/设备清单已与档案比对；缺件不挡，但须在页内列出）",
+         f"核对={len(lab_rows or [])} 项｜缺件={missing}｜"
+         + "、".join(f"{k}={v}" for k, v in (lab_summary or {}).items())),
+        ("G6", (not page_exists) or bool(overwrite),
+         "wiki 落点未占用，或显式给了 --overwrite",
+         "页已存在" if page_exists else "新页"),
+    ]
+    return gates
+
+
+def _bind_goal_files(goal, cfg):
+    d = out_dir(cfg, goal)
+    return d
+
+
+def render_experiment(goal, m, judged, lab_rows, lab_summary, edges, gates,
+                      exp_id, page_name):
+    quoted, bad = method_quote_stats(m)
+    n_judge = sum(len(judged.get(k) or []) for k in
+                  ("advantages", "conditions", "limitations"))
+    src_card = os.path.basename(m.get("page_path") or "").replace(".md", "")
+    L = [f"# 实验方案（待审核）：{m.get('name_zh')}", "",
+         "> ⚠️ **本页由 `sci_protocol_gen --export-experiment` 机械生成，尚未经人工审核。**",
+         "> 在 `review_status` 从 `pending-human` 改为 `approved` 之前，**不得当 SOP 执行**；"
+         "文末「审核清单」逐条打勾后由负责人签字。",
+         f"> 证据：{quoted} 条原文引文 ｜ 数字未进引文 {bad} 条（下文标 ⚠️）｜ "
+         f"判断层 {n_judge} 条 ｜ 方法 id `{m.get('method_id')}`", "",
+         "## 目标与依据", "",
+         f"- 课题方向：**{goal}**",
+         f"- 采用方法：**{m.get('name_zh')}**（{m.get('category')}）",
+         f"- 来源卡：[[sources/{src_card}]]" if src_card else "- 来源卡：—",
+         f"- 提取置信度：{m.get('extraction_confidence')} ｜ reviewed={m.get('reviewed')}"]
+    if m.get("summary"):
+        L += ["", f"**摘要**：{m['summary']}"]
+    L += ["", "## 判断层（优势 / 适用条件 / 局限）", "",
+          "> 以下由 LLM 合成、逐条挂原文引文；`quote` 已机械校验。判断与引文不符的条目已被丢弃。", ""]
+    for key, label in (("advantages", "优势"), ("conditions", "适用条件"),
+                       ("limitations", "局限")):
+        items = judged.get(key) or []
+        L.append(f"### {label}")
+        L.append("")
+        if not items:
+            L.append("- （判断层未给出该维度）")
+        for it in items:
+            L.append(f"- {it.get('text')} ｜ 引文：{it.get('quote')}")
+        L.append("")
+    # 操作层：把 render_operation 的标题整体降一级，避免一页两个 H1
+    op_lines = render_operation(m).split("\n")
+    op = []
+    for i, ln in enumerate(op_lines):
+        if i == 0 and ln.startswith("# "):
+            op.append("## " + ln[2:])
+        elif ln.startswith("## "):
+            op.append("### " + ln[3:])
+        else:
+            op.append(ln)
+    L += op
+    L += ["", "## 方法链（该方法的产出/输入）", ""]
+    if edges:
+        L.append("> 依赖为**术语/类别推断**，不是作者明示的因果；两侧 quote 已校验。")
+        L.append("")
+        for e in edges:
+            tag = "术语共享" if e.get("evidence_level") == "term" else "类别级（弱）"
+            if e.get("from") == m.get("method_id"):
+                L.append(f"- 本方法产出「{e['artifact']}」→ **{e['to_name']}**"
+                         f"（需要「{e['matched_input']}」）｜ {tag}")
+            else:
+                L.append(f"- **{e['from_name']}** 产出「{e['artifact']}」→ 本方法需要"
+                         f"「{e['matched_input']}」｜ {tag}")
+    else:
+        L.append("（该方法暂无 IO 记录，不在链上。）")
+    L += ["", "## 实验室条件核对", "",
+          "| 需求 | 类型 | 状态 | 已登记匹配项 | 说明 |", "|---|---|---|---|---|"]
+    for r in lab_rows:
+        L.append(f"| {r['required']} | {'试剂' if r['kind'] == 'reagent' else '设备'} | "
+                 f"**{r['status']}** | {r['matched'] or '—'} | {r.get('reason') or '—'} |")
+    if not lab_rows:
+        L.append("| — | — | — | — | 该方法未给出材料/设备清单 |")
+    L += ["",
+          "> `purchased` = 采购入库、不等于现有余量；`unregistered` = 试剂清单未登记，"
+          "**不能判定为没有**。余量必须人工核。", "",
+          "## 风险与未知", ""]
+    for p_ in (m.get("pitfalls") or []):
+        L.append(f"- 陷阱：{p_}")
+    if bad:
+        L.append(f"- ⚠️ 有 {bad} 条参数/指标的数字**未出现在引文里**，执行前必须回原文核对（见操作层表格 ⚠️ 标记）。")
+    weak = [e for e in edges if e.get("evidence_level") != "term"]
+    if weak:
+        L.append(f"- 方法链里有 {len(weak)} 条**类别级（弱）**边，只按方法类别推断、不保证同一材料体系。")
+    if not (m.get("steps") or []):
+        L.append("- 原文未给出可执行步骤：需从 L3 全文补，或先做小试确定参数。")
+    missing_names = [r["required"] for r in lab_rows if r.get("status") == "missing"]
+    checklist = ["- [ ] 试剂**实际余量**够（工具只能判断登记状态，判断不了余量）",
+                 "- [ ] 设备档期与型号一致（尤其工作站通道数、手套箱水氧值）"]
+    if missing_names:
+        checklist.append(f"- [ ] 缺件 {len(missing_names)} 项已落实（外借 / 补登记 / 换方法）："
+                         + "、".join(missing_names))
+    checklist += ["- [ ] 表中标 ⚠️ 的数字逐条回原文核对",
+                  "- [ ] 与库内其他 source 卡的差异/冲突已核对（有无更近的复现或反驳）",
+                  "- [ ] 安全与废液处置已确认（HF / 强酸 / 有机溶剂 / 重金属）",
+                  "- [ ] 负责人签字与日期："]
+    L += ["", "## 审核清单（人工，逐条打勾后把 review_status 改为 approved）", ""] \
+        + checklist + ["", "## 元数据", "",
+                       f"- exp_id：`{exp_id}`",
+                       f"- 页名：`{page_name}`",
+                       f"- 生成命令：`python tools/sci_protocol_gen.py --goal \"{goal}\" "
+                       f"--export-experiment \"{m.get('method_id')}\" --apply`",
+                       f"- 生成日期：{datetime.date.today().isoformat()}",
+                       "",
+                       "## 参见", "",
+                       "- [[experiments/_index|实验方案索引]]（本目录的入口页）",
+                       f"- [[sources/{src_card}]]（本方案的证据来源）" if src_card
+                       else "- （无来源卡）",
+                       ""]
+    return "\n".join(L)
+
+
+def render_experiments_index(rows):
+    L = ["---", "created: 2026-10-21", f"updated: {datetime.date.today().isoformat()}",
+         "type: topic", "evidence_base: mixed",
+         "tags: [experiment, index, sci-assistant]",
+         "aliases: [实验方案索引]", 'summary: "wiki/experiments/ 下实验方案页的索引（由工具生成）"',
+         "sources: []", "---", "",
+         "# 实验方案索引", "",
+         "> 本页由 `sci_protocol_gen --export-experiment` 自动重建；**只列页，不改页**。",
+         "> 这是**导航页**，不是证据页：`evidence_base: mixed` 只为满足 schema，"
+         "不要把它当成本库对实验方案的证据综合。",
+         "> `review_status=pending-human` 的方案未经人工审核，不得当 SOP 执行。", "",
+         "| exp_id | 页 | 方向 | 方法 | 类别 | 来源卡 | status | review |",
+         "|---|---|---|---|---|---|---|---|"]
+    for r in sorted(rows, key=lambda x: x["exp_id"]):
+        card = r.get("source_card") or ""
+        src = f"[[sources/{card}|{card[:18]}…]]" if card else "—"
+        L.append(f"| `{r['exp_id']}` | [[experiments/{r['name']}]] | {r['goal']} | "
+                 f"{r['method']} | {r['category']} | {src} | {r['status']} | {r['review']} |")
+    if not rows:
+        L.append("| — | — | — | — | — | — | — | — |")
+    L.append("")
+    return "\n".join(L)
+
+
+def scan_experiments():
+    """读 wiki/experiments/*.md 的 frontmatter，返回索引行。"""
+    d = experiments_dir()
+    rows = []
+    if not os.path.isdir(d):
+        return rows
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".md") or fn == "_index.md":
+            continue
+        text = K.read_text(os.path.join(d, fn))
+        fm, _ = K.split_frontmatter(text)
+        kv = {}
+        for line in (fm or "").split("\n"):
+            mt = re.match(r"^([A-Za-z_]+):\s*(.*)$", line)
+            if mt:
+                kv[mt.group(1)] = K_unquote(mt.group(2))
+        rows.append({"exp_id": kv.get("exp_id") or "?", "name": fn[:-3],
+                     "goal": kv.get("goal") or "—", "method": kv.get("method_name") or "—",
+                     "category": kv.get("category") or "—",
+                     "status": kv.get("status") or "—",
+                     "review": kv.get("review_status") or "—",
+                     "source_card": kv.get("source_card") or "",
+                     "method_id": kv.get("method_id") or ""})
+    return rows
+
+
+def K_unquote(s):
+    s = (s or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def next_exp_id(goal, rows):
+    g = slugify(goal)
+    used = [r for r in rows if r["goal"] == goal]
+    return f"EXP-{g}-{len(used) + 1:02d}"
+
+
 # ---------------------------------------------------------------- 输出
 
 def out_dir(cfg, goal):
@@ -486,7 +1018,7 @@ def _selftest():
                "parameters": [{"name": "温度", "value": "25", "unit": "°C",
                                "quote": "25 °C", "value_in_quote": False}]})
     methods = [m1, m2,
-               {"method_id": "concept:C", "name_zh": "电解液设计", "category": "计算",
+               {"method_id": "concept:C", "name_zh": "研究方向A", "category": "计算",
                 "tier": "concept", "source_ref": "[[concepts/C]]", "summary": "计算方向",
                 "parameters_raw": [{"value": "100", "unit": "ns", "context": "MD 100 ns"}],
                 "characterization": ["DFT"], "steps": [], "materials": [], "equipment": [],
@@ -532,10 +1064,249 @@ def _selftest():
     chk("判断层：伪造引文丢弃", not v2["advantages"] and v2["quotes_failed"] == 1)
     merged, st = merge_assessments([m1, m2], [good], bodies={"source:A": body})
     chk("判断层：合并挂到方法并统计", merged == ["source:A"] and st["judged"] == 1)
+    # 方向归因：名字里既无「锌」也无「沉积」的方法，靠 directions 也能被选中
+    m_dir = dict(m1, method_id="source:DIR", name_zh="可控应力台架",
+                 directions=["锌沉积"], materials=[], parameters=[], key_metrics=[],
+                 summary="")
+    sel_dir = select_methods([m_dir], "锌 沉积", None, 3)
+    chk("方向归因：名/摘要无「锌/沉积」但 directions 命中即可选中",
+        len(sel_dir) == 1 and sel_dir[0]["match"] == 2, str(sel_dir)[:120])
+    sel_none = select_methods([dict(m_dir, directions=[])], "锌 沉积", None, 3)
+    chk("方向归因：去掉 directions 后同一条方法选不中（反例）", sel_none == [])
     md2 = render_strategy("锌 沉积", [{"method": m1, "match": 2, "quoted": 1,
                                        "bad": 0, "rank_score": 21}])
     chk("判断层：策略层渲染判断与引文",
         "判断层" in md2 and "5.75 g ZnSO4" in md2)
+
+    # ---- N4：导出到 wiki/experiments/ 的机械审核门 ----
+    m_export = dict(m1, source_ref="wiki/sources/A.md", page_path="wiki/sources/A.md",
+                    steps=[{"order": 1, "action": "配液", "detail": "5.75 g",
+                            "quote": "5.75 g ZnSO4"},
+                           {"order": 2, "action": "静置", "detail": "30 min",
+                            "quote": "静置 30 min"}],
+                    pitfalls=["示例陷阱"])
+    judged_ok = {"advantages": [{"text": "a", "quote": "q"}],
+                 "conditions": [{"text": "b", "quote": "q"}],
+                 "limitations": [{"text": "c", "quote": "q"}]}
+    g_ok = experiment_gates(m_export, judged_ok, {"equipment": 2, "missing": 0}, False, False,
+                             lab_rows=[{"kind": "equipment", "status": "available"}])
+    chk("导出：门全过（含 quote 数/判断层/缺件/新页）", all(g[1] for g in g_ok),
+        str([(g[0], g[1], g[3]) for g in g_ok]))
+    g_nojudge = experiment_gates(m_export, {}, {"missing": 0}, False, False)
+    chk("导出：判断层不足 → G3 拦下",
+        not dict((g[0], g[1]) for g in g_nojudge)["G3"])
+    g_miss = experiment_gates(m_export, judged_ok, {"missing": 2}, False, False, lab_rows=None)
+    chk("导出：未做实验室核对 → G4 拦下", not dict((g[0], g[1]) for g in g_miss)["G4"])
+    g_miss2 = experiment_gates(m_export, judged_ok, {"missing": 2}, False, False,
+                               lab_rows=[{"kind": "equipment", "status": "missing"}])
+    chk("导出：有缺件但已核对 → G4 放行（缺件由页内清单承担）",
+        dict((g[0], g[1]) for g in g_miss2)["G4"])
+    g_page = experiment_gates(m_export, judged_ok, {"missing": 0}, True, False)
+    g_page_ow = experiment_gates(m_export, judged_ok, {"missing": 0}, True, True)
+    chk("导出：目标页已存在时需 --overwrite",
+        not dict((g[0], g[1]) for g in g_page)["G6"]
+        and dict((g[0], g[1]) for g in g_page_ow)["G6"])
+    g_weak = experiment_gates({"method_id": "source:W", "name_zh": "弱证据方法",
+                               "category": "合成", "source_ref": "wiki/sources/W.md",
+                               "materials": [{"name": "x"}]},
+                              judged_ok, {"missing": 0}, False, False)
+    chk("导出：引文不足 → G2 拦下", not dict((g[0], g[1]) for g in g_weak)["G2"])
+
+    lab_rows = [{"kind": "reagent", "required": "ZnSO4", "status": "purchased",
+                 "matched": "ZnSO4（AR）", "reason": "采购入库"},
+                {"kind": "equipment", "required": "电化学工作站", "status": "missing",
+                 "matched": "", "reason": "档案无"}]
+    body_x = render_experiment("锌 沉积", m_export, judged_ok, lab_rows,
+                               {"purchased": 1, "missing": 1},
+                               [{"from": "source:A", "to": "source:B",
+                                 "from_name": "测试合成", "to_name": "XRD",
+                                 "artifact": "粉体", "matched_input": "粉体",
+                                 "evidence_level": "term"}],
+                               g_ok, "EXP-demo-01", "demo-01")
+    text_x = K.join_frontmatter("\n".join([
+        "created: 2026-01-01", "updated: 2026-01-01", "type: experiment",
+        'exp_id: "EXP-demo-01"', 'goal: "锌 沉积"', 'method_id: "source:A"',
+        'method_name: "测试合成"', 'category: "合成"', "status: draft",
+        "review_status: pending-human", "tags: [experiment, demo]",
+        'summary: "含冒号: 的摘要"', "sources:", '  - "[[sources/A.md]]"']), body_x)
+    import yaml as _yaml
+    fm_x, _ = K.split_frontmatter(text_x)
+    parsed = _yaml.safe_load(fm_x) or {}
+    chk("导出：页 frontmatter 可被 yaml.safe_load（含冒号的 summary 不破）",
+        parsed.get("type") == "experiment" and parsed.get("review_status") == "pending-human",
+        str(parsed)[:120])
+    chk("导出：页里有未审核警示 + 审核清单 + 缺件标注",
+        "未经人工审核" in body_x and "审核清单" in body_x
+        and "**missing**" in body_x and "purchased" in body_x)
+    idx_x = render_experiments_index([
+        {"exp_id": "EXP-demo-01", "name": "demo-01", "goal": "锌 沉积",
+         "method": "测试合成", "category": "合成", "status": "draft",
+         "review": "pending-human"}])
+    chk("导出：索引含页行与 [[experiments/…]] 链接",
+        "[[experiments/demo-01]]" in idx_x and "EXP-demo-01" in idx_x)
+
+    # ---- N6：方法链驱动排序（chain bonus）----
+    # 自检**不依赖**真知识库：链条用夹具、实验室匹配器用替身（sci_lab_match 可能正被并发编辑）
+    def lab_stub(method, profile):
+        """替身匹配器：方法自带的 `_lab` 状态表逐项折成 `match_method` 的行。"""
+        return ([{"kind": "equipment", "required": "示例设备", "status": s}
+                 for s in method.get("_lab") or []], {})
+
+    def mk6(mid, name, n_quoted=2, lab=None):
+        return {"method_id": mid, "name_zh": name, "category": "合成", "tier": "source",
+                "source_ref": "[[sources/A]]", "summary": "", "materials": [],
+                "equipment": [], "steps": [], "characterization": [],
+                "key_metrics": [], "pitfalls": [], "_lab": list(lab or []),
+                "parameters": [{"name": f"p{i}", "value": str(i), "unit": "",
+                                "quote": f"p{i}={i}", "value_in_quote": True}
+                               for i in range(n_quoted)],
+                "extraction_confidence": "medium", "reviewed": False}
+
+    def e6(src, dst, level="term", src_name=""):
+        return {"from": src, "to": dst, "from_name": src_name or src,
+                "to_name": dst, "evidence_level": level, "kind": "材料"}
+
+    up_ok = mk6("source:UPOK", "上游可执行方法", 2, ["available"])
+    up_part = mk6("source:UPPART", "上游部分可用方法", 2, ["partial"])
+    up_none = mk6("source:UPNONE", "上游不可用方法", 2, ["missing"])
+    up_ok2 = mk6("source:UPOK2", "第二可执行上游", 2, ["available"])
+    up_ok3 = mk6("source:UPOK3", "第三可执行上游", 2, ["available"])
+    c_a = mk6("source:A6", "锌沉积A", 2)       # 同分，旧排序按名字 A 在前
+    c_b = mk6("source:B6", "锌沉积B", 2)       # 有一个可执行上游
+    ms6 = [up_ok, up_part, up_none, up_ok2, up_ok3, c_a, c_b]
+    prof6 = {"equipment": [{"name": "示例设备", "status": "available"}]}
+    ctx6 = build_chain_context(ms6, [e6("source:UPOK", "source:B6")], prof6, matcher=lab_stub)
+    legacy6 = [s["method"]["method_id"] for s in select_methods(ms6, "锌 沉积", top=2)]
+    sel6 = select_methods(ms6, "锌 沉积", top=2, chain=ctx6)
+    ids6 = [s["method"]["method_id"] for s in sel6]
+    b6 = next(s for s in sel6 if s["method"]["method_id"] == "source:B6")
+    chk("N6 链加分：上游可执行 ⇒ chain_bonus=2.0", b6["chain_bonus"] == 2.0,
+        str(b6["chain_bonus"]))
+    chk("N6 链加分：加分改变排序（旧 A→B，新 B→A）",
+        ids6 == ["source:B6", "source:A6"] and legacy6 == ["source:A6", "source:B6"],
+        f"new={ids6} legacy={legacy6}")
+    chk("N6 链位置：上游数 / 下游数正确",
+        b6["chain_position"] == {"upstream": 1, "downstream": 0},
+        str(b6["chain_position"]))
+    chk("N6 加分依据可复算：basis 含上游名 + 可用性 + 权重",
+        "上游可执行方法" in b6["chain_basis"] and "available" in b6["chain_basis"]
+        and "术语共享" in b6["chain_basis"], b6["chain_basis"])
+    ctx_off = build_chain_context(ms6, [e6("source:UPOK", "source:B6")], prof6,
+                                  matcher=lab_stub, enabled=False)
+    off6 = select_methods(ms6, "锌 沉积", top=2, chain=ctx_off)
+    chk("N6 --no-chain-bonus：加分归零且排序与旧版逐位一致",
+        all(s["chain_bonus"] == 0.0 for s in off6)
+        and [s["method"]["method_id"] for s in off6] == legacy6,
+        str([(s["method"]["method_id"], s["chain_bonus"]) for s in off6]))
+
+    # 无 lab 档案：不加分、不崩、报告注明降级
+    ctx_nolab = build_chain_context(ms6, [e6("source:UPOK", "source:B6")], None,
+                                    degraded=["无 `lab_profile.yaml`"],
+                                    matcher=lab_stub)
+    sel_nolab = select_methods(ms6, "锌 沉积", top=2, chain=ctx_nolab)
+    chk("N6 无 lab 档案：不加分、不崩、排序不变、报告写降级原因",
+        all(s["chain_bonus"] == 0.0 for s in sel_nolab)
+        and [s["method"]["method_id"] for s in sel_nolab] == legacy6
+        and "降级说明" in render_chain_bonus_section(sel_nolab, ctx_nolab),
+        str(render_chain_bonus_section(sel_nolab, ctx_nolab)[-160:]))
+    chk("N6 无 lab 档案：chain_position 仍照常输出（不靠档案）",
+        next(s for s in sel_nolab
+             if s["method"]["method_id"] == "source:B6")["chain_position"]
+        == {"upstream": 1, "downstream": 0})
+
+    # 无 chains.json：空表 + 原因，不崩
+    td6 = K.make_temp_dir(prefix="sci_proto_selftest_")
+    edges_x, why_x = load_chain_edges(os.path.join(td6, "no_such_chains.json"))
+    ctx_no_chain = build_chain_context(ms6, edges_x, prof6,
+                                       degraded=[why_x] if why_x else [])
+    sel_no_chain = select_methods(ms6, "锌 沉积", top=2, chain=ctx_no_chain)
+    chk("N6 无 chains.json：返回空表 + 原因、不加分、不崩、报告注明",
+        edges_x == [] and bool(why_x) and "无 `" in why_x
+        and all(s["chain_bonus"] == 0.0 for s in sel_no_chain)
+        and [s["method"]["method_id"] for s in sel_no_chain] == legacy6
+        and "降级说明" in render_chain_bonus_section(sel_no_chain, ctx_no_chain),
+        why_x)
+    p_chain = os.path.join(td6, "chains.json")
+    with open(p_chain, "w", encoding="utf-8") as f:
+        json.dump({"edges": [e6("source:UPOK", "source:B6")]}, f, ensure_ascii=False)
+    edges_tmp, why_tmp = load_chain_edges(p_chain)
+    chk("N6 读链：临时 chains.json 按 from/to 解析（降级原因为空）",
+        len(edges_tmp) == 1 and not why_tmp and _edge_to(edges_tmp[0]) == "source:B6",
+        f"{why_tmp} {edges_tmp}")
+    p_chain2 = os.path.join(td6, "chains_legacy.json")
+    with open(p_chain2, "w", encoding="utf-8") as f:
+        json.dump({"edges": [{"source": "source:UPOK", "target": "source:B6",
+                              "evidence_level": "term"}]}, f, ensure_ascii=False)
+    edges_legacy, _ = load_chain_edges(p_chain2)
+    chk("N6 读链：source/target 旧字段也认（from/to 为主，二者兼容）",
+        len(edges_legacy) == 1 and _edge_from(edges_legacy[0]) == "source:UPOK")
+
+    def bonus_of(edges, mid="source:B6", profile=None, enabled=True):
+        ctx = build_chain_context(ms6, edges, profile if profile is not None else prof6,
+                                  matcher=lab_stub, enabled=enabled)
+        sel = select_methods(ms6, "锌 沉积", top=2, chain=ctx)
+        return next(s for s in sel if s["method"]["method_id"] == mid)
+
+    chk("N6 上游不在方法库 ⇒ 不加分（依据写明）",
+        bonus_of([e6("source:GHOST", "source:B6")])["chain_bonus"] == 0.0
+        and "不在方法库" in bonus_of([e6("source:GHOST", "source:B6")])["chain_basis"])
+    chk("N6 权重可复算：partial=1.0、missing=0",
+        bonus_of([e6("source:UPPART", "source:B6")])["chain_bonus"] == 1.0
+        and bonus_of([e6("source:UPNONE", "source:B6")])["chain_bonus"] == 0.0)
+    wk = bonus_of([e6("source:UPOK", "source:B6", "category")])
+    chk("N6 弱边 ×0.5：类别级上游 available ⇒ 2.0×0.5=1.0（依据标「类别级（弱）」）",
+        wk["chain_bonus"] == 1.0 and "类别级（弱）" in wk["chain_basis"], wk["chain_basis"])
+    chk("N6 同一上游多条边只算一次（取最强的 term 边）",
+        bonus_of([e6("source:UPOK", "source:B6", "category"),
+                  e6("source:UPOK", "source:B6", "term")])["chain_bonus"] == 2.0)
+    chk("N6 加分封顶 4.0（3 个可执行上游 = 6.0 → 4.0）",
+        bonus_of([e6("source:UPOK", "source:B6"), e6("source:UPOK2", "source:B6"),
+                  e6("source:UPOK3", "source:B6")])["chain_bonus"] == 4.0)
+
+    def boom(method, profile):
+        raise RuntimeError("模拟匹配器坏掉")
+
+    grade_boom, why_boom = lab_grade(up_ok, prof6, matcher=boom)
+    chk("N6 匹配器异常 ⇒ unknown、不加分、不崩",
+        grade_boom == "unknown" and bool(why_boom)
+        and lab_grade(up_ok, None)[0] == "no-profile"
+        and lab_grade(up_ok, prof6, matcher=lab_stub)[0] == "available"
+        and lab_grade(mk6("source:X0", "无需求方法", 1), prof6,
+                      matcher=lab_stub)[0] == "no-need", why_boom)
+    prof_x, why_p = load_lab(os.path.join(td6, "no_such_profile.yaml"))
+    chk("N6 无 lab 档案文件：返回 (None, 原因)，不抛", prof_x is None and "无 `" in why_p)
+
+    md6 = render_chain_bonus_section(sel6, ctx6)
+    chk("N6 报告小节：含表头 + 上游 + 可用性 + 计入后分数",
+        "## 链位置与链加分（N6）" in md6 and "上游可执行方法" in md6
+        and "| 上游数 | 下游数 | 链加分 |" in md6 and "24" in md6)
+    chk("N6 报告：--no-chain-bonus 时写明已关闭、排序不变",
+        "--no-chain-bonus" in render_chain_bonus_section(sel6, ctx_off)
+        and "完全一致" in render_chain_bonus_section(sel6, ctx_off))
+
+    # ---------------- 切入点出处（§五.1 课题主键） ----------------
+    ref_demo = {"schema": 1, "id": "研究方向A#子方向A", "topic": "研究方向A",
+                "sub_direction": "子方向A", "rank_at_selection": 1,
+                "feasibility_score_at_selection": 0.552,
+                "feasibility_at_selection": "high", "signal": "single-lab-claim",
+                "rationale": "独立验证是空白",
+                "alternatives": [{"sub_direction": "机器学习势函数", "rank": 2,
+                                  "feasibility_score": 0.519,
+                                  "signal": "comp-no-expt"}],
+                "source": "topics/研究方向A/entry_points.json",
+                "captured_at": "2026-10-23"}
+    chk("主键：无引用时小节为空串（不改变既有报告）", render_entry_ref_section(None) == "")
+    md_e = render_entry_ref_section(ref_demo)
+    chk("主键：小节含主键/当时分数/当时落选/快照说明",
+        "## 切入点出处（C1 主键）" in md_e and "研究方向A#子方向A" in md_e
+        and "0.552" in md_e and "机器学习势函数" in md_e and "快照" in md_e)
+    chk("主键：保留既有引用（重生成不擦除出处）",
+        pick_entry_ref({"entry_point_ref": ref_demo}, None) == ref_demo)
+    chk("主键：新引用覆盖旧引用",
+        pick_entry_ref({"entry_point_ref": ref_demo},
+                       {"id": "B#X"})["id"] == "B#X")
+    chk("主键：新旧都没有时为 None（不造一个空引用）",
+        pick_entry_ref(None, None) is None and pick_entry_ref({}, None) is None)
 
     print(f"SELFTEST {'PASSED' if not fails else 'FAILED'}: {len(fails)} failure(s)")
     return 0 if not fails else 1
@@ -556,6 +1327,16 @@ def main(argv=None):
                     help="判断层结果 JSON（--assess 的产出经 LLM 返回后合并）")
     ap.add_argument("--json", action="store_true", help="结果 JSON 打印到 stdout")
     ap.add_argument("--no-write", action="store_true", help="不写盘")
+    ap.add_argument("--export-experiment", default=None, metavar="METHOD_ID",
+                    help="N4：把该方法的方案导出成 wiki/experiments/ 页（默认干跑）")
+    ap.add_argument("--apply", action="store_true",
+                    help="配合 --export-experiment：真正写盘（默认只打印）")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="配合 --export-experiment：允许覆盖已存在的方案页")
+    ap.add_argument("--no-chain-bonus", action="store_true",
+                    help="N6：关闭方法链加分（排序与未启用该功能时完全一致）")
+    ap.add_argument("--entry", default="", metavar="方向#子方向",
+                    help="§五.1：绑定 C1 切入点（写入快照；未给则保留既有引用）")
     ap.add_argument("--selftest", action="store_true", help="自检（不依赖知识库）")
     args = ap.parse_args(argv)
 
@@ -585,7 +1366,109 @@ def main(argv=None):
             print(f"     输出: {os.path.relpath(p_md, K.VAULT)}")
         return 0
 
-    selected = select_methods(methods, args.goal, args.category, args.top)
+    if args.export_experiment:
+        if not args.goal:
+            raise SystemExit("[!] --export-experiment 需要同时给 --goal")
+        m = find_method(methods, args.export_experiment)
+        if not m:
+            raise SystemExit(f"[!] 找不到方法: {args.export_experiment}")
+        import sci_lab_match as LM
+        profile = LM.load_profile()
+        lab_rows, lab_summary = LM.match_method(m, profile)
+        judged = load_judgements_for(m.get("method_id"), args.judges)
+        edges = chain_edges_for(m.get("method_id"))
+        rows = scan_experiments()
+        # 同一方法已有页 ⇒ 复用它的编号/exp_id（否则 --overwrite 会不断生出 -02/-03）
+        same = next((r for r in rows if r["method_id"] == m.get("method_id")), None)
+        if same:
+            page_name, exp_id = same["name"], same["exp_id"]
+            n = None
+        else:
+            n = len([r for r in rows if r["goal"] == args.goal]) + 1
+            page_name = f"{slugify(args.goal)}-{n:02d}"
+            exp_id = f"EXP-{slugify(args.goal)}-{n:02d}"
+        page_path = os.path.join(experiments_dir(), page_name + ".md")
+        gates = experiment_gates(m, judged, lab_summary,
+                                 os.path.isfile(page_path), args.overwrite, lab_rows)
+        print(f"[gate] {m.get('name_zh')} → {EXPERIMENTS_REL}/{page_name}.md")
+        for gid, ok, label, detail in gates:
+            print(f"  {'PASS' if ok else 'FAIL'}  {gid} {label}   [{detail}]")
+        hard = [g for g in gates if not g[1]]
+        if lab_summary.get("missing"):
+            print(f"  NOTE 缺件 {lab_summary['missing']} 项：不挡写盘，但页内已逐条列出并进"
+                  "「审核清单」——需外借或补登记")
+        if hard:
+            print("[!] 未过机械审核门，**不写盘**（补齐后重跑）。"
+                  "方法链属于提示项，不挡写盘。")
+            return 2
+        quoted, bad = method_quote_stats(m)
+        n_judge = sum(len(judged.get(k) or []) for k in
+                      ("advantages", "conditions", "limitations"))
+        src_card = os.path.basename(m.get("page_path") or "").replace(".md", "")
+        tags = ["experiment", "sci-assistant", slugify(args.goal)]
+        fm = "\n".join([
+            f"created: {datetime.date.today().isoformat()}",
+            f"updated: {datetime.date.today().isoformat()}",
+            "type: experiment",
+            f'exp_id: "{exp_id}"',
+            f'goal: "{args.goal}"',
+            f'method_id: "{m.get("method_id")}"',
+            f'method_name: "{m.get("name_zh")}"',
+            f'category: "{m.get("category")}"',
+            f'source_card: "{src_card}"',
+            "status: draft",
+            "review_status: pending-human",
+            f"evidence_quotes: {quoted}",
+            f"bad_value_in_quote: {bad}",
+            f"judgement_items: {n_judge}",
+            f"tags: [{', '.join(tags)}]",
+            "aliases: []",
+            f'summary: "【待人工审核】{m.get("name_zh")} 的实验方案（{args.goal}），'
+            f'含 {quoted} 条原文引文与 {n_judge} 条判断层结论，'
+            f'缺件 {lab_summary.get("missing", 0)} 项"',
+            "sources:",
+            f'  - "[[sources/{src_card}.md]]"' if src_card else '  - "[[raw/]]"',
+        ])
+        body = render_experiment(args.goal, m, judged, lab_rows, lab_summary,
+                                 edges, gates, exp_id, page_name)
+        text = K.join_frontmatter(fm, body)
+        if args.json:
+            print(json.dumps({"exp_id": exp_id, "page": page_name,
+                              "gates": [{"id": g[0], "ok": g[1], "detail": g[3]}
+                                        for g in gates]}, ensure_ascii=False, indent=2))
+        if not args.apply:
+            print(text)
+            print("[dry-run] 默认不写盘；确认无误后加 --apply")
+            return 0
+        os.makedirs(experiments_dir(), exist_ok=True)
+        ok, detail = K.write_text_verified(page_path, text, require_frontmatter=True)
+        if not ok:
+            raise SystemExit(f"[!] 写盘/复算失败：{detail}")
+        idx = render_experiments_index(scan_experiments())
+        ok2, detail2 = K.write_text_verified(os.path.join(experiments_dir(), "_index.md"),
+                                             idx, require_frontmatter=True)
+        if not ok2:
+            raise SystemExit(f"[!] 索引写盘/复算失败：{detail2}")
+        print(f"[ok] 方案页：{os.path.relpath(page_path, K.VAULT)}（{exp_id}）")
+        print(f"[ok] 索引：{EXPERIMENTS_REL}/_index.md")
+        print("     下一步：人工过「审核清单」→ 改 review_status: approved；"
+              "再跑 kb_build_index.py 让检索层看到它")
+        return 0
+
+    # N6：链加分上下文（--no-chain-bonus 时完全不建 ⇒ 排序与旧行为逐位相同）
+    chain_ctx = None
+    if not args.no_chain_bonus:
+        edges, why_e = load_chain_edges()
+        profile, why_p = load_lab()
+        degraded = []
+        if why_e:
+            degraded.append(f"{why_e} ⇒ 链位置取不到上游，链加分恒为 0（按无链降级，不崩）")
+        if why_p:
+            degraded.append(f"{why_p} ⇒ 上游可用性判不了，本次不加分"
+                            "（chain_position 仍照常输出）")
+        chain_ctx = build_chain_context(methods, edges, profile, degraded=degraded)
+
+    selected = select_methods(methods, args.goal, args.category, args.top, chain=chain_ctx)
     if not selected:
         raise SystemExit(f"[!] 方法库中没有与「{args.goal}」匹配的方法"
                          "（试试更宽的目标词，或先补方法库）")
@@ -614,28 +1497,70 @@ def main(argv=None):
 
     md = render_strategy(args.goal, selected, args.category)
     md += render_chain_section({s["method"]["method_id"] for s in selected})
+    md += render_chain_bonus_section(selected, chain_ctx)
+    # 切入点出处（§五.1 课题主键）：--entry 显式绑定；未给则保留既有引用（重生成不擦除出处）
+    new_ref = None
+    if getattr(args, "entry", ""):
+        _t, _s = LK.parse_entry_id(args.entry)
+        new_ref = LK.snapshot_entry(_t, sub_direction=_s, cfg=cfg)
+    old_strategy = None
+    old_js = os.path.join(d, "strategy.json")
+    if os.path.isfile(old_js):
+        try:
+            with open(old_js, "r", encoding="utf-8") as f:
+                old_strategy = json.load(f)
+        except Exception:                                # noqa: BLE001
+            old_strategy = None
+    entry_ref = pick_entry_ref(old_strategy, new_ref)
+    md += render_entry_ref_section(entry_ref)
     if args.json:
         print(json.dumps([{"method_id": s["method"]["method_id"], "match": s["match"],
                            "quoted": s["quoted"], "bad": s["bad"],
-                           "rank_score": s["rank_score"]} for s in selected],
-                         ensure_ascii=False, indent=2))
+                           "rank_score": s["rank_score"],
+                           "chain_position": s.get("chain_position"),
+                           "chain_bonus": s.get("chain_bonus", 0.0),
+                           "final_score": s.get("final_score", s["rank_score"]),
+                           "chain_upstream": s.get("chain_upstream") or []}
+                          for s in selected], ensure_ascii=False, indent=2))
+    if args.no_write:
+        # 干跑 = 打印方案、不写盘（与 --export-experiment 的「默认干跑打印」一致）。
+        # 此前 --no-write 连方案都不打印，读者只能看到"什么都没有"，像工具坏了。
+        if not args.json:
+            print(md)
+        return 0
     if not args.no_write:
         p_md = write_text(os.path.join(d, "strategy.md"), md)
         p_js = os.path.join(d, "strategy.json")
         write_text(p_js, json.dumps({
             "goal": args.goal, "category": args.category,
             "generated_at": datetime.date.today().isoformat(),
+            "entry_point_ref": entry_ref,
+            "chain_bonus_enabled": bool(chain_ctx and chain_ctx.get("enabled")),
+            "chain_degraded": (chain_ctx or {}).get("degraded") or [],
             "candidates": [{"method_id": s["method"]["method_id"],
                             "name_zh": s["method"]["name_zh"],
                             "category": s["method"]["category"],
                             "matched": s["match"], "quoted": s["quoted"],
-                            "bad": s["bad"], "rank_score": s["rank_score"]}
+                            "bad": s["bad"], "rank_score": s["rank_score"],
+                            "chain_position": s.get("chain_position"),
+                            "chain_bonus": s.get("chain_bonus", 0.0),
+                            "final_score": s.get("final_score", s["rank_score"]),
+                            "chain_basis": s.get("chain_basis") or ""}
                            for s in selected]}, ensure_ascii=False, indent=2))
         print(f"[ok] 策略层：{len(selected)} 个候选（目标「{args.goal}」）")
+        if entry_ref:
+            print(f"     切入点：{entry_ref.get('id')}"
+                  f"（当时 {entry_ref.get('feasibility_score_at_selection')}）")
         for s in selected:
             m = s["method"]
+            extra = ""
+            if chain_ctx and chain_ctx.get("enabled"):
+                cp = s.get("chain_position") or {}
+                extra = (f" ｜ 链 ↑{cp.get('upstream', 0)}/↓{cp.get('downstream', 0)}"
+                         f" 加分 {float(s.get('chain_bonus') or 0):g}"
+                         f" → 计入后 {float(s.get('final_score') or 0):g}")
             print(f"     - [{m.get('category')}] {m.get('name_zh')} "
-                  f"（match={s['match']} 引文={s['quoted']}）")
+                  f"（match={s['match']} 引文={s['quoted']}{extra}）")
         print(f"     输出: {os.path.relpath(p_md, K.VAULT)}")
     return 0
 

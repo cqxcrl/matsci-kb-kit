@@ -35,11 +35,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import kb_lib as K                                            # noqa: E402
+K.console_encoding()
 
-try:                                                           # noqa: SIM105
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                                              # noqa: BLE001
-    pass
 
 LEVELS = {"ok": 0, "info": 0, "warn": 1, "error": 2}
 

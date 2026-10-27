@@ -39,6 +39,7 @@ import sys
 import os
 import re
 import glob
+import kb_lib as K
 from collections import Counter
 
 # 🔴 必须**守卫**且带 errors 兜底。2026-10-10 实测后果：
@@ -47,15 +48,13 @@ from collections import Counter
 #   调用方 `kb_lint_deep` 的 `try: import qc_evidence_base / except Exception: return []`
 #   把异常吞掉 ⇒ **B3（evidence_base ↔ sources 重算）在 --json 模式下整轮静默禁用**。
 #   它是本库唯一会自己校验「证据承重」的检查，静默禁用等于该维度长期无人管。
-try:                                                           # noqa: SIM105
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                                              # noqa: BLE001
-    pass
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, "tools")
 from kb_lib import (read_text, split_frontmatter, parse_frontmatter,  # noqa: E402
                     join_frontmatter)
+from kb_lib import console_encoding
+console_encoding()
 
 
 def match_frontmatter(text):
@@ -91,12 +90,23 @@ VALID = ("strong", "mixed", "single-source", "secondhand")
 
 
 def load_source_pages():
-    """加载全部 source 页的 {页面名: (fm, body)}"""
+    """加载全部 source 页的 {页面名: (fm, body)}。
+
+    2026-10-22 起**同时加载项目卡**（`projects/*/sources/*.md`）：
+    项目卡已纳入检索层（见 kb_lib.iter_page_files(include_projects=True)），
+    概念页可以直接以它们为 `sources:`；若这里仍只扫 wiki/sources，
+    引用项目卡的概念页会被机械判成 `single-source`（假阴性）。
+    同名时 **wiki 优先**，与 kb_build_index 的去重口径一致。
+    """
     out = {}
-    for f in glob.glob("wiki/sources/*.md"):
+    paths = sorted(glob.glob("wiki/sources/*.md")) + sorted(glob.glob("projects/*/sources/*.md"))
+    for f in paths:
+        name = os.path.basename(f)[:-3]
+        if name == "index" or name in out:
+            continue
         t = read_text(f)
         a, b = split_frontmatter(t)
-        out[os.path.basename(f)[:-3]] = (parse_frontmatter(a), b)
+        out[name] = (parse_frontmatter(a), b)
     return out
 
 
@@ -226,8 +236,13 @@ def write_field(page_path, value):
     if not match_frontmatter(new):
         raise ValueError(f"写入后会破坏 frontmatter，已中止: {page_path}")
     if new != t:
-        with open(page_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(new)
+        # 🔴 换行不能硬写 "\n"：本库 md 是 CRLF/LF 混合，`newline="\n"` 会把 CRLF 页整份翻转
+        #    ⇒ git diff 变成整篇换行噪声，真实改动被淹没（本库踩过 7132 行 diff 只加 1 行的事故）。
+        #    改走 kb_lib 的唯一出口：按多数票保留原换行 + **写后复算**。
+        ok, detail = K.write_text_verified(page_path, new, quiet=True,
+                                           require_frontmatter=True)
+        if not ok:
+            raise ValueError(f"写入失败/写后复算不一致：{detail}（{page_path}）")
         return True
     return False
 

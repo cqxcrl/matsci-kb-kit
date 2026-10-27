@@ -28,6 +28,8 @@ META_PATH = os.path.join(INDEX_DIR, "meta.json")        # 精简版：AI 每次�
 FULL_PATH = os.path.join(INDEX_DIR, "meta_full.json")   # 内部版：出链/路径/hash，工具专用
 BM25_PATH = os.path.join(INDEX_DIR, "bm25.json")
 META_LITE_PATH = os.path.join(INDEX_DIR, "meta_lite.json")
+# 🆕 2026-10-15：预取的 frontmatter 限定词**独立成文件**（见下方 load_page_fm 的说明）
+META_FM_PATH = os.path.join(INDEX_DIR, "meta_fm.json")
 
 # 索引时排除的目录（备份、缓存、插件、会话记录）
 EXCLUDE_DIR_MARKERS = (
@@ -39,7 +41,11 @@ EXCLUDE_DIR_MARKERS = (
     "backup",
 )
 
-PAGE_DIRS = ("entities", "concepts", "sources", "topics", "outputs")
+PAGE_DIRS = ("entities", "concepts", "sources", "topics", "outputs", "experiments")
+# `experiments/`（2026-10-21 加入）：sci-assistant 的 N4 把**人工审核过/待审核的
+# 实验方案**写进 `wiki/experiments/`（`type: experiment`），这样 `kb-query` 能检索到。
+# 加进 PAGE_DIRS 之前，这些页面对 lint / 索引 / 语义检索 **完全不可见**——
+# 「已写进 wiki」不等于「已被检索层看见」。
 
 # ---------------------------------------------------------------- QC 工作目录
 #
@@ -134,6 +140,309 @@ def join_frontmatter(fm_text, body):
     return "---\n" + (fm_text or "").strip("\n") + "\n---\n" + (body or "").lstrip("\n")
 
 
+def json_safe(value):
+    """移除 surrogate，保证历史文本也能序列化为严格 UTF-8 JSON。"""
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(value, dict):
+        return {json_safe(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    return value
+
+
+def json_dumps(value, **kwargs):
+    return json.dumps(json_safe(value), **kwargs)
+
+
+def write_json_atomic(path, value, **kwargs):
+    """同目录临时文件 + os.replace，避免半截 JSON 索引。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(json_dumps(value, **kwargs))
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- 控制台输出编码
+#
+# 🔴 由来（2026-10-14 诊断意见 P1-3）：全库 30+ 个脚本各写一份
+#        `sys.stdout.reconfigure(encoding="utf-8", errors="replace")`
+#    但 **控制台代码页仍是 936（GBK）时**，Python 写出 UTF-8 字节、控制台按 GBK 解码
+#    ⇒ 中文全成 mojibake（`kb_stats` / `kb_route` / `kb_search --resolve` 实测）。
+#    对 AI 调用无碍（管道里字节是好的），但**人直接看工具输出是坏的**，
+#    而「工具可被人工验证」正是本库自检体系的最后一环。
+#
+# 判定策略（**不赌单一事实**，因为「谁在解码」随宿主变化）：
+#   · stdout 不是终端（管道/重定向/子进程捕获）⇒ 强制 UTF-8。
+#     调用方（如 lit_finish 用 encoding="utf-8" 捕获）与 Agent 都按 UTF-8 读，字节必须自洽。
+#   · stdout 是终端 ⇒ **先试着把控制台代码页改成 65001**（SetConsoleOutputCP）。
+#       成功 → 用 UTF-8（终端与写出的字节一致，且保留化学式上下标等字符）。
+#       失败 → **回落到控制台原本的编码**，至少中文是可读的。
+#     ⚠️ 不能无条件 reconfigure：CP936 终端 + UTF-8 字节 = 整屏乱码。
+#     这正是本库「**写出了缺省值也要验证它在起作用**」那条方法论的适用处
+#     ——旧写法「声明了 UTF-8」却在 cp936 终端上没生效。
+#
+# 收敛到 kb_lib 的唯一原因与 `parse_budget`/`TYPE_DIR` 相同：**同一事实多处维护必然漂移**。
+
+_console_encoding_done = False
+
+
+def console_encoding():
+    """按上文策略设置 stdout/stderr 编码；返回实际生效的编码名。
+
+    幂等：重复调用只做一次（供被 import 时立即使用）。
+    任何异常都吞掉——编码设置失败绝不该让一个工具跑不起来。
+    """
+    global _console_encoding_done
+    if _console_encoding_done:
+        return getattr(sys.stdout, "encoding", "") or ""
+    _console_encoding_done = True
+    try:
+        is_tty = False
+        try:
+            is_tty = bool(sys.stdout.isatty())
+        except Exception:                                  # noqa: BLE001
+            is_tty = False
+        want = "utf-8"
+        if is_tty:
+            cp = None
+            try:
+                import ctypes
+                k = ctypes.windll.kernel32                  # 仅 Windows 有
+                cp = int(k.GetConsoleOutputCP())
+                if cp != 65001:
+                    # 试着把控制台切到 UTF-8；失败（返回值 0）就按原代码页来
+                    if k.SetConsoleOutputCP(65001):
+                        cp = 65001
+            except Exception:                              # noqa: BLE001
+                cp = None
+            if cp and cp != 65001:
+                # 切不过去 ⇒ 用控制台原编码，中文才可读（宁可不统一，不可乱码）
+                import codecs
+                want = "cp%d" % cp if codecs.lookup("cp%d" % cp) else want
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding=want, errors="replace")
+            except Exception:                              # noqa: BLE001
+                pass
+        return want
+    except Exception:                                      # noqa: BLE001
+        return getattr(sys.stdout, "encoding", "") or ""
+
+
+# ---------------------------------------------------------------- 页面类型 → 目录
+#
+# 🔴 类型 → wiki 子目录名。**不能靠加 s 拼接**：
+#     entity → "entitys" 不存在（正确是 entities）。
+#     2026-10-04 实测：`kb_search --json` 对 entity 命中返回的 path 100% 不存在，
+#     Agent 据此路径读取必然失败。
+#
+# 为什么收敛到这里：此前 `kb_search.TYPE_DIR` 与 `kb_route.TYPE_DIR` **各有一份**，
+# 且两处带着同样的「entitys 不是 entities」注释——**同一事实两处维护**。
+# 本库的 `qc_same_text` 纪律（一个更正平均 3–7 处副本）没覆盖到自己的代码，
+# 这正是诊断 P1-4 点出的问题。现在只有这一份；kb_selftest 断言其与 PAGE_DIRS 一致。
+TYPE_DIR = {
+    "concept": "concepts",
+    "entity": "entities",
+    "source": "sources",
+    "topic": "topics",
+    "output": "outputs",
+    "experiment": "experiments",
+}
+
+
+def page_path_for_type(name, ptype):
+    """页面**相对库根**的路径；类型未知时返回空串（不要猜）。
+
+    项目卡优先查项目路径表：它们的 `type` 也是 `source`，若走 TYPE_DIR 会
+    被错拼成 `wiki/sources/<卡名>.md`（不存在）——**路径错但形似正确**，
+    正是本库最忌讳的静默失效。故先查缓存，再回落到 wiki 规则。
+    """
+    proj = project_page_paths().get(name)
+    if proj:
+        return proj
+    d = TYPE_DIR.get(ptype)
+    return "wiki/%s/%s.md" % (d, name) if d else ""
+
+
+def cite_page(name, ptype=""):
+    """可点击 wikilink：用**真实路径**，不用「类型 → 目录」猜（项目卡靠这条才点得开）。"""
+    rel = page_path_for_type(name, ptype)
+    if rel.endswith(".md"):
+        rel = rel[:-3]
+    return "[[%s]]" % (rel or name)
+
+
+# ---------------------------------------------------------------- 预取 frontmatter 字段
+#
+# 🔴 由来（2026-10-14 诊断 P1-4）：`kb_route.layer2` 为拿 `source_reliability`
+#    对 top-k **逐页 read_text + split_frontmatter**（O(k) 文件 IO，每次查询都做）。
+#    这些字段正是分层检索的立身之本（证据强度必须随身），却在索引里缺席。
+#    现在建索引时解析一次，写进 meta.json 的 `page_fm`。
+#
+# 为什么用**独立的第三块**而不是往 PAGE_COLS / SOURCE_COLS 里加列：
+#    那两组是**位置元组**（`meta_of` 按位解包 `t, s, u, tags, al, _ = meta["pages"][name]`），
+#    加列会**静默错位**所有既有读取方——本库最痛恨的失效形态。
+#    新增一块则可自由增删字段。
+#
+# 🔴 **只预索引「检索层真的会读」的字段**，不做"把 frontmatter 全搬进来"。
+#    实测（862 页）：若把 year/journal/doi/source_url 也搬进来，`page_fm` 会膨胀到 571 KB
+#    ⇒ `meta.json` 从 961 KB 涨到 1497 KB（+56%），而这份文件是 **AI 每次查询整份读入**的
+#    ——索引大了，检索的上下文预算就被挤掉，属于**为了省 O(k) 文件 IO 而付 O(全库) 上下文**，
+#    得不偿失。
+#    故只留 `L2 检索时随身要带的限定词`：
+#      · source_reliability —— `kb_route` 每条 L2 命中都要展示（截 160 字）
+#      · evidence_base      —— concept/topic 页的证据承重（综述判权重直接用）
+#      · si_status          —— L3 原文块要带"SI 是否随件"的限定（见 kb_corpus）
+#    `year`/`journal`/`doi` 等仍在**页面**与 `meta_full.json` 里，需要时读页即可。
+FM_INDEX_FIELDS = ("source_reliability", "evidence_base", "si_status")
+# 单字段入库长度上限。取值依据：`kb_route` 展示 `source_reliability[:160]`，
+# 故取 **160**——索引里存的是**检索层真正会读到的那一段**。
+#   ⚠️ 诚实边界：这是**有损**的（实测原始中位数就有 391 字）。被截掉的部分
+#   **本来在 meta.json 里也从没被读过**（完整值始终在页面正文，深读时读页即可）。
+#   截到 160 而非 220 的理由单纯是体积：AI 每次查询整份读入，多出的字节是纯成本。
+FM_INDEX_MAXLEN = {"source_reliability": 160}
+
+
+def index_fm_extras(fm):
+    """从**已解析**的 frontmatter 取出要预索引的字段（长值按 FM_INDEX_MAXLEN 截断）。
+
+    口径：**只做机械搬运，不做判定**——`evidence_base` 的判定规则属于
+    `qc_evidence_base.py`（CLAUDE.md 明令勿手填）；此处只把已写在 frontmatter 里的值
+    搬进索引，没有就是空串（**不猜、不推导**）。
+    """
+    out = {}
+    for k in FM_INDEX_FIELDS:
+        v = fm.get(k)
+        if v in (None, "", []):
+            continue
+        s = str(v)
+        n = FM_INDEX_MAXLEN.get(k)
+        out[k] = s[:n] if n else s
+    return out
+
+
+def load_page_fm(meta=None):
+    """读预取的 frontmatter 限定词 -> {页面名: {字段: 值}}。
+    🔴 为什么**独立成 `meta_fm.json`** 而不是塞在 `meta.json` 里
+    （2026-10-15 第二轮诊断认定为「唯一技术债」，本节即为处置）：
+    `meta.json` 是 **AI 每次查询整份读入**的文件，把 252 KB 限定词塞进去会让它
+    从 961 KB 涨到 1214 KB（+26%）。这笔账在首轮处置报告里已如实记为权衡，
+    但它**可以不必付**：检索层要的是「免去逐页读盘」，不是「必须与 meta.json 同文件」。
+    拆开后 `meta.json` 回到改造前体积，`meta_fm.json` 只在真正要用时才加载
+    （`kb_route` 一次、`kb_corpus` 一次）—— **文件 IO 仍是 O(1)，不是 O(k)**。
+
+    兼容：`meta` 仍带 `page_fm` 时优先用它（旧索引不必立即重建即可工作）；
+    传 None 时自行加载 meta.json 取内嵌值。
+    """
+    if os.path.exists(META_FM_PATH):
+        try:
+            with open(META_FM_PATH, encoding="utf-8") as f:
+                return (json.load(f) or {}).get("page_fm") or {}
+        except Exception:                                  # noqa: BLE001
+            pass                                  # 坏了就回退，不让检索整体失败
+    if meta is None:
+        try:
+            with open(META_PATH, encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:                                  # noqa: BLE001
+            return {}
+    return (meta or {}).get("page_fm") or {}
+
+
+# ---------------------------------------------------------------- 临时目录（沙箱兼容）
+#
+# 🔴 由来（2026-10-15 第二轮诊断 §七「环境层阻塞」）：本机 DSH 沙箱下，
+#    `tempfile.mkdtemp()` 建出的目录**连创建者自己都不能写** ——
+#    实测根因：mkdtemp 用 mode 0700，而该 mode 在此沙箱里落成一条**拒绝本用户的 ACL**
+#    （`icacls` 对它甚至报 "Failed processing 1 files"），且 `os.chmod` 也被拒
+#    ⇒ 无法事后放宽。后果：16 个工具的 `--selftest` 全部崩在**建临时目录**这一步，
+#    连断言都没跑到（其中 6 个本来就 FAIL，另 10 个是纯环境所致）。
+#
+# 为什么这**不是**「掩盖缺陷」：缺陷是**临时目录的分配**，不是被测逻辑。
+#    `make_temp_dir` 只在 mkdtemp 产出不可写目录时才换 `os.makedirs`
+#    （后者继承父目录 ACL，实测可写）；**基目录仍由调用方/系统决定**，不自作主张换位置。
+#    真正失败的断言依旧会失败 —— 恢复的是「能跑完」，不是「都变绿」。
+
+def _default_temp_bases(base=None):
+    """临时目录的**基目录**候选，按优先级。
+
+    逐级回退不是新发明：`lit_ingest` / `lit_daily` / `lit_fetch` **早已各自**手写过
+    「temp → cwd → 工具目录」的回退（因为本机受限环境下 temp 也可能不可写）。
+    此处只是把它收敛成一份，供全部工具复用。
+    """
+    if base is not None:
+        return [base]
+    import tempfile
+    return [tempfile.gettempdir(), os.getcwd(),
+            os.path.dirname(os.path.abspath(__file__))]
+
+
+def make_temp_dir(prefix="kb_tmp_", base=None, bases=None):
+    """建一个**确实可写**的临时目录，返回其路径（全部候选都失败才抛 OSError）。
+
+    两层回退（与既有工具的手写逻辑一致）：
+      ① 基目录：`bases` > `base` > 默认链（temp → cwd → tools/）
+      ② 建法  ：`tempfile.mkdtemp` 失败/不可写 → `os.makedirs` + 随机名
+    **每次都真写一个探针文件**验证可写 —— 「目录建出来了」不等于「能往里写」
+    （这正是本库 `已声明 ≠ 已生效` 那条方法论的适用处）。
+    """
+    import tempfile as _tf
+    import uuid
+    cand_bases = bases if bases else _default_temp_bases(base)
+    last_err = None
+    for b in cand_bases:
+        for maker in ("mkdtemp", "makedirs"):
+            try:
+                if maker == "mkdtemp":
+                    d = _tf.mkdtemp(prefix=prefix, dir=b)
+                else:
+                    d = os.path.join(b, prefix + uuid.uuid4().hex[:8])
+                    os.makedirs(d, exist_ok=True)
+                probe = os.path.join(d, ".write_probe")
+                with open(probe, "w", encoding="utf-8") as f:
+                    f.write("x")
+                os.remove(probe)
+                return d
+            except OSError as e:
+                last_err = e
+                continue
+    raise OSError("无法创建可写临时目录（基目录 %s 全试过，两种建法全试过）：%s"
+                  % (cand_bases, last_err))
+
+
+def remove_temp_dir(path):
+    """尽力删除临时目录；**绝不抛异常**（清理失败不该否定已完成的检查）。"""
+    import shutil
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+class temp_dir(object):
+    """`with K.temp_dir(prefix=...) as d:`：可写临时目录 + 清理失败不抛。
+
+    为什么自建而不直接用 `tempfile.TemporaryDirectory`：后者在受限环境下
+    ① `mkdtemp` 会产出不可写目录；② `__exit__` 的 rmtree 清理失败会**抛异常**，
+    而它处在 finally 路径上 ⇒ **整个自检崩掉，已通过的断言连汇总行都打不出来**
+    （实测：8 项全过后崩在清理，看起来像「自检失败」）。
+    """
+
+    def __init__(self, prefix="kb_tmp_", base=None, bases=None):
+        self.prefix, self.base, self.bases = prefix, base, bases
+        self.path = None
+
+    def __enter__(self):
+        self.path = make_temp_dir(prefix=self.prefix, base=self.base, bases=self.bases)
+        return self.path
+
+    def __exit__(self, *exc):
+        remove_temp_dir(self.path)
+        return False                                  # 不吞被测代码的异常
+
+
 # ---------------------------------------------------------------- 停用词
 
 STOPWORDS = set("""
@@ -160,8 +469,14 @@ MAX_CANDIDATE_TERMS = 12
 
 # ---------------------------------------------------------------- 工具函数
 
-def iter_page_files():
-    """遍历 wiki 下所有正式页面文件（相对 vault 的路径）。"""
+def iter_page_files(include_projects=False):
+    """遍历 wiki 下所有正式页面文件（绝对路径）。
+
+    include_projects=True 时**额外**产出 `projects/<slug>/sources/*.md`
+    （项目文献卡）。默认 False —— lint / stats / selftest 的语义是「wiki 页」，
+    改变它们的口径会让既有的「库内共 N 页」类断言静默漂移。
+    检索层（建索引 / 语义索引）显式传 True，让项目卡进入检索。
+    """
     for d in PAGE_DIRS:
         full = os.path.join(WIKI, d)
         if not os.path.isdir(full):
@@ -169,6 +484,42 @@ def iter_page_files():
         for fn in sorted(os.listdir(full)):
             if fn.endswith(".md"):
                 yield os.path.join(full, fn)
+    if include_projects:
+        for path in iter_project_page_files():
+            yield path
+
+
+def iter_project_page_files():
+    """项目文献卡：`projects/<slug>/sources/*.md`（排除 index.md）。"""
+    base = os.path.join(VAULT, "projects")
+    if not os.path.isdir(base):
+        return
+    for slug in sorted(os.listdir(base)):
+        d = os.path.join(base, slug, "sources")
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if fn.endswith(".md") and fn != "index.md":
+                yield os.path.join(d, fn)
+
+
+def is_project_page(path):
+    rel = os.path.relpath(path, VAULT).replace("\\", "/")
+    return rel.startswith("projects/")
+
+
+_PROJECT_PATH_CACHE = {}
+
+
+def project_page_paths(refresh=False):
+    """{页面名: 相对库根路径}，只含项目卡。进程内缓存（listdir 级开销）。"""
+    if refresh or not _PROJECT_PATH_CACHE:
+        _PROJECT_PATH_CACHE.clear()
+        for path in iter_project_page_files():
+            name = os.path.splitext(os.path.basename(path))[0]
+            rel = os.path.relpath(path, VAULT).replace("\\", "/")
+            _PROJECT_PATH_CACHE[name] = rel
+    return _PROJECT_PATH_CACHE
 
 
 def is_excluded(path):
@@ -671,6 +1022,43 @@ def lit_runs_dir(cfg, *sub):
     return os.path.join(base, *sub) if sub else base
 
 
+def _load_project_directions():
+    """扫描 `projects/*/config/lit_direction.yaml`，返回方向列表（坑 4，2026-10-22）。
+
+    文件格式（与 automation.directions 同构）：
+        status: active | paused          # 缺省 active；paused 时整份文件不生效
+        directions:
+          - {slug: myproj, label: 某综述工程, limit: 15, query: "proton exchange membrane ..."}
+    缺 slug 时用工程目录名兜底；缺 limit 兜底 15。
+    解析失败 fail fast——静默退化会让每日发现漏掉整个方向（比崩溃危险）。
+
+    🔴 `status: paused` 是**可执行**的暂停（2026-10-23 加）：文献层冻结的工程
+    若只写注释，每日发现仍会持续灌新文献——「已声明 ≠ 已生效」。
+    """
+    import glob
+    out = []
+    base = os.path.join(VAULT, "projects")
+    if not os.path.isdir(base):
+        return out
+    for f in sorted(glob.glob(os.path.join(base, "*", "config", "lit_direction.yaml"))):
+        try:
+            import yaml
+            with open(f, encoding="utf-8") as fh:
+                d = yaml.safe_load(fh) or {}
+        except Exception as e:                       # noqa: BLE001
+            raise RuntimeError(f"项目方向文件解析失败（{f}）：{e}") from e
+        if str(d.get("status") or "active").strip().lower() == "paused":
+            continue
+        for it in d.get("directions") or []:
+            if not isinstance(it, dict):
+                raise RuntimeError(f"项目方向文件条目应为映射（{f}）：{it!r}")
+            it = dict(it)
+            it.setdefault("slug", os.path.basename(os.path.dirname(os.path.dirname(f))))
+            it.setdefault("limit", 15)
+            out.append(it)
+    return out
+
+
 def load_lit_config(path=None):
     """读取 tools/lit_config.yaml。
 
@@ -727,6 +1115,20 @@ def load_lit_config(path=None):
         if k in cfg:
             continue                      # 已在上面逐段合并过（含 paths 的逐键合并）
         cfg[k] = copy.deepcopy(v)
+
+    # 🆕 2026-10-22（坑 4）：综述工程方向自动并入 automation.directions。
+    #    新综述工程开工时，把发现方向写进 `projects/<slug>/config/lit_direction.yaml`，
+    #    lit_daily 的每日发现即自动覆盖该主题——不必再手改 lit_config.yaml
+    #    （手改会忘；忘了就是「已声明≠已生效」：方向静默漏检，每日发现装看不见）。
+    #    同名 slug 时**项目声明覆盖**配置（项目主题比通用方向更具体）。
+    #    解析失败 fail fast（与上面 lit_config.yaml 的纪律同款：静默退化比崩溃危险）。
+    _proj_decl = _load_project_directions()
+    if _proj_decl:
+        _auto = cfg.get("automation") or {}
+        _by = {d.get("slug"): d for d in (_auto.get("directions") or [])}
+        for _d in _proj_decl:
+            _by[_d.get("slug")] = _d
+        cfg["automation"]["directions"] = list(_by.values())
 
     # 解析相对路径 → 绝对路径
     cfg["paths_rel"] = dict(cfg["paths"])
@@ -1054,8 +1456,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    try:                                                       # noqa: SIM105
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:                                          # noqa: BLE001
-        pass
+    console_encoding()
     sys.exit(main())

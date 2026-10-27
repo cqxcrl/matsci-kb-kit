@@ -5,15 +5,23 @@
 kb_build_index.py — 为 LLM Wiki 构建检索索引
 
 产出文件到 wiki/.index/：
-  meta.json      — 全库结构化元数据（约 400 KB，供 AI 一次性读入）
-  meta_full.json — 内部版（含出链/hash，工具链专用）
+  meta.json      — 全库结构化元数据，**AI 每次查询整份读入的那份**（2026-10-15 约 940 KB）
+  meta_fm.json   — 🆕 预取的 frontmatter 限定词（source_reliability / evidence_base /
+                   si_status），**检索层按需加载**。刻意与 meta.json 分开：后者是
+                   AI 每次查询整份读入的文件，内嵌这 250 KB 会让它 +26%。
+  meta_full.json — 内部版（含出链/hash/fm，工具链专用）
   bm25.json      — BM25 倒排索引（供 kb_search.py 打分）
-  meta_lite.json — 超精简索引（<500KB，仅 --lite 时生成）
+  meta_lite.json — 精简索引（仅 --lite 时生成）
+                   ⚠️ **目前没有任何工具读它**（只有 kb_stats / kb.py --doctor 列它的大小）。
+                   历史上设想是「查询时读的精简版」，实际从未接入检索路径。
+                   实测 2026-10-15 为 712 KB —— 旧文档写的「<500KB」**是失效声明**，已更正。
+                   （本库纪律：**已声明 ≠ 已生效**。留着它无害，但不要把「未接线的设计」
+                   当成「正在起作用的功能」。接入或退役由后续按需决定。）
 
 用法：
   python tools/kb_build_index.py            # 增量构建（只重算内容变化的页面）
   python tools/kb_build_index.py --full     # 全量重建
-  python tools/kb_build_index.py --lite     # 额外生成 meta_lite.json
+  python tools/kb_build_index.py --lite     # 额外生成 meta_lite.json（**无消费者**，见上）
   python tools/kb_build_index.py --embed    # 同时构建嵌入索引（语义检索）
   python tools/kb_build_index.py --stats    # 只打印统计，不写盘
   python tools/kb_build_index.py --add sources/新论文.md concepts/新概念.md  # 增量添加/更新指定页面
@@ -67,9 +75,16 @@ def load_existing():
 
 
 def scan_pages():
-    """扫描全部页面，返回 {name: {fields, fm, path}}。"""
+    """扫描全部页面，返回 {name: {fields, fm, path}}。
+
+    🆕 2026-10-22：**项目文献卡一并入索引**（`projects/*/sources/`）。
+    此前它们只存在于项目目录，`kb_search` / `kb_route` / `kb_graph` 完全看不见
+    ——「卡已写好」不等于「检索得到」。
+    ⚠️ 同名的 wiki 页**优先**：项目卡不得覆盖知识层页面。
+    """
     pages = {}
-    for path in K.iter_page_files():
+    dup = []
+    for path in K.iter_page_files(include_projects=True):
         if K.is_excluded(path):
             continue
         raw = K.read_text(path)
@@ -77,8 +92,14 @@ def scan_pages():
         fm = K.parse_frontmatter(fm_raw)
         name = os.path.splitext(os.path.basename(path))[0]
         rel = os.path.relpath(path, K.VAULT).replace("\\", "/")
+        if name in pages:
+            if K.is_project_page(path):
+                dup.append(name)
+                continue
         fields = K.build_fields(name, fm, body)
         pages[name] = {"fields": fields, "fm": fm, "path": rel}
+    if dup:
+        print(f"[warn] {len(dup)} 张项目卡与 wiki 页同名，已保留 wiki 页：{dup[:3]}")
     return pages
 
 
@@ -120,6 +141,25 @@ def _build_meta_lite(meta_pages, alias_map):
         "outputs": groups["output"],
         "alias_map": alias_map,
     }
+
+
+def write_page_fm(meta_pages):
+    """把预取的 frontmatter 限定词写入独立侧车 `meta_fm.json`（2026-10-15）。
+
+    只收**有内容**的页——多数页没有 source_reliability，写空 dict 纯属浪费体积。
+    """
+    page_fm = {n: m["fm"] for n, m in meta_pages.items() if m.get("fm")}
+    os.makedirs(K.INDEX_DIR, exist_ok=True)
+    K.write_json_atomic(K.META_FM_PATH, {
+        "_generated_by": "tools/kb_build_index.py",
+        "_note": ("预取的 frontmatter 限定词（source_reliability / evidence_base / "
+                  "si_status），供检索层免去逐页读盘。"
+                  "**刻意与 meta.json 分开**：后者是 AI 每次查询整份读入的文件。"),
+        "fields": list(K.FM_INDEX_FIELDS),
+        "count": len(page_fm),
+        "page_fm": page_fm,
+    }, ensure_ascii=False, separators=(",", ":"))
+    return len(page_fm)
 
 
 def add_pages(page_rel_paths, also_lite=False):
@@ -167,21 +207,22 @@ def add_pages(page_rel_paths, also_lite=False):
         except Exception:
             pass
 
-    # ---- 加载现有 meta_lite.json（如需要）
-    meta_lite = None
-    if also_lite and os.path.exists(K.META_LITE_PATH):
-        try:
-            with open(K.META_LITE_PATH, "r", encoding="utf-8") as f:
-                meta_lite = json.load(f)
-        except Exception:
-            pass
+    # ---- 是否需要维护 meta_lite.json
+    # 2026-10-15：**只判存在，不再 json.load**。旧版把整个 712 KB 读进来，却只用来判断
+    #   「该不该重写它」——内容一个字段都没用上。而它**没有任何下游消费者**
+    #   （见文件头说明）。白白解析 712 KB 属纯浪费。
+    meta_lite = (also_lite and os.path.exists(K.META_LITE_PATH)) or None
 
     fresh, reused = 0, 0
     seen_names = set()
     alias_map = meta.get("alias_map", {})
 
     for rel_path in page_rel_paths:
-        full_path = os.path.join(K.WIKI, rel_path)
+        # 🆕 2026-10-22：`projects/...` 视为**库根相对**（项目卡不在 wiki/ 下）；
+        # 其余仍按 wiki 相对。写作 `path` 时统一成库根相对，与全量构建一致。
+        rel_norm = rel_path.replace("\\", "/")
+        is_proj = rel_norm.startswith("projects/")
+        full_path = os.path.join(K.VAULT if is_proj else K.WIKI, rel_path)
         if not os.path.exists(full_path):
             print(f"  [!] 文件不存在，跳过: {rel_path}")
             continue
@@ -213,8 +254,9 @@ def add_pages(page_rel_paths, also_lite=False):
             "terms": K.top_terms(fields),
             "out": K.extract_outlinks(raw),
             "n_sources": len(fm.get("sources", []) or []),
-            "path": rel_path.replace("\\", "/"),
+            "path": rel_norm if is_proj else "wiki/" + rel_norm,
             "hash": h,
+            "fm": K.index_fm_extras(fm),      # 🆕 预取限定词字段（诊断 P1-4）
         }
 
         # ---- 更新 alias_map：移除旧别名，添加新别名
@@ -253,16 +295,14 @@ def add_pages(page_rel_paths, also_lite=False):
         "postings": postings,
     }
     os.makedirs(K.INDEX_DIR, exist_ok=True)
-    with open(K.BM25_PATH, "w", encoding="utf-8") as f:
-        json.dump(bm25, f, ensure_ascii=False, separators=(",", ":"))
+    K.write_json_atomic(K.BM25_PATH, bm25, ensure_ascii=False, separators=(",", ":"))
 
     # ---- 写回 meta_full.json
     full = {
         "_note": "内部元数据，含出链与内容 hash。AI 查询无需读取。",
         "pages": full_pages,
     }
-    with open(K.FULL_PATH, "w", encoding="utf-8") as f:
-        json.dump(full, f, ensure_ascii=False, separators=(",", ":"))
+    K.write_json_atomic(K.FULL_PATH, full, ensure_ascii=False, separators=(",", ":"))
 
     # ---- 更新 meta.json
     if meta:
@@ -271,8 +311,15 @@ def add_pages(page_rel_paths, also_lite=False):
         meta["count"] = len(full_pages)
         meta["pages"] = lean_pages
         meta["sources"] = src_rows
-        with open(K.META_PATH, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, separators=(",", ":"))
+        # 🆕 侧车同步（2026-10-15）：**同一份真源重写整个文件**，不做增量合并。
+        #    侧车 252 KB、862 页，整体重写是毫秒级；而增量合并要处理「旧条目缺 fm 键」
+        #    的过渡态，正是本库最忌讳的「静默错位」来源 —— 宁慢勿错。
+        #    `full_pages` 旧条目可能没有 "fm" 键（本次改动前建的索引）⇒ m.get 兜底。
+        write_page_fm(full_pages)
+        # 旧版把 page_fm 内嵌在 meta.json；现改侧车 ⇒ 显式**移除**内嵌键，
+        # 否则旧索引的 252 KB 会一直留在 AI 阅读路径上（拆分等于没做）。
+        meta.pop("page_fm", None)
+        K.write_json_atomic(K.META_PATH, meta, ensure_ascii=False, separators=(",", ":"))
 
     # ---- 更新 meta_lite.json（如已有或 --lite 同时指定）
     if meta_lite is not None:
@@ -286,8 +333,7 @@ def add_pages(page_rel_paths, also_lite=False):
                 "aliases": m.get("aliases", []),
             }
         lite = _build_meta_lite(meta_pages_for_lite, alias_map)
-        with open(K.META_LITE_PATH, "w", encoding="utf-8") as f:
-            json.dump(lite, f, ensure_ascii=False, separators=(",", ":"))
+        K.write_json_atomic(K.META_LITE_PATH, lite, ensure_ascii=False, separators=(",", ":"))
 
     print(f"[OK] 增量更新：{len(seen_names)} 个页面（重算 {fresh}）")
     print(f"     索引总页面: {len(doc_names)}")
@@ -398,7 +444,7 @@ def _empty_vault_fixture():
     import shutil
     import subprocess
     try:
-        with tempfile.TemporaryDirectory() as td:
+        with K.temp_dir() as td:
             shutil.copytree(os.path.dirname(os.path.abspath(__file__)),
                             os.path.join(td, "tools"))
             for d in ("wiki/concepts", "wiki/entities", "wiki/sources",
@@ -408,11 +454,16 @@ def _empty_vault_fixture():
                 [__import__("sys").executable,
                  os.path.join(td, "tools", "kb_build_index.py")],
                 capture_output=True, text=True, cwd=td)
+            # 🆕 2026-10-15：`meta_fm.json` 侧车也必须在四件套里 —— 它是检索层
+            #    取可靠性限定词的来源，缺了 L2 就会静默丢限定词（本库最忌的失效形态）。
+            _need = ("meta.json", "meta_full.json", "bm25.json", "meta_fm.json")
             wrote = all(os.path.exists(os.path.join(td, "wiki", ".index", f))
-                        for f in ("meta.json", "meta_full.json", "bm25.json"))
+                        for f in _need)
+            missing = [f for f in _need
+                       if not os.path.exists(os.path.join(td, "wiki", ".index", f))]
             good_build = bi.returncode == 0 and wrote
             print(f"  [{'ok' if good_build else 'FAIL'}] 空库构建：exit={bi.returncode}"
-                  f" 三文件={'齐' if wrote else '缺'}")
+                  f" 索引四件套={'齐' if wrote else '缺 ' + str(missing)}")
             sr = subprocess.run(
                 [__import__("sys").executable,
                  os.path.join(td, "tools", "kb_search.py"), "x"],
@@ -428,10 +479,14 @@ def _empty_vault_fixture():
 
 
 def main():
+    # `--help` 的 description/help 文本含 ✅ 等非 GBK 字符；CP936 控制台下
+    # print 会抛 UnicodeEncodeError ⇒ 退出码 1（2026-10-23 修复）。
+    K.console_encoding()
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true", help="全量重建，忽略增量缓存")
     ap.add_argument("--stats", action="store_true", help="只打印统计")
-    ap.add_argument("--lite", action="store_true", help="额外生成 meta_lite.json（<500KB 精简索引）")
+    ap.add_argument("--lite", action="store_true",
+                    help="额外生成 meta_lite.json（⚠️ 目前无工具读取它，见文件头说明）")
     ap.add_argument("--add", nargs="+", metavar="PAGE",
                     help="增量添加/更新指定页面（相对于 wiki/ 的路径）")
     ap.add_argument("--embed", action="store_true",
@@ -506,6 +561,7 @@ def main():
             "n_sources": len(sources),
             "path": p["path"],
             "hash": p["hash"],
+            "fm": K.index_fm_extras(fm),      # 🆕 预取限定词字段（诊断 P1-4）
         }
 
     # ---- 倒排索引（真正的 inverted index：term → [[doc_idx, tf], ...]）
@@ -537,6 +593,11 @@ def main():
 
     # ---- 精简版：AI 每次查询读入的那份
     lean_pages, src_rows = K.group_by_type(meta_pages)
+    # 🆕 预取的 frontmatter 限定词（诊断 P1-4）写入**独立侧车** meta_fm.json（2026-10-15）。
+    #    不放进 meta.json：那是 AI 每次查询整份读入的文件，252 KB 的限定词会让它 +26%。
+    #    侧车只在检索层真正要用时加载一次 —— 仍是 O(1) IO，而 meta.json 回到改造前体积。
+    #    另注：**不能加进 PAGE_COLS/SOURCE_COLS**，那两组是位置元组，加列会让按位解包静默错位。
+    write_page_fm(meta_pages)
     meta = {
         "_generated_by": "tools/kb_build_index.py",
         "_note": "AI 检索用元数据。查询时先整份读入，再对候选页做 BM25 精排。",
@@ -544,6 +605,8 @@ def main():
             "pages": f"{{页面名: {K.PAGE_COLS}}}（非来源页面）",
             "source_cols": K.SOURCE_COLS,
             "alias_map": "{别名小写: 规范页面名}",
+            "page_fm": f"**已移出本文件** -> {os.path.basename(K.META_FM_PATH)}"
+                       "（预取的 frontmatter 限定词，检索层按需加载）",
         },
         "count": len(pages),
         "alias_map": alias_map,
@@ -551,16 +614,14 @@ def main():
         "source_cols": K.SOURCE_COLS,
         "sources": src_rows,
     }
-    with open(K.META_PATH, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, separators=(",", ":"))
+    K.write_json_atomic(K.META_PATH, meta, ensure_ascii=False, separators=(",", ":"))
 
     # ---- 内部版：出链/路径/hash，供工具与补链分析用
     full = {
         "_note": "内部元数据，含出链与内容 hash。AI 查询无需读取。",
         "pages": {n: m for n, m in meta_pages.items()},
     }
-    with open(K.FULL_PATH, "w", encoding="utf-8") as f:
-        json.dump(full, f, ensure_ascii=False, separators=(",", ":"))
+    K.write_json_atomic(K.FULL_PATH, full, ensure_ascii=False, separators=(",", ":"))
 
     bm25 = {
         "_version": 2,
@@ -573,8 +634,7 @@ def main():
         "n_docs": len(doc_names),
         "postings": postings,
     }
-    with open(K.BM25_PATH, "w", encoding="utf-8") as f:
-        json.dump(bm25, f, ensure_ascii=False, separators=(",", ":"))
+    K.write_json_atomic(K.BM25_PATH, bm25, ensure_ascii=False, separators=(",", ":"))
 
     # 原来的 old 里可能包含已删除页面，这里以磁盘为准，天然清理
     removed = set(old_pages) - set(pages)
@@ -583,8 +643,7 @@ def main():
     # ---- meta_lite.json（--lite 时额外输出）
     if args.lite:
         lite = _build_meta_lite(meta_pages, alias_map)
-        with open(K.META_LITE_PATH, "w", encoding="utf-8") as f:
-            json.dump(lite, f, ensure_ascii=False, separators=(",", ":"))
+        K.write_json_atomic(K.META_LITE_PATH, lite, ensure_ascii=False, separators=(",", ":"))
         sz_l = os.path.getsize(K.META_LITE_PATH) / 1024
         print(f"     meta_lite.json   : {sz_l:.0f} KB  (--lite 精简索引)")
 

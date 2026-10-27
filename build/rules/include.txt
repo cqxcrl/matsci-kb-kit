@@ -1,9 +1,14 @@
 # 随 kit 发布的工具（相对 src/tools 的文件名，不含路径）
+# 白名单即依赖闭包：新增前用 src/tools 内的 sibling import 图核验，避免 kb.py 之类
+# 的统一入口 import 到未随包发布的兄弟模块（运行时才炸）。
 # 核心检索层
 kb_lib.py
 kb.py
 kb_search.py
 kb_semantic_search.py
+kb_rag.py
+kb_agentic.py
+kb_manifest.py
 kb_route.py
 kb_corpus.py
 kb_graph.py
@@ -34,7 +39,10 @@ lit_gapscan.py
 lit_doctor.py
 lit_journals.py
 lit_report.py
-# Sci-Assistant 决策层（v0 完成 2026-10-21）
+lit_enrich.py
+lit_si.py
+lit_browser_fetch.py
+# Sci-Assistant 决策层
 sci_landscape.py
 sci_gap_scan.py
 sci_topic_rec.py
@@ -47,5 +55,14 @@ sci_ecsa_qc.py
 sci_review.py
 sci_method_chain.py
 sci_reagent_import.py
+sci_links.py
+# QC 质检层（只读审计 + 幂等修复器；均带 --selftest，不绑源库历史语料）
+qc_proj_sources.py
+qc_proj_names.py
+qc_proj_assets.py
+qc_evidence_audit.py
+qc_evidence_note.py
+qc_si_backfill.py
+qc_sources_drift.py
 # 数据文件
 journals-multidisciplinary.yaml

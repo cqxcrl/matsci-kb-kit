@@ -8,16 +8,32 @@
           + 列头（如 `Potential/V, Current/A`、`Freq/Hz, Z'/ohm, Z"/ohm, ...`）+ 数值行
   digisim DIGISIM 文本：`number of E(V), I(A) couples: N` + 无数值表头的两列
   csv     通用 CSV（首行表头，含 BOM 处理）
+  neware  Neware 电池测试柜（BTS）导出：`.csv`（逗号/制表/分号）与 `.xlsx`（可多 sheet）
+          - 表头**常不在首行**（前面还有多行说明/统计行）⇒ 先定位表头行，再解析；
+          - 列名归一（Cycle/循环、Step/工步、Step Type/工步类型、Capacity/容量、
+            Voltage/电压、Current/电流、Time/时间、Energy/能量），支持中英双语两行表头；
+          - **按循环聚合**：充电容量、放电容量、库伦效率 CE、平均电压（有能量列时附充/放能量），
+            产出与 chi/digisim/csv **完全一致**的 dataset 结构 ⇒ `--stats` / `--export` 直接复用；
+          - xlsx 优先用 openpyxl，缺失时降级为 zip+XML 流式解析（不引入 pandas）；
+          - 旧版 `.xls`（BIFF）**明确不支持**，绝不会被当 csv 静默解析。
 
 用法：
   python tools/sci_data_analysis.py --file <path> --stats
-  python tools/sci_data_analysis.py --file <path> --export
+  python tools/sci_data_analysis.py --file <path> --export [--out-dir <目录>]
   python tools/sci_data_analysis.py --file <path> --plot [--eref-label Ag/AgCl --eref-offset 0.197 --area 0.196]
+  python tools/sci_data_analysis.py --file <neware.csv> --stats          # 循环容量 + CE，无需参比电极
+  python tools/sci_data_analysis.py --file <neware.xlsx> --export --out-dir _scratch/sci-opt/task-2
   python tools/sci_data_analysis.py --selftest
 
-🔴 不改原始文件：导出只写 `processed.csv` + `meta.json` 到 data_analysis/<日期>-<文件名>/。
+🔴 不改原始文件：导出只写 `processed.csv` + `meta.json` 到 data_analysis/<日期>-<文件名>/（可用 --out-dir 覆盖）。
 🔴 CV/LSV 出图前必须提供参比电极与电极面积（库约定：纵轴 mA cm⁻²、横轴 V vs RHE）；
    缺参数时**拒绝出图并说明缺什么**，绝不自行假设。
+   ⚠️ Neware 循环数据是**另一类**图（循环容量 & CE vs cycle），**不适用**这条 CV 硬门：
+      `check_plot_ready` 对 Neware 数据集直接放行，避免误触「必须给参比电极+面积」。
+⚠️ **诚实边界（务必读）**：库内**没有**真实 Neware 样例，本文件自检里的 Neware 文件
+   全部是**合成数据（synthetic）**。真机导出的列名/单位/分隔符可能不同，`--stats` 会打印
+   「识别到的列名」与「未识别列」——采信聚合结果前请逐条核对；合成夹具只能证明**逻辑**
+   （表头定位、列名归一、CE 数学、聚合口径）正确，不能证明兼容真机文件。
 """
 
 import argparse
@@ -29,6 +45,9 @@ import os
 import re
 import statistics
 import sys
+import unicodedata
+import zipfile
+import xml.etree.ElementTree as ET
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS_DIR)
@@ -37,7 +56,8 @@ import kb_lib as K  # noqa: E402
 K.console_encoding()
 
 CONFIG_REL = "projects/sci-assistant/config/sci_assistant_config.yaml"
-UNSUPPORTED_EXT = {".bin", ".opju", ".mdl", ".cex", ".png", ".pdf", ".xlsx", ".docx"}
+# .xls（BIFF）在下方单独报错；.xlsx 不再一律不支持——先按 Neware 导出去识别
+UNSUPPORTED_EXT = {".bin", ".opju", ".mdl", ".cex", ".png", ".pdf", ".xls", ".docx"}
 
 
 # ---------------------------------------------------------------- 解析
@@ -161,31 +181,669 @@ def parse_csv(text):
             "params": {}}
 
 
+# ---------------------------------------------------------------- Neware 电池测试柜
+#
+# ⚠️ 诚实边界：库内**没有**真实 Neware 样例，本节自检用的文件全部是**合成数据（synthetic）**。
+#    合成夹具只能证明逻辑正确（表头定位 / 列名归一 / CE 数学 / 聚合口径），
+#    **不能**证明兼容真机导出；真机列名请用 --stats 打印的「识别到的列名」核对。
+
+NEWARE_HEADER_SCAN_ROWS = 40        # Neware 表头常不在首行：最多向下找 40 行
+NEWARE_MAX_SHEETS = 4               # xlsx 最多探测前 4 个 sheet（数据表常在第二个）
+XML_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+# 列名归一：raw 表头 → 规范字段。**顺序有意义**（先具体后一般）：
+# 「充电容量」必须先于「容量」；「平均电压」先于「电压」；「工步类型」先于「工步」。
+NEWARE_FIELD_RULES = (
+    ("charge_capacity", ("充电容量", "charge capacity", "charging capacity",
+                         "chg capacity", "chg. cap", "chg cap")),
+    ("discharge_capacity", ("放电容量", "discharge capacity", "discharging capacity",
+                            "dchg capacity", "dchg. cap", "dchg cap")),
+    ("avg_voltage", ("平均电压", "avg voltage", "average voltage", "mean voltage")),
+    ("status", ("工步类型", "充放电状态", "充放电", "step type", "step_type",
+                "charge/discharge", "chg/dchg", "status", "state")),
+    ("cycle", ("循环号", "循环序号", "循环", "cycle")),
+    ("step", ("工步号", "工步序号", "工步", "step")),
+    ("capacity", ("容量", "capacity", "cap.")),
+    ("voltage", ("电压", "voltage")),
+    ("current", ("电流", "current")),
+    ("energy", ("能量", "energy")),
+    ("time", ("时间", "time")),
+)
+
+NEWARE_UNIT_ALIASES = {"mah": "mAh", "ah": "Ah", "wh": "Wh", "mwh": "mWh", "kwh": "kWh",
+                       "v": "V", "mv": "mV", "ma": "mA", "a": "A", "h": "h", "min": "min",
+                       "s": "s", "%": "%", "mah/g": "mAh/g", "mah/cm2": "mAh/cm2"}
+
+NEWARE_SPLIT_LABELS = {
+    "capacity_columns": "充电容量/放电容量分列（不再按工步拆分）",
+    "step_type": "工步类型（Step Type/工步类型）",
+    "current_sign": "电流符号（>0 充电 / <0 放电）",
+}
+
+
+def _decode_bytes(raw):
+    """字节 → 文本：BOM/UTF-8 → GBK 兜底（Neware 中文导出常见 GBK）。
+
+    尾部被截断的多字节字符按「截断点之前」解码，避免把 UTF-8 文件误判成 GBK。
+    """
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig")
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        if e.start >= len(raw) - 3:                    # 只是尾部截断
+            try:
+                return raw[:e.start].decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+        try:
+            return raw.decode("gbk")
+        except UnicodeDecodeError:
+            return raw.decode("utf-8", "replace")
+
+
+def _read_text_file(path, limit=None):
+    with open(path, "rb") as f:
+        raw = f.read() if limit is None else f.read(limit)
+    return _decode_bytes(raw).lstrip("\ufeff")
+
+
+def sniff_delimiter(text):
+    """按前若干行里 , / Tab / ; 的出现次数选分隔符（Neware 导出三种都见过）。"""
+    sample = "\n".join(text.splitlines()[:NEWARE_HEADER_SCAN_ROWS])
+    counts = {",": sample.count(","), "\t": sample.count("\t"), ";": sample.count(";")}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else ","
+
+
+def _text_rows(text, limit=None, delimiter=None):
+    """文本 → 二维行（每格 str 去空白）；limit 只取前 N 行（用于表头探测）。"""
+    text = text.lstrip("\ufeff")
+    if not text.strip():
+        return []
+    delim = delimiter or sniff_delimiter(text)
+    out = []
+    for row in csv.reader(io.StringIO(text), delimiter=delim):
+        out.append([str(c).strip() for c in row])
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def _norm_header(s):
+    s = unicodedata.normalize("NFKC", str(s if s is not None else "")).strip()
+    return re.sub(r"\s+", " ", s).lower()
+
+
+def neware_field(raw):
+    """raw 表头单元格 → 规范字段名；不识别返回 ''。"""
+    t = _norm_header(raw)
+    if not t:
+        return ""
+    for field, keys in NEWARE_FIELD_RULES:
+        if any(k in t for k in keys):
+            return field
+    return ""
+
+
+def neware_unit(raw):
+    """从表头取单位：优先括号内（容量(mAh)），其次 `/` 之后（容量/mAh）。"""
+    s = unicodedata.normalize("NFKC", str(raw if raw is not None else "")).strip()
+    m = re.search(r"[(（]\s*([^)）]{1,12})\s*[)）]", s)
+    unit = m.group(1).strip() if m else ""
+    if not unit:
+        m = re.search(r"/\s*([A-Za-z%]+(?:/[A-Za-z0-9]+)?)\s*$", s)
+        unit = m.group(1).strip() if m else ""
+    return NEWARE_UNIT_ALIASES.get(unit.lower(), unit)
+
+
+def neware_charge_flag(raw):
+    """工步类型/状态单元格 → True=充电 / False=放电 / None=无法判定（静置等）。
+
+    先判放电再判充电：'dchg' 里含 'chg'，'discharging' 里含 'charging'。
+    """
+    t = _norm_header(raw).replace(" ", "").replace("_", "").replace("-", "")
+    if not t:
+        return None
+    if "放电" in t or "dchg" in t or "discharge" in t or "discharging" in t:
+        return False
+    if "充电" in t or "chg" in t or "charge" in t or "charging" in t:
+        return True
+    return None
+
+
+def neware_current_flag(current):
+    """电流符号兜底：>0 充电 / <0 放电 / 0 或缺失 → None。"""
+    if current is None or abs(current) < 1e-15:
+        return None
+    return current > 0
+
+
+def locate_neware_header(rows, max_scan=NEWARE_HEADER_SCAN_ROWS):
+    """在前 max_scan 行内定位 Neware 表头（可能两行双语），返回 dict 或 None。
+
+    判据（宁漏不误）：一行里至少 2 个可识别字段，且满足其一——
+      · 有容量族字段（Capacity/容量/充电容量/放电容量）——容量是 Neware 的核心列；
+      · 同时有 Cycle/循环 与 Step/工步——只有循环-工步结构才这么写表头；
+      · 有 Cycle/循环 且总字段 ≥3。
+    ⇒「只有 Time/Voltage/Current」的普通电化学 CSV 不会被误判成 Neware。
+    """
+    for i, row in enumerate(rows[:max_scan]):
+        cells = [str(c).strip() if c is not None else "" for c in (row or [])]
+        if not any(cells):
+            continue
+        fields = {}
+        for j, cell in enumerate(cells):
+            f = neware_field(cell)
+            if f and f not in fields:
+                fields[f] = j
+        if len(fields) < 2:
+            continue
+        cap_family = {"capacity", "charge_capacity", "discharge_capacity"} & set(fields)
+        ok = bool(cap_family) or ("cycle" in fields and "step" in fields) or \
+            ("cycle" in fields and len(fields) >= 3)
+        if not ok:
+            continue
+        return _merge_neware_header(rows, i, cells)
+    return None
+
+
+def _merge_neware_header(rows, i, first):
+    """表头行 i；若下一行也像表头（双语两行）则合并：字段取先出现者，单位取先有的。"""
+    nxt_raw = rows[i + 1] if i + 1 < len(rows) else []
+    nxt = [str(c).strip() if c is not None else "" for c in (nxt_raw or [])]
+    nxt_fields = {neware_field(c) for c in nxt} - {""}
+    merge_next = len(nxt_fields) >= 2
+    header_rows = [i, i + 1] if merge_next else [i]
+    n = max(len(first), len(nxt) if merge_next else 0)
+    columns = []
+    for j in range(n):
+        a = first[j] if j < len(first) else ""
+        b = nxt[j] if (merge_next and j < len(nxt)) else ""
+        fa, fb = neware_field(a), neware_field(b)
+        columns.append({"index": j, "raw": a or b, "raw_alt": b if (b and b != a) else "",
+                        "field": fa or fb, "unit": neware_unit(a) or neware_unit(b)})
+    fields = {}
+    for c in columns:
+        if c["field"] and c["field"] not in fields:
+            fields[c["field"]] = c["index"]
+    return {"header_row": i, "header_rows": header_rows,
+            "columns": columns, "fields": fields}
+
+
+# ---------- xlsx 读取：openpyxl 优先，缺失时 zip+XML 降级
+
+def _cell_str(v):
+    """单元格值 → 字符串（整数值的浮点去掉 .0，便于 _num 与报告阅读）。"""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, float):
+        if v == int(v) and abs(v) < 1e16:
+            return str(int(v))
+        return repr(v)
+    return str(v)
+
+
+def _col_index(letters):
+    """A→0, B→1, ... AA→26。"""
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+def _xlsx_read_sheets_openpyxl(path, max_rows=None, max_sheets=NEWARE_MAX_SHEETS):
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    out = []
+    try:
+        for ws in wb.worksheets[:max_sheets]:
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                rows.append([_cell_str(v) for v in row])
+                if max_rows and len(rows) >= max_rows:
+                    break
+            out.append((ws.title, rows))
+    finally:
+        wb.close()
+    return out
+
+
+def _xlsx_read_sheets_zip(path, max_rows=None, max_sheets=NEWARE_MAX_SHEETS):
+    """zip+XML 流式解析（不依赖 openpyxl）：sharedStrings + 逐行 iterparse，读完即清。"""
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        ss = []
+        if "xl/sharedStrings.xml" in names:
+            with z.open("xl/sharedStrings.xml") as f:
+                for _, el in ET.iterparse(f):
+                    if el.tag == XML_NS + "si":
+                        ss.append("".join(t.text or "" for t in el.iter(XML_NS + "t")))
+                        el.clear()
+        sheet_names = sorted(
+            [n for n in names if re.match(r"xl/worksheets/sheet\d+\.xml$", n)],
+            key=lambda n: int(re.search(r"sheet(\d+)\.xml$", n).group(1)))
+        out = []
+        for nm in sheet_names[:max_sheets]:
+            rows = []
+            with z.open(nm) as f:
+                for _, el in ET.iterparse(f):
+                    if el.tag != XML_NS + "row":
+                        continue
+                    cells = {}
+                    for c in el:
+                        m = re.match(r"([A-Z]+)", c.get("r") or "")
+                        if not m:
+                            continue
+                        t = c.get("t")
+                        v = c.find(XML_NS + "v")
+                        if t == "inlineStr":
+                            node = c.find(XML_NS + "is")
+                            val = "".join(x.text or "" for x in node.iter(XML_NS + "t")) \
+                                if node is not None else ""
+                        elif v is None:
+                            val = ""
+                        elif t == "s":
+                            try:
+                                val = ss[int(v.text)]
+                            except (IndexError, TypeError, ValueError):
+                                val = ""
+                        else:
+                            val = v.text or ""
+                        if val != "":
+                            cells[_col_index(m.group(1))] = val
+                    if cells:
+                        width = max(cells) + 1
+                        rows.append([cells.get(j, "") for j in range(width)])
+                    el.clear()
+                    if max_rows and len(rows) >= max_rows:
+                        break
+            out.append((os.path.basename(nm)[:-4], rows))
+        return out
+
+
+def read_xlsx_sheets(path, use_openpyxl=True, max_rows=None,
+                     max_sheets=NEWARE_MAX_SHEETS):
+    """→ [(sheet 名, 行列表)]；use_openpyxl=False 强制走 zip+XML 降级（便于自检）。"""
+    if use_openpyxl:
+        try:
+            return _xlsx_read_sheets_openpyxl(path, max_rows, max_sheets)
+        except ImportError:
+            pass
+    return _xlsx_read_sheets_zip(path, max_rows, max_sheets)
+
+
+def read_neware_xlsx(path, peek=True, use_openpyxl=True):
+    """在 xlsx 的前几个 sheet 里找出含 Neware 表头的那个 → (rows, sheet) / (None, None)。
+
+    peek=True 只读前 NEWARE_HEADER_SCAN_ROWS 行（探测用，大文件不必全读）。
+    """
+    limit = NEWARE_HEADER_SCAN_ROWS if peek else None
+    for name, rows in read_xlsx_sheets(path, use_openpyxl=use_openpyxl,
+                                       max_rows=limit, max_sheets=NEWARE_MAX_SHEETS):
+        if locate_neware_header(rows) is not None:
+            return rows, name
+    return None, None
+
+
+# ---------- 按循环聚合
+
+def _neware_cycle_capacity(recs, split):
+    """单循环行 → 充电/放电容量与能量。
+
+    · capacity_columns：充/放容量分列 ⇒ 各取循环内最大值（累计列取末值，逐循环汇总表取该值）；
+    · step_type / current_sign：同一工步内取容量最大值（累计列），再按充/放把各工步求和。
+      —— 这一步很关键：Neware 的容量列是**步内累计**，逐行相加会把容量放大好几倍。
+    """
+    if split == "capacity_columns":
+        chg = [abs(v) for v in (_num(r.get("charge_capacity")) for r in recs) if v is not None]
+        dis = [abs(v) for v in (_num(r.get("discharge_capacity")) for r in recs) if v is not None]
+        return {"q_chg": max(chg) if chg else 0.0, "q_dis": max(dis) if dis else 0.0,
+                "e_chg": None, "e_dis": None, "n_unknown": 0, "n_neg": 0}
+    groups = {}
+    n_unknown = n_neg = 0
+    for r in recs:
+        flag = neware_charge_flag(r.get("status")) if split == "step_type" \
+            else neware_current_flag(_num(r.get("current")))
+        if flag is None:
+            n_unknown += 1
+            continue
+        step = _num(r.get("step"))
+        key = int(round(step)) if step is not None else ("type", flag)
+        g = groups.setdefault(key, {"flags": [], "cap": None, "energy": None})
+        g["flags"].append(flag)
+        cap = _num(r.get("capacity"))
+        if cap is not None:
+            if cap < 0:
+                n_neg += 1
+            cap = abs(cap)
+            g["cap"] = cap if g["cap"] is None else max(g["cap"], cap)
+        ent = _num(r.get("energy"))
+        if ent is not None:
+            ent = abs(ent)
+            g["energy"] = ent if g["energy"] is None else max(g["energy"], ent)
+    q_chg = q_dis = e_chg = e_dis = 0.0
+    has_energy = False
+    for g in groups.values():
+        flag = sum(1 for x in g["flags"] if x) * 2 >= len(g["flags"])
+        cap = g["cap"] or 0.0
+        if flag:
+            q_chg += cap
+        else:
+            q_dis += cap
+        if g["energy"] is not None:
+            has_energy = True
+            if flag:
+                e_chg += g["energy"]
+            else:
+                e_dis += g["energy"]
+    return {"q_chg": q_chg, "q_dis": q_dis,
+            "e_chg": e_chg if has_energy else None,
+            "e_dis": e_dis if has_energy else None,
+            "n_unknown": n_unknown, "n_neg": n_neg}
+
+
+def _neware_cycle_voltage(recs):
+    """单循环平均电压：**放电段**按容量加权（无放电段则全部行）。→ (值, 口径说明)。"""
+    if not recs:
+        return None, "无数据"
+    probe = recs[0]
+    field = "avg_voltage" if "avg_voltage" in probe else ("voltage" if "voltage" in probe else "")
+    if not field:
+        return None, "无电压列"
+    picked = []
+    for r in recs:
+        if "status" in r:
+            flag = neware_charge_flag(r.get("status"))
+        elif "current" in r:
+            flag = neware_current_flag(_num(r.get("current")))
+        else:
+            flag = None
+        if flag is False:
+            picked.append(r)
+    basis = "放电段容量加权" if field == "voltage" else "放电段容量加权（平均电压列）"
+    if not picked:
+        picked = recs
+        basis = "全部行容量加权" if field == "voltage" else "全部行容量加权（平均电压列）"
+    num = den = 0.0
+    for r in picked:
+        v = _num(r.get(field))
+        if v is None:
+            continue
+        w = None
+        for k in ("discharge_capacity", "capacity", "charge_capacity"):
+            if k in r:
+                w = _num(r.get(k))
+                if w is not None:
+                    break
+        w = abs(w) if w else 1.0
+        num += v * w
+        den += w
+    if den == 0:
+        return None, "电压列无可用数值"
+    return num / den, basis
+
+
+def _dedupe(seq):
+    seen, out = set(), []
+    for s in seq:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def parse_neware_rows(rows, fmt="neware-csv", sheet=None, synthetic=False, source=""):
+    """Neware BTS 导出（xlsx/csv 同构）→ 统一 dataset（**按循环聚合**）。
+
+    ⚠️ 诚实边界：本函数只用逻辑保证正确性；库内**没有**真实 Neware 样例，
+       自检夹具是**合成数据（synthetic）**。真机列名请以返回的 `neware.recognized` 核对。
+
+    缺关键列时**抛 SystemExit 并列出识别到的列名**，绝不返回空数据集：
+      · 缺 Cycle/循环 → 不猜单循环，直接报错（按循环聚合是硬前提）；
+      · 缺 Capacity/容量 → 报错；
+      · 缺工步类型且无电流列 → 报错（无法拆分充/放）。
+    """
+    hdr = locate_neware_header(rows)
+    if hdr is None:
+        raise SystemExit(
+            f"[!] 未在前 {NEWARE_HEADER_SCAN_ROWS} 行找到 Neware 表头。"
+            "需要含 Cycle/循环 与 Capacity/容量 等列；若是其他仪器导出，请勿用 Neware 解析")
+    fields = hdr["fields"]
+    raw_list = "、".join(c["raw"] for c in hdr["columns"] if c["raw"]) or "（空表头）"
+    cap_family = [f for f in ("capacity", "charge_capacity", "discharge_capacity")
+                  if f in fields]
+    if not cap_family:
+        raise SystemExit("[!] Neware 解析失败：未找到容量列（Capacity/容量）。"
+                         f"识别到的列名：{raw_list}")
+    if "cycle" not in fields:
+        raise SystemExit("[!] Neware 解析失败：未找到循环列（Cycle/循环号/循环序号）。"
+                         "本工具只做按循环聚合，缺循环列无法分组（不会把整表当单循环）；"
+                         f"请在导出里勾选循环号后重试。识别到的列名：{raw_list}")
+
+    has_pair = "charge_capacity" in fields and "discharge_capacity" in fields
+    if has_pair:
+        split = "capacity_columns"
+    elif "capacity" in fields and "status" in fields:
+        split = "step_type"
+    elif "capacity" in fields and "current" in fields:
+        split = "current_sign"
+    elif "capacity" in fields:
+        raise SystemExit("[!] Neware 解析失败：无法拆分充电/放电容量——缺工步类型"
+                         "（Step Type/工步类型）标识列，也没有电流列可做符号判定。"
+                         f"识别到的列名：{raw_list}")
+    else:
+        raise SystemExit("[!] Neware 解析失败：只找到充电或放电单侧容量列，缺少另一侧"
+                         f"或通用容量列，无法计算库伦效率。识别到的列名：{raw_list}")
+
+    warnings = []
+    cap_units = {}
+    for f in ("capacity", "charge_capacity", "discharge_capacity"):
+        if f in fields:
+            cap_units[f] = hdr["columns"][fields[f]]["unit"]
+    if not any(cap_units.values()):
+        warnings.append("容量列未标单位：按原始数值输出，无法核对 mAh/Ah，请人工确认")
+    if split == "current_sign":
+        warnings.append("无工步类型列，按电流符号划分充/放（>0 充电 / <0 放电）；"
+                        "若仪器符号约定相反，容量会互换——请核对")
+    if split == "capacity_columns":
+        warnings.append("采用充电容量/放电容量分列，按循环取最大值（不再按工步拆分）")
+    if "energy" not in fields:
+        warnings.append("未检测到能量列（Energy/能量），能量指标已省略")
+
+    body = rows[hdr["header_rows"][-1] + 1:]
+    by_cycle, n_skipped = {}, 0
+    for raw in body:
+        cells = [str(c).strip() if c is not None else "" for c in (raw or [])]
+        if not any(cells):
+            n_skipped += 1
+            continue
+        rec = {}
+        for f, j in fields.items():
+            rec[f] = cells[j] if j < len(cells) else ""
+        cyc = _num(rec.get("cycle"))
+        if cyc is None:
+            n_skipped += 1                      # 页脚/统计行/说明行
+            continue
+        by_cycle.setdefault(int(round(cyc)), []).append(rec)
+    if not by_cycle:
+        raise SystemExit("[!] Neware 解析失败：表头之后没有可用数据行"
+                         "（循环列非数值，或表头定位错行）。"
+                         f"识别到的列名：{raw_list}")
+
+    volt_unit = ""
+    for f in ("avg_voltage", "voltage"):
+        if f in fields:
+            volt_unit = hdr["columns"][fields[f]]["unit"] or volt_unit
+    energy_unit = hdr["columns"][fields["energy"]]["unit"] if "energy" in fields else ""
+    chg_unit = cap_units.get("charge_capacity") or cap_units.get("capacity") or ""
+    dis_unit = cap_units.get("discharge_capacity") or cap_units.get("capacity") or ""
+    if chg_unit and dis_unit and chg_unit != dis_unit:
+        warnings.append(f"充/放容量单位不同（{chg_unit} / {dis_unit}），CE 仍按同单位比值计算，"
+                        "请确认导出列")
+    with_energy = "energy" in fields
+    columns = ["Cycle", "Charge_Capacity", "Discharge_Capacity", "CE", "Mean_Voltage"]
+    units = ["", chg_unit, dis_unit, "%", volt_unit]
+    if with_energy:
+        columns += ["Charge_Energy", "Discharge_Energy"]
+        units += [energy_unit, energy_unit]
+
+    out_rows, n_unknown, n_neg = [], 0, 0
+    for cyc in sorted(by_cycle):
+        recs = by_cycle[cyc]
+        agg = _neware_cycle_capacity(recs, split)
+        n_unknown += agg["n_unknown"]
+        n_neg += agg["n_neg"]
+        q_chg, q_dis = agg["q_chg"], agg["q_dis"]
+        ce = 100.0 * q_dis / q_chg if q_chg > 0 else 0.0
+        if q_chg <= 0:
+            warnings.append(f"循环 {cyc} 充电容量 ≤0，CE 置 0（该点不可用）")
+        mv, _vbasis = _neware_cycle_voltage(recs)
+        row = [cyc, q_chg, q_dis, ce, mv if mv is not None else 0.0]
+        if with_energy:
+            if split == "capacity_columns":
+                row += [0.0, 0.0]
+            else:
+                row += [agg["e_chg"] or 0.0, agg["e_dis"] or 0.0]
+        out_rows.append(row)
+    if n_unknown:
+        warnings.append(f"{n_unknown} 行无法判定充/放（静置/Rest 等），已跳过、容量不计入")
+    if n_neg:
+        warnings.append(f"{n_neg} 行容量为负，已取绝对值参与聚合")
+    if with_energy and split == "capacity_columns":
+        warnings.append("分列表无充放电标识，充/放能量列留 0（未拆分）")
+
+    ce_list = [r[3] for r in out_rows if r[1] > 0]
+    ce_first = out_rows[0][3] if out_rows else None
+    ce_mean = statistics.fmean(ce_list) if ce_list else None
+    ce_rest = statistics.fmean([r[3] for r in out_rows[1:] if r[1] > 0]) \
+        if len(out_rows) > 1 else None
+
+    rep = {
+        "format": fmt,
+        "source": source,
+        "sheet": sheet or "",
+        "header_row": hdr["header_row"] + 1,                 # 1-based，便于人工对照
+        "header_rows": [i + 1 for i in hdr["header_rows"]],
+        "recognized": [{"column": c["index"] + 1, "raw": c["raw"], "field": c["field"],
+                        "unit": c["unit"]} for c in hdr["columns"] if c["field"]],
+        "ignored": [c["raw"] for c in hdr["columns"] if c["raw"] and not c["field"]],
+        "n_body_rows": len(body),
+        "n_rows_used": sum(len(v) for v in by_cycle.values()),
+        "n_rows_skipped": n_skipped,
+        "n_cycles": len(out_rows),
+        "cycles": [int(r[0]) for r in out_rows],
+        "split": split,
+        "split_label": NEWARE_SPLIT_LABELS[split],
+        "aggregation_label": ("循环内取最大值（累计列取末值）"
+                              if split == "capacity_columns"
+                              else "同一工步取容量最大值 → 按充/放把各工步容量求和"),
+        "voltage_basis": _neware_cycle_voltage(by_cycle[sorted(by_cycle)[0]])[1]
+        if by_cycle else "",
+        "ce_first": ce_first,
+        "ce_mean": ce_mean,
+        "ce_mean_ex_first": ce_rest,
+        "warnings": _dedupe(warnings),
+        "synthetic": bool(synthetic),
+    }
+    meta = {"date": "", "technique": "Battery cycling (Neware BTS)",
+            "instrument": "Neware BTS",
+            "sample": "synthetic（合成夹具，非真机数据）" if synthetic else ""}
+    return {"format": fmt, "columns": columns, "units": units, "rows": out_rows,
+            "meta": meta, "params": {}, "neware": rep}
+
+
+def neware_report_lines(d):
+    """--stats 时打印的 Neware 报告（重点：识别到的列名，供用户核对真机文件）。"""
+    nw = (d or {}).get("neware")
+    if not nw:
+        return []
+    tag = "合成夹具（synthetic，非真机数据）" if nw.get("synthetic") \
+        else "文件来源未标注（若为真机导出，请核对下列列名）"
+    lines = [f"[Neware] 数据性质：{tag}"]
+    loc = f"     表头行：第 {nw['header_row']} 行（1-based）"
+    if nw.get("header_rows") and len(nw["header_rows"]) > 1:
+        loc += f"，双语表头合并自第 {'+'.join(str(x) for x in nw['header_rows'])} 行"
+    if nw.get("sheet"):
+        loc += f" ｜ 工作表：{nw['sheet']}"
+    lines.append(loc)
+    rec = "、".join(f"{r['raw']}→{r['field']}" for r in nw.get("recognized") or [])
+    lines.append("     识别到的列名：" + (rec or "（无）"))
+    if nw.get("ignored"):
+        lines.append("     未识别列（未参与聚合）：" + "、".join(nw["ignored"]))
+    lines.append(f"     聚合：{nw['n_cycles']} 循环 ｜ 充放电划分：{nw['split_label']}")
+    lines.append(f"     循环内口径：{nw['aggregation_label']} ｜ 平均电压：{nw['voltage_basis']}")
+    lines.append(f"     行数：数据 {nw['n_body_rows']} 行，参与聚合 {nw['n_rows_used']} 行，"
+                 f"跳过 {nw['n_rows_skipped']} 行（说明/页脚/非数值循环）")
+    if nw.get("ce_mean") is not None:
+        lines.append(f"     库伦效率：首循环 {nw['ce_first']:.3f}% ｜ "
+                     f"全循环均值 {nw['ce_mean']:.3f}% ｜ "
+                     f"除首循环均值 "
+                     f"{('%.3f%%' % nw['ce_mean_ex_first']) if nw.get('ce_mean_ex_first') is not None else '—'}")
+    if nw.get("warnings"):
+        lines.append("     ⚠️ " + "；".join(nw["warnings"]))
+    return lines
+
+
 def detect_format(path):
     ext = os.path.splitext(path)[1].lower()
+    if ext == ".xls":
+        return "unsupported"
     if ext in UNSUPPORTED_EXT:
         return "unsupported"
-    with open(path, "rb") as f:
-        raw = f.read(4096)
-    text = raw.decode("utf-8", "replace")
+    if ext == ".xlsx":
+        try:
+            rows, _ = read_neware_xlsx(path, peek=True)
+        except Exception:
+            return "unsupported"
+        return "neware-xlsx" if rows is not None else "unsupported"
+    head = _read_text_file(path, limit=65536)
+    if looks_like_neware_text(head):
+        return "neware-csv"          # Neware 文本导出（.csv/.txt/.tsv/.dat 都可能）
     if ext == ".csv":
         return "csv"
-    if "Instrument Model:" in text or re.search(r",\s*[\w'\"()/]+\s*/", text):
+    if "Instrument Model:" in head or re.search(r",\s*[\w'\"()/]+\s*/", head):
         return "chi"
-    if re.search(r"couples", text):
+    if re.search(r"couples", head):
         return "digisim"
     return "unknown"
 
 
+def looks_like_neware_text(text):
+    """文本前若干行里能否定位 Neware 表头（表头可以不在首行）。"""
+    return locate_neware_header(_text_rows(text, limit=NEWARE_HEADER_SCAN_ROWS)) is not None
+
+
 def read_dataset(path):
     fmt = detect_format(path)
+    ext = os.path.splitext(path)[1].lower()
     if fmt == "unsupported":
-        raise SystemExit(f"[!] 不支持的格式：{path}（当前支持 chi / digisim / csv）")
-    if fmt == "csv":
-        text = open(path, "rb").read().decode("utf-8-sig", "replace")
-        d = parse_csv(text)
+        if ext == ".xls":
+            raise SystemExit("[!] 旧版 .xls（BIFF）不支持：Neware 请导出为 .xlsx 或 .csv，"
+                             "或用 Excel「另存为」成 .xlsx（本工具不会把 .xls 当 csv 解析）")
+        if ext == ".xlsx":
+            raise SystemExit(f"[!] 这个 .xlsx 未识别出 Neware 表头：{path}"
+                             "（当前 .xlsx 仅支持 Neware BTS 导出；通用表格请另存为 .csv）")
+        raise SystemExit(f"[!] 不支持的格式：{path}"
+                         "（当前支持 chi / digisim / csv / Neware csv / Neware xlsx）")
+    if fmt == "neware-csv":
+        d = parse_neware_rows(_text_rows(_read_text_file(path)), fmt="neware-csv",
+                              source=os.path.basename(path))
+    elif fmt == "neware-xlsx":
+        rows, sheet = read_neware_xlsx(path, peek=False)
+        if rows is None:
+            raise SystemExit(f"[!] {os.path.basename(path)}：xlsx 里未找到 Neware 表头"
+                             f"（已扫描前 {NEWARE_MAX_SHEETS} 个 sheet），文件可能已损坏")
+        d = parse_neware_rows(rows, fmt="neware-xlsx", sheet=sheet,
+                              source=os.path.basename(path))
+    elif fmt == "csv":
+        d = parse_csv(_read_text_file(path))
     else:
-        text = open(path, "rb").read().decode("utf-8", "replace")
+        text = _read_text_file(path)
         d = parse_chi(text) or parse_digisim(text)
     if not d:
         raise SystemExit(f"[!] 解析失败：{path}")
@@ -231,7 +889,23 @@ def analyze(d):
 
 # ---------------------------------------------------------------- 导出
 
-def analysis_dir(cfg, path):
+def _rel_display(p):
+    """展示用相对路径；跨盘符（输出在 C: 临时盘）时退回绝对路径，不因 relpath 崩溃。"""
+    try:
+        return os.path.relpath(p, K.VAULT)
+    except ValueError:
+        return p
+
+
+def is_neware(d):
+    """该数据集是否来自 Neware 解析（决定出图门禁/图型/报告分支）。"""
+    return bool(d) and str(d.get("format") or "").startswith("neware")
+
+
+def analysis_dir(cfg, path, override=None):
+    """导出/出图目录；override（--out-dir）优先，便于把产物放 _scratch/ 而不污染知识库。"""
+    if override:
+        return override if os.path.isabs(override) else os.path.join(K.VAULT, override)
     base = (cfg.get("sci") or {}).get("data_analysis_dir") or \
         "projects/sci-assistant/data_analysis"
     stem = os.path.splitext(os.path.basename(path))[0]
@@ -239,23 +913,34 @@ def analysis_dir(cfg, path):
 
 
 def export_processed(d, out_dir):
+    """写 processed.csv + meta.json（走 kb_lib 原子写 + **写后复算**）。
+
+    Neware 数据集额外把 neware 报告（表头行/识别列名/聚合口径）写进 meta.json，
+    便于事后核对「当时到底识别成了哪些列」。
+    """
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(d["path"]))[0]
     p_csv = os.path.join(out_dir, stem + "_processed.csv")
-    with open(p_csv, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([f"{c}/{u}" if u else c for c, u in zip(d["columns"], d["units"])])
-        for r in d["rows"]:
-            w.writerow([repr(v) for v in r])
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([f"{c}/{u}" if u else c for c, u in zip(d["columns"], d["units"])])
+    for r in d["rows"]:
+        w.writerow([repr(v) for v in r])
+    ok, detail = K.write_text_verified(p_csv, buf.getvalue())
+    if not ok:
+        raise SystemExit(f"[!] 导出写后复算失败：{p_csv}（{detail}）")
     p_meta = os.path.join(out_dir, stem + "_meta.json")
-    with open(p_meta, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"source": d["path"], "format": d["format"],
-                   "meta": d["meta"], "params": d["params"],
-                   "columns": d["columns"], "units": d["units"],
-                   "n_points": len(d["rows"]),
-                   "exported": datetime.datetime.now().isoformat(timespec="seconds")},
-                  f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    meta_obj = {"source": d["path"], "format": d["format"],
+                "meta": d["meta"], "params": d["params"],
+                "columns": d["columns"], "units": d["units"],
+                "n_points": len(d["rows"]),
+                "exported": datetime.datetime.now().isoformat(timespec="seconds")}
+    if d.get("neware"):
+        meta_obj["neware"] = d["neware"]
+    ok, detail = K.write_text_verified(
+        p_meta, json.dumps(meta_obj, ensure_ascii=False, indent=2) + "\n")
+    if not ok:
+        raise SystemExit(f"[!] 导出写后复算失败：{p_meta}（{detail}）")
     return p_csv, p_meta
 
 
@@ -320,6 +1005,7 @@ def prepare_xy(d, opts):
     """返回 (x, y, xlabel, ylabel)。
 
     - EIS：Z' vs -Z''
+    - Neware 循环数据：Cycle vs 充电容量（**绝不**做 RHE / 面积换算）
     - CV/LSV 且给了参比电极偏移与面积：**换算成 V vs RHE 与 mA cm⁻²**
     - 其他：原始两列
     """
@@ -328,6 +1014,11 @@ def prepare_xy(d, opts):
         return ([r[1] for r in rows], [-r[2] for r in rows], "Z' (Ω)", "-Z'' (Ω)")
     x = [r[0] for r in rows]
     y = [r[1] for r in rows]
+    if is_neware(d):
+        xl = f"{cols[0]} (循环)" if cols else "Cycle"
+        yl = f"{cols[1]} ({d['units'][1]})" if len(cols) > 1 and d["units"][1] else (
+            cols[1] if len(cols) > 1 else "Capacity")
+        return x, y, xl, yl
     tech = (d["meta"].get("technique") or "").lower()
     is_cv = any(k in tech for k in ("cyclic", "voltammetry", "lsv", "linear sweep"))
     if is_cv and opts.get("eref_offset") is not None and opts.get("area"):
@@ -339,10 +1030,55 @@ def prepare_xy(d, opts):
     return x, y, xl, yl
 
 
+def plot_cycle_summary(d, out_png):
+    """Neware 循环图：双轴 —— 左轴 充/放容量 vs cycle，右轴 库伦效率 vs cycle。
+
+    与 CV 无关：不读参比电极、不做 RHE/面积换算、不触发 CV 硬门。
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+    idx = {c: i for i, c in enumerate(d["columns"])}
+    rows = d["rows"]
+    cyc = [r[idx["Cycle"]] for r in rows]
+    cap_u = d["units"][idx["Charge_Capacity"]] if d["units"][idx["Charge_Capacity"]] else "mAh"
+    fig, ax = plt.subplots(figsize=(5.2, 3.4), dpi=300)
+    ax.plot(cyc, [r[idx["Charge_Capacity"]] for r in rows], "o-", ms=3, lw=1.2,
+            label="充电容量")
+    ax.plot(cyc, [r[idx["Discharge_Capacity"]] for r in rows], "s-", ms=3, lw=1.2,
+            label="放电容量")
+    ax.set_xlabel("Cycle")
+    ax.set_ylabel(f"Capacity ({cap_u})")
+    ax.grid(alpha=0.25, lw=0.5)
+    # 循环号是整数：自动刻度可能出现 1.2/1.4 这类无意义刻度
+    from matplotlib.ticker import MaxNLocator
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax2 = ax.twinx()
+    ax2.plot(cyc, [r[idx["CE"]] for r in rows], "^--", ms=3, lw=1.0,
+             color="tab:red", label="库伦效率")
+    ax2.set_ylabel("Coulombic efficiency (%)")
+    if rows:
+        ce_vals = [r[idx["CE"]] for r in rows]
+        lo, hi = min(ce_vals), max(ce_vals)
+        pad = max(0.5, (hi - lo) * 0.25)
+        ax2.set_ylim(lo - pad, hi + pad)
+    lines = ax.get_lines() + ax2.get_lines()
+    ax.legend(lines, [ln.get_label() for ln in lines], fontsize=7, loc="best")
+    ax.set_title(os.path.splitext(os.path.basename(d["path"]))[0], fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_png)
+    plt.close(fig)
+    return out_png
+
+
 class MatplotlibBackend(PlotBackend):
     name = "matplotlib"
 
     def plot(self, d, out_png, opts):
+        if is_neware(d):
+            return plot_cycle_summary(d, out_png)
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -362,8 +1098,33 @@ class MatplotlibBackend(PlotBackend):
         return out_png
 
 
-ORIGIN_SKILL_DIRS = (r"E:\.claude\skills\origin-plot",
-                     os.path.expanduser(r"~\.claude\skills\origin-plot"))
+def origin_questions(skill_dir, timeout=120):
+    """跑 `origin_plot.py --list-questions`，返回 [(问题, 选项/说明)]（失败返回空）。"""
+    import subprocess
+    argv = [sys.executable, os.path.join(skill_dir, "scripts", "origin_plot.py"),
+           "--list-questions"]
+    try:
+        proc = subprocess.run(argv, cwd=skill_dir, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout,
+                              env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    out = []
+    for line in (proc.stdout or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        mt = re.match(r"^[-*\d.\s]*(?:\[?[A-Za-z0-9_.-]+\]?\s*[:.)]?\s*)?(.{6,})$", s)
+        if mt:
+            out.append(mt.group(1).strip())
+    return out[:30]
+
+
+ORIGIN_SKILL_DIRS = (os.path.join(os.environ.get("CLAUDE_HOME")
+                                  or os.path.expanduser("~/.claude"),
+                                  "skills", "origin-plot"),)
 
 
 def find_origin_skill():
@@ -375,6 +1136,8 @@ def find_origin_skill():
 
 
 def origin_recipe(d):
+    if is_neware(d):
+        return "line"            # 循环容量/CE vs cycle：普通折线，不做电化学换算
     tech = (d["meta"].get("technique") or "").lower()
     if "impedance" in tech:
         return "eis"
@@ -390,9 +1153,18 @@ def build_origin_command(d, out_png, opts, skill_dir, csv_path):
     r = origin_recipe(d)
     argv = [sys.executable, os.path.join(skill_dir, "scripts", "origin_plot.py"),
             csv_path, "--recipe", r, "-o", out_png, "--no-ask"]
+    if opts.get("profile"):
+        argv += ["--profile", str(opts["profile"])]
+    if opts.get("stack"):
+        argv += ["--stack"]
+    if opts.get("n_series", 1) > 1:
+        labels = opts.get("series_labels") or []
+        if labels:
+            argv += ["--legend", ",".join(str(x) for x in labels)]
     if r in ("cv", "lsv"):
         stem = os.path.splitext(os.path.basename(csv_path))[0]
-        argv += ["--legend", stem]
+        if opts.get("n_series", 1) <= 1 and not opts.get("series_labels"):
+            argv += ["--legend", stem]
         if opts.get("eref_label"):
             argv += ["--ref-electrode", str(opts["eref_label"])]
         if opts.get("area"):
@@ -402,6 +1174,45 @@ def build_origin_command(d, out_png, opts, skill_dir, csv_path):
         elif opts.get("eref_offset") is not None:
             argv += ["--eshift", str(opts["eref_offset"])]
     return argv
+
+
+def write_origin_csv_multi(datasets, csv_path, x_tol=1e-9):
+    """多个数据集合成「X + Y1…Yn」宽表（origin-plot 约定：第 1 列 X，其余为 Y）。
+
+    X 轴取第一个数据集的 X；其余数据集按 X 就近插值/匹配（不假设等间隔）。
+    返回值列数，便于自检。缺失 X 的点不写（宁可短表，不造数据）。
+    """
+    base = datasets[0]
+    xs = [r[0] for r in base["rows"]]
+    cols = [[r[1] for r in base["rows"]]]
+    for ds in datasets[1:]:
+        pts = sorted((r[0], r[1]) for r in ds["rows"])
+        dxx = [p[0] for p in pts]
+        dyy = [p[1] for p in pts]
+        col = []
+        for x in xs:
+            # 二分找最近点；距离超过该数据集相邻格点间距的一半就置空
+            import bisect
+            i = bisect.bisect_left(dxx, x)
+            cand = [j for j in (i - 1, i) if 0 <= j < len(dxx)]
+            if not cand:
+                col.append("")
+                continue
+            j = min(cand, key=lambda k: abs(dxx[k] - x))
+            col.append(repr(dyy[j]))
+        cols.append(col)
+    units = [datasets[0]["units"][0]] + [
+        (ds["units"][1] if len(ds["units"]) > 1 else "") for ds in datasets]
+    cols_names = [datasets[0]["columns"][0]] + [
+        (ds["columns"][1] if len(ds["columns"]) > 1 else f"Y{i + 2}")
+        for i, ds in enumerate(datasets)]
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([f"{c} ({u})" if u else c for c, u in zip(cols_names, units)])
+        for i, x in enumerate(xs):
+            w.writerow([repr(x)] + [c[i] for c in cols])
+    return len(cols) + 1   # 含 X 轴列：单数据集 = 2 列，n 个数据集 = n+1 列
 
 
 def write_origin_csv(d, csv_path):
@@ -427,7 +1238,13 @@ class OriginPlotBackend(PlotBackend):
             raise RuntimeError("未找到 origin-plot 技能目录（设 ORIGIN_PLOT_DIR 或 --origin-dir）")
         tmp_dir = os.path.join(K.VAULT, "_scratch", "origin_tmp")
         stem = os.path.splitext(os.path.basename(d["path"]))[0]
-        csv_path = write_origin_csv(d, os.path.join(tmp_dir, stem + ".csv"))
+        extra = opts.get("extra_datasets") or []
+        if extra:
+            csv_path = os.path.join(tmp_dir, stem + "_multi.csv")
+            n = write_origin_csv_multi([d] + list(extra), csv_path)
+            opts = dict(opts, n_series=n)
+        else:
+            csv_path = write_origin_csv(d, os.path.join(tmp_dir, stem + ".csv"))
         argv = build_origin_command(d, out_png, opts, skill, csv_path)
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
         proc = subprocess.run(argv, cwd=skill, capture_output=True, text=True,
@@ -441,7 +1258,13 @@ class OriginPlotBackend(PlotBackend):
 # ---------------------------------------------------------------- 出图前检查（CV 约定）
 
 def check_plot_ready(d, opts):
-    """返回 (ok, [缺失项])。CV/LSV 必须给参比电极与面积（库约定）。"""
+    """返回 (ok, [缺失项])。CV/LSV 必须给参比电极与面积（库约定）。
+
+    🔴 Neware 循环数据是**另一类**图（循环容量 & CE vs cycle），只以循环号为横轴，
+       不需要参比电极/电解液 pH/电极面积 ⇒ 此处**直接放行**，不得误触 CV 硬门。
+    """
+    if is_neware(d):
+        return True, []
     tech = (d["meta"].get("technique") or "").lower()
     is_cv = any(k in tech for k in ("cyclic", "voltammetry", "lsv", "linear sweep"))
     if not is_cv:
@@ -509,6 +1332,147 @@ number of E(V), I(A) couples: 3
 """
 
 CSV_SAMPLE = "x,y\n1,2\n2,3\n3,4\n"
+
+# —— Neware 合成夹具（synthetic）：库内无真实 Neware 样例，只用于验证解析逻辑 ——
+#    真机文件的列名/单位/编码可能不同，绝不能把这里通过当「兼容真机」。
+NEWARE_CSV_SYN = """新威电池测试柜 BTS-4000 | 导出（synthetic 合成夹具，非真机数据）
+测试编号: SYN-LEAD-001
+测试日期: 2026-04-01 09:00:00
+循环号,工步号,工步类型,容量(mAh),电压(V),电流(mA),时间(h)
+1,1,恒流充电,0.50,3.20,0.50,0.10
+1,1,恒流充电,1.00,4.20,0.50,0.20
+1,2,恒流放电,0.40,3.90,-0.50,0.30
+1,2,恒流放电,0.90,3.00,-0.50,0.40
+2,1,恒流充电,0.60,3.25,0.50,0.50
+2,1,恒流充电,1.02,4.20,0.50,0.60
+2,2,恒流放电,0.50,3.85,-0.50,0.70
+2,2,恒流放电,1.00,3.00,-0.50,0.80
+"""
+
+NEWARE_CSV_CURRENT = """循环号,工步号,容量(mAh),电压(V),电流(mA)
+1,1,1.00,4.20,0.50
+1,2,0.90,3.00,-0.50
+2,1,1.02,4.20,0.50
+2,2,1.00,3.00,-0.50
+"""
+
+NEWARE_CSV_NO_CAP = """循环号,工步号,工步类型,电压(V),电流(mA),时间(h)
+1,1,恒流充电,3.20,0.50,0.10
+1,1,恒流充电,4.20,0.50,0.20
+"""
+
+NEWARE_CSV_NO_CYCLE = """工步号,工步类型,容量(mAh),电压(V)
+1,恒流充电,1.00,4.20
+2,恒流放电,0.90,3.00
+"""
+
+NEWARE_CSV_NO_FLAG = """循环号,容量(mAh),电压(V)
+1,1.00,4.20
+"""
+
+NEWARE_CSV_ENERGY = """循环号,工步号,工步类型,容量(mAh),电压(V),能量(mWh)
+1,1,恒流充电,1.00,4.20,4.20
+1,2,恒流放电,0.90,3.00,2.70
+"""
+
+NEWARE_CSV_GBK = """循环号,工步号,工步类型,容量(mAh),电压(V),电流(mA)
+1,1,恒流充电,1.00,4.20,0.50
+1,2,恒流放电,0.90,3.00,-0.50
+"""
+
+# 逐循环汇总表（每行一个循环，充/放容量分列 + 平均电压列）——Neware 也能导出这种形状
+NEWARE_CSV_PAIR = """循环号,充电容量(mAh),放电容量(mAh),平均电压(V)
+1,1.00,0.90,3.90
+2,1.02,1.00,3.88
+"""
+
+
+def _syn_neware_xlsx_openpyxl(path):
+    """合成 Neware xlsx（synthetic）：sheet1 是汇总表（无 Neware 表头），sheet2 才是数据。
+
+    表头刻意做成**双语两行**（中文列名 + 英文列名带单位），验证表头合并与单位提取。
+    """
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws0 = wb.active
+    ws0.title = "汇总"
+    ws0.append(["统计信息（synthetic 合成夹具）"])
+    ws0.append(["循环数", 2])
+    ws = wb.create_sheet("数据")
+    ws.append(["新威 BTS 导出（synthetic）"])
+    ws.append(["测试编号", "SYN-XLSX-002"])
+    ws.append(["循环号", "工步号", "工步类型", "容量", "电压", "电流", "时间", "序号"])
+    ws.append(["Cycle", "Step", "Step Type", "Capacity(mAh)", "Voltage(V)",
+               "Current(mA)", "Time(h)", "No."])
+    data = [(1, 1, "CC_Chg", 0.50, 3.20, 0.50, 0.10),
+            (1, 1, "CC_Chg", 1.00, 4.20, 0.50, 0.20),
+            (1, 2, "CC_DChg", 0.40, 3.90, -0.50, 0.30),
+            (1, 2, "CC_DChg", 0.90, 3.00, -0.50, 0.40),
+            (2, 1, "CC_Chg", 0.60, 3.25, 0.50, 0.50),
+            (2, 1, "CC_Chg", 1.02, 4.20, 0.50, 0.60),
+            (2, 2, "CC_DChg", 0.50, 3.85, -0.50, 0.70),
+            (2, 2, "CC_DChg", 1.00, 3.00, -0.50, 0.80)]
+    for i, rec in enumerate(data, start=1):
+        ws.append(list(rec) + [i])
+    wb.save(path)
+
+
+def _syn_neware_xlsx_zip(path):
+    """不依赖 openpyxl 的最小 xlsx（synthetic）——专门喂给 zip+XML 降级解析器。
+
+    与 `_syn_neware_xlsx_openpyxl` 的前导行/sheet 结构一致：sheet1 无 Neware 表头，
+    sheet2 才是数据；表头用中文单行（单位写在括号里），状态值用中文「恒流充电/放电」。
+    """
+    ss = []
+
+    def sid(s):
+        ss.append(s)
+        return len(ss) - 1
+
+    def c_num(ref, v):
+        return f'<c r="{ref}"><v>{v}</v></c>'
+
+    def c_str(ref, s, inline=False):
+        if inline:
+            return f'<c r="{ref}" t="inlineStr"><is><t>{s}</t></is></c>'
+        return f'<c r="{ref}" t="s"><v>{sid(s)}</v></c>'
+
+    def row(r, cells):
+        return f'<row r="{r}">' + "".join(cells) + "</row>"
+
+    s1 = [row(1, [c_str("A1", "统计信息（synthetic）", inline=True)]),
+          row(2, [c_str("A2", "循环数"), c_num("B2", 2)])]
+    hdr = ["循环号", "工步号", "工步类型", "容量(mAh)", "电压(V)", "电流(mA)", "时间(h)"]
+    s2 = [row(1, [c_str("A1", "新威 BTS 导出（synthetic）", inline=True)]),
+          row(2, [c_str(f"{chr(65 + i)}2", h) for i, h in enumerate(hdr)])]
+    data = [(1, 1, "恒流充电", 0.50, 3.20, 0.50, 0.10),
+            (1, 1, "恒流充电", 1.00, 4.20, 0.50, 0.20),
+            (1, 2, "恒流放电", 0.40, 3.90, -0.50, 0.30),
+            (1, 2, "恒流放电", 0.90, 3.00, -0.50, 0.40),
+            (2, 1, "恒流充电", 0.60, 3.25, 0.50, 0.50),
+            (2, 1, "恒流充电", 1.02, 4.20, 0.50, 0.60),
+            (2, 2, "恒流放电", 0.50, 3.85, -0.50, 0.70),
+            (2, 2, "恒流放电", 1.00, 3.00, -0.50, 0.80)]
+    for i, rec in enumerate(data, start=3):
+        cells = [c_str(f"C{i}", rec[2]) if j == 2 else c_num(f"{chr(65 + j)}{i}", v)
+                 for j, v in enumerate(rec)]
+        s2.append(row(i, cells))
+    ns = XML_NS.strip("{}")
+
+    def sheet_xml(rows):
+        return ('<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="%s">'
+                "<sheetData>%s</sheetData></worksheet>") % (ns, "".join(rows))
+
+    sst = ('<?xml version="1.0" encoding="UTF-8"?><sst xmlns="%s">%s</sst>'
+           % (ns, "".join(f"<si><t>{s}</t></si>" for s in ss)))
+    wb = ('<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="%s"><sheets>'
+          '<sheet name="汇总" sheetId="1"/><sheet name="数据" sheetId="2"/>'
+          "</sheets></workbook>") % ns
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/workbook.xml", wb)
+        z.writestr("xl/sharedStrings.xml", sst)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml(s1))
+        z.writestr("xl/worksheets/sheet2.xml", sheet_xml(s2))
 
 
 def _selftest():
@@ -591,6 +1555,34 @@ def _selftest():
                                     {"eref_label": "Hg/HgO", "eref_offset": 0.9268,
                                      "area": 1.0}, "S", "in.csv")
         chk("origin 后端：无 pH 时用 --eshift", "--eshift" in cmd3 and "0.9268" in cmd3)
+
+        # N5：风格档案 / 堆叠 / 多数据集图例
+        cmd4 = build_origin_command(d, "out.png", {"profile": "我的风格", "stack": True,
+                                                   "n_series": 3,
+                                                   "series_labels": ["a", "b", "c"]},
+                                    "S", "in.csv")
+        chk("origin 深度集成：透传 --profile / --stack / 多列图例",
+            "--profile" in cmd4 and "我的风格" in cmd4 and "--stack" in cmd4
+            and "a,b,c" in cmd4, " ".join(cmd4))
+        cmd5 = build_origin_command(d, "out.png", {"n_series": 2}, "S", "in.csv")
+        chk("origin 深度集成：多列且无标签时不再塞单列图例",
+            "--legend" not in cmd5, " ".join(cmd5))
+
+        # N5：多数据集合成宽表（X + Y1 + Y2）
+        d2 = parse_chi(CHI_SAMPLE)
+        d2 = dict(d2, rows=[[0.0, -9.0], [0.1, -8.0], [0.2, -7.0]],
+                  path="second.chi")
+        multi_p = os.path.join(tmp, "multi.csv")
+        ncol = write_origin_csv_multi([d, d2], multi_p)
+        head = open(multi_p, encoding="utf-8").read().splitlines()
+        chk("多数据集：3 列且首行是 X + 两列 Y", ncol == 3 and
+            head[0].count(",") == 2 and head[0].startswith("Potential"), head[0])
+        chk("多数据集：行数取基准集、Y2 按 X 对齐",
+            len(head) - 1 == len(d["rows"]) and "-8.0" in ",".join(head))
+        ncol1 = write_origin_csv_multi([d], os.path.join(tmp, "one.csv"))
+        chk("多数据集：单数据集退化为 2 列", ncol1 == 2)
+        chk("问题清单：技能目录不存在时返回空而不是抛错",
+            origin_questions(os.path.join(tmp, "no_such_skill")) == [])
     finally:
         K.remove_temp_dir(tmp)
 
@@ -605,6 +1597,255 @@ def _selftest():
     except SystemExit:
         chk("ECSA：扫速<3 被拒", True)
 
+    # ---------------- Neware 电池测试柜（全部夹具为 synthetic 合成数据） ----------------
+    print("[Neware] 夹具为**合成数据（synthetic）**：库内没有真实 Neware 样例；"
+          "真机文件请用 --stats 打印的「识别到的列名」逐项核对")
+    tmp_nw = K.make_temp_dir(prefix="sci_da_neware_")
+    try:
+        def wf(name, text, encoding="utf-8"):
+            fp = os.path.join(tmp_nw, name)
+            with open(fp, "w", encoding=encoding, newline="\n") as f:
+                f.write(text)
+            return fp
+
+        def rows_close(a, b, tol=1e-9):
+            if len(a) != len(b):
+                return False
+            for ra, rb in zip(a, b):
+                if len(ra) != len(rb):
+                    return False
+                for x, y in zip(ra, rb):
+                    if abs(float(x) - float(y)) > tol:
+                        return False
+            return True
+
+        # —— 识别 / 表头定位 / 列名归一 ——
+        p_csv = wf("neware_syn.csv", NEWARE_CSV_SYN)
+        chk("Neware 识别：CSV（前导 3 行说明 + 中文表头，synthetic）",
+            detect_format(p_csv) == "neware-csv")
+        hdr = locate_neware_header(_text_rows(_read_text_file(p_csv)))
+        chk("Neware 识别：表头不在首行也能定位（第 4 行，synthetic）",
+            hdr is not None and hdr["header_row"] == 3,
+            str(hdr and hdr["header_row"]))
+        chk("Neware 表头：7 列全归一 + 单位提取（容量(mAh)→mAh）",
+            hdr is not None
+            and set(hdr["fields"]) == {"cycle", "step", "status", "capacity",
+                                       "voltage", "current", "time"}
+            and hdr["columns"][hdr["fields"]["capacity"]]["unit"] == "mAh",
+            str(hdr and hdr["fields"]))
+        chk("Neware 识别：普通 CSV 不误判",
+            detect_format(wf("plain.csv", "x,y\n1,2\n2,3\n")) == "csv")
+        chk("Neware 识别：Time/Voltage/Current 普通 CSV 不误判",
+            detect_format(wf("chrono.csv", "time,voltage,current\n1,2,3\n")) == "csv")
+
+        # —— 解析 / 按循环聚合（CE 数学用已知容量反算） ——
+        d_nw = parse_neware_rows(_text_rows(_read_text_file(p_csv)), synthetic=True)
+        chk("Neware 解析：2 循环、5 列（Cycle/充/放/CE/平均电压）",
+            len(d_nw["rows"]) == 2
+            and d_nw["columns"] == ["Cycle", "Charge_Capacity", "Discharge_Capacity",
+                                    "CE", "Mean_Voltage"], str(d_nw["columns"]))
+        chk("Neware 聚合：循环号升序 [1,2]",
+            [int(r[0]) for r in d_nw["rows"]] == [1, 2])
+        chk("Neware 聚合：充电容量=同一工步取最大再求和（1.00 / 1.02）",
+            abs(d_nw["rows"][0][1] - 1.00) < 1e-9
+            and abs(d_nw["rows"][1][1] - 1.02) < 1e-9, str([r[1] for r in d_nw["rows"]]))
+        chk("Neware 聚合：放电容量（0.90 / 1.00）",
+            abs(d_nw["rows"][0][2] - 0.90) < 1e-9
+            and abs(d_nw["rows"][1][2] - 1.00) < 1e-9, str([r[2] for r in d_nw["rows"]]))
+        chk("Neware 聚合：CE 数学正确（90.000% / 98.039%，放电/充电）",
+            abs(d_nw["rows"][0][3] - 90.0) < 1e-9
+            and abs(d_nw["rows"][1][3] - 100.0 * 1.00 / 1.02) < 1e-9,
+            str([r[3] for r in d_nw["rows"]]))
+        chk("Neware 聚合：平均电压=放电段容量加权（3.276923 V）",
+            abs(d_nw["rows"][0][4] - (3.90 * 0.40 + 3.00 * 0.90) / 1.30) < 1e-9,
+            str(d_nw["rows"][0][4]))
+        chk("Neware 聚合：首循环 CE 与全循环均值可复算",
+            abs(d_nw["neware"]["ce_first"] - 90.0) < 1e-9
+            and abs(d_nw["neware"]["ce_mean"]
+                    - (90.0 + 100.0 * 1.00 / 1.02) / 2) < 1e-9)
+        chk("Neware 聚合：无能量列时省略能量列并给出警告",
+            "Discharge_Energy" not in d_nw["columns"]
+            and any("能量" in w for w in d_nw["neware"]["warnings"]))
+        d_en = parse_neware_rows(_text_rows(_read_text_file(
+            wf("neware_energy_syn.csv", NEWARE_CSV_ENERGY))))
+        chk("Neware 聚合：有能量列时输出充/放能量（4.20 / 2.70 mWh）",
+            d_en["columns"][-2:] == ["Charge_Energy", "Discharge_Energy"]
+            and abs(d_en["rows"][0][5] - 4.20) < 1e-9
+            and abs(d_en["rows"][0][6] - 2.70) < 1e-9, str(d_en["rows"][0]))
+
+        # —— 报告：识别到的列名（供真机核对） ——
+        rec = {r["raw"]: r["field"] for r in d_nw["neware"]["recognized"]}
+        chk("Neware 报告：识别到的列名逐列可核对",
+            rec.get("循环号") == "cycle" and rec.get("容量(mAh)") == "capacity"
+            and rec.get("工步类型") == "status" and len(rec) == 7, str(rec))
+        chk("Neware 报告：表头行/数据行数/合成标记如实记录",
+            d_nw["neware"]["header_row"] == 4 and d_nw["neware"]["n_body_rows"] == 8
+            and d_nw["neware"]["synthetic"] and "synthetic" in d_nw["meta"]["sample"])
+        rep_txt = "\n".join(neware_report_lines(d_nw))
+        chk("Neware 报告：文本含「识别到的列名」与 synthetic 标注",
+            "识别到的列名" in rep_txt and "synthetic" in rep_txt
+            and "2 循环" in rep_txt)
+
+        # —— xlsx：openpyxl 主路径 + zip+XML 降级路径 ——
+        p_xlsx = os.path.join(tmp_nw, "neware_syn.xlsx")
+        has_opx = True
+        try:
+            _syn_neware_xlsx_openpyxl(p_xlsx)
+        except ImportError:
+            has_opx = False
+            _syn_neware_xlsx_zip(p_xlsx)
+        chk("Neware 识别：xlsx（synthetic）", detect_format(p_xlsx) == "neware-xlsx")
+        d_x = read_dataset(p_xlsx)
+        chk("Neware xlsx：与同内容 csv 夹具逐行一致",
+            rows_close(d_x["rows"], d_nw["rows"]))
+        if has_opx:
+            chk("Neware xlsx：多 sheet 时选中含表头的数据表（跳过汇总表）",
+                d_x["neware"]["sheet"] == "数据", str(d_x["neware"]["sheet"]))
+            unit_map = {r["raw"]: r["unit"] for r in d_x["neware"]["recognized"]}
+            chk("Neware xlsx：双语两行表头合并、单位取自英文行（mAh）",
+                d_x["neware"]["header_rows"] == [3, 4]
+                and unit_map.get("容量") == "mAh", str(d_x["neware"]["header_rows"]))
+            chk("Neware xlsx：未识别列（序号）进 ignored 名单",
+                "序号" in d_x["neware"]["ignored"], str(d_x["neware"]["ignored"]))
+        p_zip = os.path.join(tmp_nw, "neware_zip_syn.xlsx")
+        _syn_neware_xlsx_zip(p_zip)
+        rows_fb, _sheet = read_neware_xlsx(p_zip, peek=False, use_openpyxl=False)
+        d_fb = parse_neware_rows(rows_fb, fmt="neware-xlsx")
+        chk("Neware xlsx 降级：zip+XML（无 openpyxl）解析出同一结果",
+            rows_close(d_fb["rows"], d_nw["rows"]))
+
+        # —— 反例 / 边界（必须明确报错，不得静默产出空数据） ——
+        p_nocap = wf("neware_nocap_syn.csv", NEWARE_CSV_NO_CAP)
+        chk("Neware 反例：缺 Capacity 列仍按 Neware 识别（不静默当普通 CSV）",
+            detect_format(p_nocap) == "neware-csv")
+        try:
+            read_dataset(p_nocap)
+            chk("Neware 反例：缺 Capacity 列 → 明确报错（不产出空数据）", False)
+        except SystemExit as e:
+            msg = str(e)
+            chk("Neware 反例：缺 Capacity 列 → 明确报错（不产出空数据）",
+                "容量" in msg and "Capacity" in msg and "循环号" in msg, msg)
+        try:
+            read_dataset(wf("neware_nocycle_syn.csv", NEWARE_CSV_NO_CYCLE))
+            chk("Neware 反例：缺 Cycle 列但有 Capacity → 明确报错", False)
+        except SystemExit as e:
+            chk("Neware 反例：缺 Cycle 列但有 Capacity → 明确报错",
+                "Cycle" in str(e) and "循环" in str(e), str(e))
+        try:
+            read_dataset(wf("neware_noflag_syn.csv", NEWARE_CSV_NO_FLAG))
+            chk("Neware 反例：缺充放电标识且无电流列 → 明确报错", False)
+        except SystemExit as e:
+            chk("Neware 反例：缺充放电标识且无电流列 → 明确报错",
+                "工步类型" in str(e) and "电流" in str(e), str(e))
+        d_cur = read_dataset(wf("neware_current_syn.csv", NEWARE_CSV_CURRENT))
+        chk("Neware 边界：无状态列时按电流符号划分并在报告标注",
+            d_cur["neware"]["split"] == "current_sign"
+            and abs(d_cur["rows"][0][1] - 1.00) < 1e-9
+            and any("电流符号" in w for w in d_cur["neware"]["warnings"]))
+        d_pair = parse_neware_rows(_text_rows(_read_text_file(
+            wf("neware_pair_syn.csv", NEWARE_CSV_PAIR))))
+        chk("Neware 边界：充/放容量分列的逐循环汇总表也能算 CE 与平均电压",
+            d_pair["neware"]["split"] == "capacity_columns"
+            and abs(d_pair["rows"][0][3] - 90.0) < 1e-9
+            and abs(d_pair["rows"][0][4] - 3.90) < 1e-9, str(d_pair["rows"][0]))
+        p_xls = wf("old.xls", "dummy")
+        chk("Neware 识别：旧版 .xls 明确不支持（不会当 csv）",
+            detect_format(p_xls) == "unsupported")
+        try:
+            read_dataset(p_xls)
+            chk("Neware 反例：.xls 给出明确不支持提示", False)
+        except SystemExit as e:
+            chk("Neware 反例：.xls 给出明确不支持提示", ".xls" in str(e), str(e))
+        if has_opx:
+            import openpyxl as _opx
+            p_plain_xlsx = os.path.join(tmp_nw, "plain.xlsx")
+            wb = _opx.Workbook()
+            wb.active.append(["a", "b"])
+            wb.active.append([1, 2])
+            wb.save(p_plain_xlsx)
+            chk("Neware 识别：非 Neware 的 .xlsx 明确不支持",
+                detect_format(p_plain_xlsx) == "unsupported")
+            try:
+                read_dataset(p_plain_xlsx)
+                chk("Neware 反例：非 Neware .xlsx 给出明确提示", False)
+            except SystemExit as e:
+                chk("Neware 反例：非 Neware .xlsx 给出明确提示",
+                    "Neware" in str(e), str(e))
+        p_gbk = os.path.join(tmp_nw, "neware_gbk_syn.csv")
+        try:
+            with open(p_gbk, "wb") as f:
+                f.write(NEWARE_CSV_GBK.encode("gbk"))
+            chk("Neware 识别：GBK 编码的 csv 仍可识别（真机中文导出常见）",
+                detect_format(p_gbk) == "neware-csv")
+            chk("Neware 解析：GBK 中文表头归一正确",
+                parse_neware_rows(_text_rows(_read_text_file(p_gbk)))
+                ["neware"]["n_cycles"] == 1)
+        except UnicodeEncodeError:
+            print("  skip  GBK 夹具无法用 GBK 编码，跳过该项（不影响其它断言）")
+
+        # —— 出图：绝不误触 CV 硬门 ——
+        chk("Neware 出图门禁：不需要参比电极与面积（不是 CV）",
+            check_plot_ready(d_nw, {"eref_label": "", "eref_offset": None, "area": None})
+            == (True, []))
+        chk("Neware 出图：technique 不含 CV 触发词（不会碰硬门）",
+            not any(k in d_nw["meta"]["technique"].lower()
+                    for k in ("cyclic", "voltammetry", "lsv", "linear sweep")))
+        xy = prepare_xy(d_nw, {"eref_offset": 0.9268, "area": 1.0})
+        chk("Neware 换算：给了参比电极/面积也不做 RHE 换算",
+            abs(xy[0][0] - 1) < 1e-9 and abs(xy[1][0] - 1.00) < 1e-9
+            and "RHE" not in xy[2])
+        d_nw["path"] = p_csv
+        png = os.path.join(tmp_nw, "cycle.png")
+        plot_cycle_summary(d_nw, png)
+        chk("Neware 出图：循环容量 + CE 双轴图生成（PNG 非空）",
+            os.path.isfile(png) and os.path.getsize(png) > 5000,
+            str(os.path.getsize(png) if os.path.isfile(png) else 0))
+        cmd_nw = build_origin_command(d_nw, "o.png",
+                                      {"eref_label": "Ag/AgCl", "area": 0.196}, "S", "in.csv")
+        chk("Neware origin 后端：走 line 配方且不塞参比/面积参数",
+            "--recipe" in cmd_nw and "line" in cmd_nw
+            and "--ref-electrode" not in cmd_nw and "--area" not in cmd_nw)
+
+        # —— 统计 / 导出 / CLI 复用（--stats --export 直接可用） ——
+        st_nw = analyze(d_nw)
+        chk("Neware 复用：analyze 正常（点数=循环数、首列 Cycle）",
+            st_nw["n_points"] == 2 and st_nw["columns"][0]["name"] == "Cycle")
+        out_nw = os.path.join(tmp_nw, "out")
+        pc, pm = export_processed(d_nw, out_nw)
+        meta_back = json.load(open(pm, encoding="utf-8"))
+        chk("Neware 导出：meta.json 含报告（表头行/识别列名/聚合口径）",
+            meta_back["neware"]["header_row"] == 4
+            and any(r["raw"] == "容量(mAh)" for r in meta_back["neware"]["recognized"])
+            and meta_back["neware"]["n_cycles"] == 2)
+        n_lines = len(open(pc, encoding="utf-8").read().splitlines()) - 1
+        chk("Neware 导出：processed.csv 写后行数 = 循环数", n_lines == 2, str(n_lines))
+
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["--file", p_csv, "--stats"])
+        cli_txt = buf.getvalue()
+        chk("Neware CLI：--stats 打印「识别到的列名」与循环数",
+            rc == 0 and "识别到的列名" in cli_txt and "2 循环" in cli_txt,
+            cli_txt[-160:])
+        out_cli = os.path.join(tmp_nw, "cli_out")
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            rc2 = main(["--file", p_csv, "--export", "--out-dir", out_cli])
+        files = os.listdir(out_cli) if os.path.isdir(out_cli) else []
+        chk("Neware CLI：--export --out-dir 落盘（processed.csv + meta.json）",
+            rc2 == 0 and any(f.endswith("_processed.csv") for f in files)
+            and any(f.endswith("_meta.json") for f in files), str(files))
+        out_plot = os.path.join(tmp_nw, "cli_plot")
+        buf3 = io.StringIO()
+        with contextlib.redirect_stdout(buf3):
+            rc3 = main(["--file", p_csv, "--plot", "--out-dir", out_plot])
+        pngs = os.listdir(out_plot) if os.path.isdir(out_plot) else []
+        chk("Neware CLI：--plot --out-dir 出循环图",
+            rc3 == 0 and any(f.endswith(".png") for f in pngs), str(pngs))
+    finally:
+        K.remove_temp_dir(tmp_nw)
+
     print(f"SELFTEST {'PASSED' if not fails else 'FAILED'}: {len(fails)} failure(s)")
     return 0 if not fails else 1
 
@@ -613,10 +1854,11 @@ def _selftest():
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="电化学数据读取/统计/导出/出图（Phase 3b v0）")
-    ap.add_argument("--file", help="数据文件路径（chi/digisim/csv）")
-    ap.add_argument("--stats", action="store_true", help="打印统计")
+    ap.add_argument("--file", help="数据文件路径（chi/digisim/csv/neware.csv/neware.xlsx）")
+    ap.add_argument("--stats", action="store_true", help="打印统计（Neware 另附识别列名报告）")
     ap.add_argument("--export", action="store_true", help="导出 processed.csv + meta.json")
-    ap.add_argument("--plot", action="store_true", help="出图（CV/LSV 需参比电极与面积）")
+    ap.add_argument("--plot", action="store_true",
+                    help="出图（CV/LSV 需参比电极与面积；Neware 画循环容量 & CE vs cycle）")
     ap.add_argument("--backend", default="matplotlib", choices=["matplotlib", "origin-plot"])
     ap.add_argument("--eref-label", default=None, help="参比电极名，如 Ag/AgCl")
     ap.add_argument("--eref-offset", type=float, default=None,
@@ -625,7 +1867,21 @@ def main(argv=None):
     ap.add_argument("--ph", type=float, default=None,
                     help="电解液 pH（origin-plot CV 族换算 RHE 用）")
     ap.add_argument("--origin-dir", default=None, help="origin-plot 技能目录（默认自动探测）")
+    ap.add_argument("--with", dest="with_files", action="append", default=None,
+                    metavar="FILE",
+                    help="origin-plot 多数据集一图：再叠加一个数据文件（可重复）")
+    ap.add_argument("--profile", default=None,
+                    help="origin-plot 风格档案名（缺省读配置 sci.plot.origin_profile）")
+    ap.add_argument("--stack", action="store_true",
+                    help="origin-plot 堆叠（谱图上下堆叠）")
+    ap.add_argument("--series-labels", default=None,
+                    help="多数据集的图例标签，逗号分隔（默认用各文件名）")
+    ap.add_argument("--show-questions", action="store_true",
+                    help="先回显 origin-plot --list-questions 的问题清单（透明化：哪些值是按库约定给的）")
     ap.add_argument("--json", action="store_true", help="统计以 JSON 打印")
+    ap.add_argument("--out-dir", default=None,
+                    help="覆盖导出/出图目录（默认 data_analysis/<日期>-<文件名>；"
+                         "把产物放 _scratch/ 时用）")
     ap.add_argument("--ecsa", action="store_true",
                     help="由多扫速 CV 计算 Cdl/ECSA（需 --files 与 --e0）")
     ap.add_argument("--files", default=None, help="ECSA 系列文件，分号分隔")
@@ -678,23 +1934,36 @@ def main(argv=None):
             with open(pj, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(res, f, ensure_ascii=False, indent=2)
                 f.write("\n")
-            print(f"[ok] 导出：{os.path.relpath(pj, K.VAULT)}")
+            print(f"[ok] 导出：{_rel_display(pj)}")
         return 0
 
     d = read_dataset(args.file)
+    plot_cfg = ((cfg.get("sci") or {}).get("plot") or {})
     opts = {"eref_label": args.eref_label, "eref_offset": args.eref_offset,
-            "area": args.area, "ph": args.ph, "origin_dir": args.origin_dir}
+            "area": args.area, "ph": args.ph, "origin_dir": args.origin_dir,
+            "profile": args.profile or plot_cfg.get("origin_profile"),
+            "stack": bool(args.stack)}
+    if args.with_files:
+        opts["extra_datasets"] = [read_dataset(f) for f in args.with_files]
+        opts["series_labels"] = ([s.strip() for s in args.series_labels.split(",")]
+                                 if args.series_labels
+                                 else [os.path.basename(args.file)] +
+                                 [os.path.basename(f) for f in args.with_files])
     st = analyze(d)
     if args.stats or not (args.export or args.plot):
         if args.json:
-            print(json.dumps({"format": d["format"], "meta": d["meta"],
-                              "params": d["params"], "stats": st},
-                             ensure_ascii=False, indent=2))
+            payload = {"format": d["format"], "meta": d["meta"],
+                       "params": d["params"], "stats": st}
+            if d.get("neware"):
+                payload["neware"] = d["neware"]
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
             print(f"[ok] {os.path.basename(d['path'])} ｜ 格式 {d['format']} ｜ "
                   f"{st['n_points']} 点")
             print(f"     仪器：{d['meta'].get('instrument') or '—'} ｜ "
                   f"技术：{d['meta'].get('technique') or '—'}")
+            for line in neware_report_lines(d):
+                print(line)
             for c in st["columns"]:
                 print(f"     {c['name']}（{c['unit'] or '—'}）："
                       f"{c['min']:.6g} … {c['max']:.6g}，均值 {c['mean']:.6g}")
@@ -702,23 +1971,36 @@ def main(argv=None):
                 print(f"     ⚠️ 质量标记：{'、'.join(st['flags'])}")
 
     if args.export:
-        out = analysis_dir(cfg, d["path"])
+        out = analysis_dir(cfg, d["path"], args.out_dir)
         p_csv, p_meta = export_processed(d, out)
-        print(f"[ok] 导出：{os.path.relpath(p_csv, K.VAULT)}")
-        print(f"     meta：{os.path.relpath(p_meta, K.VAULT)}")
+        print(f"[ok] 导出：{_rel_display(p_csv)}")
+        print(f"     meta：{_rel_display(p_meta)}")
 
     if args.plot:
         ok, missing = check_plot_ready(d, opts)
         if not ok:
             raise SystemExit("[!] CV/LSV 出图前必须先确认：" + "；".join(missing) +
                              "\n    （库约定：横轴 V vs RHE、纵轴 mA cm⁻²；不自行假设）")
+        if args.backend == "origin-plot":
+            skill = args.origin_dir or find_origin_skill()
+            if skill and args.show_questions:
+                qs = origin_questions(skill)
+                print(f"[info] origin-plot 会问的问题（本次 --no-ask 下按库约定/显式参数给值）：{len(qs)} 条")
+                for q in qs[:12]:
+                    print(f"       · {q}")
+            if opts.get("extra_datasets"):
+                units = {d["units"][0] for d in [d] + opts["extra_datasets"]
+                         if d["units"]}
+                if len(units) > 1:
+                    print(f"     ⚠️ 多数据集的 X 轴单位不一致：{sorted(units)}，"
+                          "请确认是否同一物理量")
         backend = MatplotlibBackend() if args.backend == "matplotlib" else OriginPlotBackend()
-        out = analysis_dir(cfg, d["path"])
+        out = analysis_dir(cfg, d["path"], args.out_dir)
         os.makedirs(out, exist_ok=True)
         png = os.path.join(out, os.path.splitext(os.path.basename(d["path"]))[0] +
                            ("_origin.png" if args.backend == "origin-plot" else ".png"))
         backend.plot(d, png, opts)
-        print(f"[ok] 出图：{os.path.relpath(png, K.VAULT)}")
+        print(f"[ok] 出图：{_rel_display(png)}")
     return 0
 
 

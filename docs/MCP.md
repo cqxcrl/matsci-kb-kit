@@ -45,6 +45,13 @@ python mcp/server.py --vault /path/to/vault --allow-write # 额外允许写工�
    `kb_serve` 是**可选加速器**，不是硬依赖——避免 daemon 生命周期带来的支持负担。
 2. **调度不进 MCP**。MCP 协议没有调度器。`lit_daily` 的每日发现应放在 OS 侧：
    - Linux/macOS（cron）：`47 7 * * * cd /path/to/vault && python tools/lit_daily.py`
-   - Windows：任务计划程序调用一个包装脚本（参考源库的 `lit_daily_task.ps1` 模式，
-     把库根作为参数传入）。
+   - Windows（任务计划程序）：写一个两行的包装脚本，把**库根**当参数传进去，例如
+     ```bat
+     @echo off
+     cd /d "%~1"
+     set OPENALEX_API_KEY=<你的key>
+     python tools\lit_daily.py
+     ```
+     计划任务调用它并传库根路径。把 key 放在包装脚本里（而非 `lit_config.yaml`）
+     是因为库通常被 git 跟踪，而包装脚本可以留在库外。
    详见 `docs/GETTING-STARTED.md` 与技能 `lit-watch`。

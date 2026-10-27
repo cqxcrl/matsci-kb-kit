@@ -41,14 +41,11 @@ import os
 import re
 import sys
 
-try:                                                           # noqa: SIM105
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                                              # noqa: BLE001
-    pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import kb_lib as K                                            # noqa: E402
+K.console_encoding()
 
 # ⚠️ 运行产物根**读配置**，不再硬编码 `_archive/lit-runs`（2026-10-10 迁移）。
 #    `_cfg()` 尚未定义时不能求值，故这里是函数而非模块常量。

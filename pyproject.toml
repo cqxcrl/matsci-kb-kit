@@ -1,7 +1,7 @@
 [project]
 name = "matsci-kb-kit"
-version = "0.1.0"
-description = "Toolbox + methodology for building an Obsidian knowledge base: retrieval, literature pipeline, QC, MCP server."
+version = "0.3.0"
+description = "Toolbox + methodology for building an Obsidian knowledge base: retrieval, literature pipeline, QC, MCP server, and Sci-Assistant decision layer."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -9,12 +9,29 @@ authors = [{ name = "梁公子" }]
 dependencies = ["pyyaml", "jieba", "numpy", "PyMuPDF"]
 
 [project.optional-dependencies]
+# 语义检索 + 精排。🔴 不装则 kb.py search 的默认 --mode hybrid 会退出码 3（不静默降级）。
 semantic = ["sentence-transformers", "scikit-learn"]
+# lit_browser_fetch：反爬站点兜底下载（装完还需 python -m playwright install chromium）
+browser = ["playwright", "curl_cffi"]
+# Sci-Assistant 出图与 .xlsx 读取（缺失时降级为跳过绘图 / zip+XML 解析）
+sci = ["matplotlib", "openpyxl"]
 mcp = ["mcp>=2.0.0"]
-all = ["sentence-transformers", "scikit-learn", "pyperclip", "mcp>=2.0.0"]
+all = [
+  "sentence-transformers",
+  "scikit-learn",
+  "playwright",
+  "curl_cffi",
+  "matplotlib",
+  "openpyxl",
+  "ruamel.yaml",
+  "pyperclip",
+  "mcp>=2.0.0",
+]
 
 [project.urls]
-Homepage = "https://github.com/"
+Homepage = "https://github.com/cqxcrl/matsci-kb-kit#readme"
+Repository = "https://github.com/cqxcrl/matsci-kb-kit.git"
+Issues = "https://github.com/cqxcrl/matsci-kb-kit/issues"
 
 [tool.setuptools]
 packages = []

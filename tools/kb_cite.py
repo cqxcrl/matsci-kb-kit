@@ -7,7 +7,7 @@ kb_cite.py — GB/T 7714 引用格式化
 从 wiki source 页的 frontmatter 生成 GB/T 7714-2015 标准引用字符串。
 
 用法：
-  python tools/kb_cite.py --page sources/2022-数据驱动锂金属电解液设计-PNAS.md
+  python tools/kb_cite.py --page sources/2022-示例卡片-示例期刊.md
   python tools/kb_cite.py --page 2020-自主移动机器人化学家-Nature   # 自动补路径
   python tools/kb_cite.py --authors "Sang Cheol Kim, Solomon T. Oyakhire, Yi Cui" \\
       --year 2022 --title "Data-driven electrolyte design" --journal PNAS
@@ -23,13 +23,10 @@ import re
 import sys
 import argparse
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kb_lib as K
+K.console_encoding()
 
 
 # ---------------------------------------------------------------- 作者名格式化
@@ -174,7 +171,7 @@ def _extract_title(fm, body, page_name):
                 return clean
 
     # 3. 从页面名推断
-    # 格式通常为 "2022-数据驱动锂金属电解液设计-PNAS"
+    # 格式通常为 "2022-示例卡片-示例期刊"
     parts = page_name.split("-", 2)
     if len(parts) >= 2:
         # 跳过年份部分
@@ -408,7 +405,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
-  python tools/kb_cite.py --page sources/2022-数据驱动锂金属电解液设计-PNAS.md
+  python tools/kb_cite.py --page sources/2022-示例卡片-示例期刊.md
   python tools/kb_cite.py --page 2020-自主移动机器人化学家-Nature
   python tools/kb_cite.py --authors "Kim S.C.; Oyakhire S.T.; Cui Y." \\
       --year 2022 --title "Data-driven electrolyte design" --journal PNAS

@@ -387,7 +387,7 @@ def selftest():
     # 落盘：临时输出目录
     import tempfile
     import shutil
-    tmp = tempfile.mkdtemp(prefix="lit-report-selftest-")
+    tmp = K.make_temp_dir(prefix="lit-report-selftest-")
     try:
         out = os.path.join(tmp, "r.md")
         with open(out, "w", encoding="utf-8", newline="\n") as f:

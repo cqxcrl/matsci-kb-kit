@@ -10,6 +10,7 @@ const path = require('path');
 const fs = require('fs');
 
 const TOOLS_DIR = path.join(__dirname, '..', 'tools');
+const SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
 
 function showHelp() {
   console.log(`
@@ -19,28 +20,48 @@ matsci-kb-kit - 材料科学知识库工具箱
 
 核心命令:
   kb_init <target>           初始化新知识库
-  kb_stats                   统计知识库状态
-  kb_search <query>          检索知识库
-  kb_lint [--quick]          健康检查
+  kb <subcommand>            统一入口（ask/search/route/corpus/stats/doctor/index/serve/lint/toolcheck/tools/selftest）
+  kb_search <query>          检索知识库（BM25 / 语义 / 混合）
+  kb_rag <query>             传统 RAG：BM25 + 向量 + RRF + 本地 CrossEncoder 强制精排
+  kb_agentic <query>         Agentic RAG：查询分类 → 规划 → 分层取证 → 图谱扩展
+  kb_lint [--quick|--deep]   健康检查
   kb_build_index             重建索引
-  kb_toolcheck               工具自检
+  kb_manifest                静态工具/CLI 清单
+  kb_toolcheck               工具自检（实跑每个工具的 --selftest）
 
 文献流水线:
-  lit_discover               发现新文献
-  lit_fetch                  下载文献
-  lit_extract                提取元数据
+  lit_discover               发现新文献（OpenAlex）
+  lit_fetch                  下载 OA 全文
+  lit_browser_fetch          浏览器兜底下载（自动取全文被 403/Cloudflare 挡住时）
+  lit_extract                PDF → md/图 提取
   lit_ingest                 入库建卡
-  lit_watch                  文献监控全链
+  lit_si                     补充材料（SI）存在性判定 / 自动获取
+  lit_enrich                 证据化二次加工（带逐行 quote 校验）
+  lit_finish                 收尾（index/log/索引）
+  lit_daily                  每日发现全链
+
+质检层:
+  qc_proj_sources            项目卡字段门禁
+  qc_proj_names              项目卡 ↔ PDF/Extract/SI 命名归属矩阵
+  qc_proj_assets             项目 Extract 图片链接审计
+  qc_evidence_base           证据强度判定口径
+  qc_evidence_audit          「正文引用但未登记 sources」分类
+  qc_si_backfill             补 si_status
+  qc_sources_drift           sources: 语义漂移修复
 
 Sci-Assistant 决策层:
-  sci_landscape              方向景观分析
-  sci_gap_scan               空白信号扫描
-  sci_topic_rec              切入点推荐
-  sci_method_extract         方法提取
-  sci_protocol_gen           方案生成
-  sci_lab_match              实验室匹配
-  sci_progress               课题管理
-  sci_data_analysis          数据分析
+  sci_landscape              C1 方向景观分析
+  sci_gap_scan               C1 空白信号扫描
+  sci_topic_rec              C1 切入点推荐
+  sci_method_extract         C2 方法提取
+  sci_protocol_gen           C2 方案生成
+  sci_lab_match              C2 实验室匹配
+  sci_method_chain           C2 方法链
+  sci_progress               C3 课题管理
+  sci_data_analysis          C3 数据分析
+  sci_ecsa_qc                C3 ECSA 五道门
+  sci_review                 C3 复盘建议
+  sci_links                  贯穿 C1→C2→C3 的链路溯源
 
 其他命令:
   help                       显示此帮助
@@ -49,8 +70,9 @@ Sci-Assistant 决策层:
 
 示例:
   matsci-kb kb_init ./my-vault
-  matsci-kb kb_search "电解液设计"
-  matsci-kb sci_landscape --direction "电解液设计"
+  matsci-kb kb_search "固态电解质 界面"
+  matsci-kb kb ask "这个方向的证据充分吗"
+  matsci-kb sci_landscape --direction "<你的研究方向>"
 
 文档: https://github.com/cqxcrl/matsci-kb-kit#readme
 `);
@@ -71,9 +93,12 @@ function listTools() {
 }
 
 function runPythonTool(toolName, args) {
-  const toolPath = path.join(TOOLS_DIR, `${toolName}.py`);
-  
-  if (!fs.existsSync(toolPath)) {
+  // tools/ 是主体；kb_init / verify_kit 这类安装期脚本在 scripts/。
+  const candidates = [path.join(TOOLS_DIR, `${toolName}.py`),
+                      path.join(SCRIPTS_DIR, `${toolName}.py`)];
+  const toolPath = candidates.find(p => fs.existsSync(p));
+
+  if (!toolPath) {
     console.error(`错误: 工具 ${toolName} 不存在`);
     console.error(`使用 'matsci-kb list' 查看所有可用工具`);
     process.exit(1);

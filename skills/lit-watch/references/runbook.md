@@ -66,8 +66,33 @@ python tools/lit_fetch.py --in <picks.json> [--outdir <raw/pdf>] [--manifest <�
 
 - 成功判据：`%PDF-` 魔数 + 非 `text/html`；失败原因逐条记录。
 - 失败清单：`<runs_dir>/downloads/手动下载清单.md`（可点 DOI/直链）。
-- 结果：`<runs_dir>/runs/fetch_result-<时间戳>.json`。
+- 结果：`<runs_dir>/runs/fetch_result-<时间戳>.json`（含 `si` / `si_missing` / `si_not_applicable`）。
 - 已存在同名 PDF 且体积 >20KB 时会跳过（避免覆盖人工整理过的原件），但会再做一次魔数校验。
+- 🔴 **SI 是这一步的子步骤**（2026-10-22 定规）：主文一落盘就调 `lit_si.scan` 判有无，
+  有则试取（Nature/Elsevier/Wiley 可自动），**取不到写进清单的「📎 SI 待手动下载」小节**；
+  全文无 SI 证据的判 `no_si`、不下载。**不按 tier**——过去只对 T0/T1 试，现已全档。
+  单独重跑：`python tools/lit_si.py fetch "<pdf>" --apply [--year YYYY]`。
+
+## B‴ · 浏览器兜底 `lit_browser_fetch.py`（条件分支）
+
+> 只有 B 的 `fetch_result` 里 `failed` 或 `si_missing` 非空时才跑；完整协议见
+> [`../../lit-browser-fetch/SKILL.md`](../../lit-browser-fetch/SKILL.md)。
+
+```bash
+python tools/lit_browser_fetch.py --latest                 # 干跑
+python tools/lit_browser_fetch.py --latest --apply --import
+python tools/lit_browser_fetch.py --latest --apply --import --interactive
+```
+
+- 真实 Edge + 持久化专用 profile + 类人鼠标；默认 20 篇/轮、4–9 秒间隔，
+  同域连续 2 次挑战失败写 `state.json` 并 6 小时跳过。
+- 正文 → `raw/pdf/Manual Download/`；SI → `raw/pdf/si/<stem>.si.<ext>`；
+  报告/JSON/残余清单 → `<runs_dir>/downloads/browser-fetch-<ts>*`。
+- 退出码：0=全成且 SI 不缺／3=部分／4=正文全失败／2=环境或参数。
+- `--import` 自动调 `lit_manual_import.py --apply`；**测试改 `--outdir` 时不要加**。
+- 无人值守不猜图片验证码；IOP/Radware/hCaptcha 用 `--interactive` 人工过一次。
+- profile：`_scratch/lit-browser-fetch/profile/`；首次 `--login`，
+  被标记时 `--reset-profile --apply`，已有干净 profile 可 `--seed-from`。
 
 ## B′ · 收编 `lit_manual_import.py`
 
@@ -80,6 +105,10 @@ python tools/lit_manual_import.py [--inbox D ...] [--fresh-since YYYY-MM-DD] \
 - 行为：命中→按 `lit_fetch.pdf_filename()` 改名移入 `raw/pdf/`；未命中→`raw/pdf/_unmatched/`；
   非 PDF→拒绝；已在库→默认跳过。台账 `<runs_dir>/state/manual_import_log.json`。
 - 报告：`<runs_dir>/downloads/手动导入报告.md`。
+- **SI 分流（2026-10-12）**：`looks_like_si()` 判为补充材料的文件**先于主文流程分流**，
+  落 `raw/pdf/si/<主文 stem>.si.pdf`（不再与主文撞名）。判据＝文件名 SI 词段（独立词段，
+  不误伤 `Silylation`）**或**（≤30 页 且 首页含 `Supporting Information` 抬头）；两者并用。
+  报告单列 `📎`，台账记 `si: true`。`[--si-dir]` 不适用于本工具（落点固定 `raw/pdf/si/`）。
 
 ## C · 提取 `lit_batch.py` / `lit_extract.py`
 
@@ -91,6 +120,8 @@ python tools/lit_extract.py "<pdf>" [--out raw/text] [--assets raw/assets] [--dp
 ```
 
 - 台账 `<runs_dir>/state/extract_ledger.json`：`{pdf 相对路径: {ok, how, doi, text, reason, at}}`。
+- `walk_pdfs()` **排除 `.si.pdf`**：补充材料不算待提取主文，不进「待提取 PDF」计数、不建卡
+  （SI 由 `lit_ingest.find_si_file` 按 `<stem>.si.pdf` 回找、只映射进 `si_status`）。
 - 对账判据（按可靠性）：① 台账已有成功记录且产物在 ② 同名 md ③ **DOI 对齐**（PDF 首页 vs md 正文）
   ④ 标题词重叠 ≥0.6。都不中才是真待办。
 - `--ingest` 只看"已提取但没有任何卡片 `sources:` 引用它"的全文 —— 与"卡片是否精读"无关。
@@ -108,6 +139,17 @@ python tools/lit_ingest.py [--candidates X.json | --files raw/text/a.md ... | --
 - 页面名 = `{年}-{标题前42字}-{刊名缩写}`；同名且 DOI 不同会加 `-2` 后缀并告警。
 - 只建骨架；作者取不到留白 + `⚠️ 信息缺口`；`source_url` 仅在 DOI 完整时才生成。
 
+## D2 · 二次加工 `lit_enrich.py`
+
+```bash
+python tools/kb.py lit enrich request --page sources/X.md --json
+python tools/kb.py lit enrich apply --proposal proposal.json --json          # 干跑
+python tools/kb.py lit enrich apply --proposal proposal.json --apply --json # 写页
+```
+
+模型无关 JSON 接口；每条 claim 的 quote 必须在指定 raw Markdown 行范围内逐字存在。
+默认干跑、写前备份、写后校验、幂等标记段；机器加工后仍须人工复核。
+
 ## E · 收尾 `lit_finish.py`
 
 ```bash
@@ -123,7 +165,7 @@ python tools/lit_finish.py [--pages f1 f2 | --since YYYY-MM-DD | --days N] [--li
 | `kb_corpus.py --build` | `--with-corpus` | ~66s | raw 全文分块检索面 |
 | `kb_semantic_search.py --add` | `--with-semantic` | 增量 | 语义检索面（全量重建约 110s） |
 | `kb_lint.py --quick` | 本脚本 | <1s | 本批红旗 |
-| `kb.py --doctor` | 本脚本 | <1s | 索引新鲜度（注意它也会报嵌入缺失） |
+| `kb.py doctor` | 本脚本 | <1s | 页面集合、同名内容哈希与语料文件哈希新鲜度 |
 
 另外：新建/大改 concept、topic 页时，**在建索引之前**先跑
 `python tools/qc_evidence_base.py --apply`，否则 `evidence_base` 进不了索引。

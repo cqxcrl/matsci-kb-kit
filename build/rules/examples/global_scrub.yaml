@@ -1,0 +1,43 @@
+# 示例：全局专名替换表。复制成 private/global_scrub.yaml 后填你自己的专名。
+#
+# 作用：对**每一个**生成物（tools / CLAUDE.md / docs / skills）逐条字面替换。
+# 与 scrub.yaml 的分工：
+#   · scrub.yaml         —— 按文件的**结构性**改写（改代码语义、删整段、换实现），未命中会告警；
+#   · global_scrub.yaml  —— 纯**专名 → 占位符**，未命中不告警（不是每个文件都含每个专名）；
+#                            漏网的由 leak_denylist 兜底为构建失败。
+#
+# 🔴 顺序敏感：长的、具体的在前，短的兜底在后（否则短串先命中会留下残渣）。
+# 🔴 替换必须在**同一文件内一致**：selftest 的断言两端同时被换，测试仍然自洽。
+
+rules:
+  # ---------- 库名 / 工程目录名 ----------
+  - find: '我的旧库名'
+    replace: '某旧库名'
+  - find: 'My Review Project'
+    replace: '综述工程'
+  - find: 'projects/my-review-project'
+    replace: 'projects/综述工程'
+  - find: 'my-review-project'
+    replace: '综述工程'
+  - find: 'MYPROJ'
+    replace: '某工程'
+  - find: 'slug: 你工程卡里的真实 slug'
+    replace: 'slug: myproj'
+  - find: '我的诊断工程'
+    replace: '诊断工程'
+
+  # ---------- 源库真实文献卡 slug / 论文标题（不得外泄本地文献） ----------
+  - find: '某篇论文的真实中文标题'
+    replace: '示例论文标题'
+
+  # ---------- 源库真实研究方向 / 子方向 / 课题 slug ----------
+  - find: '我的研究方向'
+    replace: '研究方向A'
+  - find: '我的子方向'
+    replace: '子方向A'
+  - find: '我的课题'
+    replace: '课题A'
+
+  # ---------- 库名兜底（放最后：前面具体规则已把带路径的形态处理掉） ----------
+  - find: '我的知识库名'
+    replace: '本工具链'

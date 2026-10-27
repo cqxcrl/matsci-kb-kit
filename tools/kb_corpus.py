@@ -39,6 +39,7 @@ import re
 import sys
 import json
 import time
+import hashlib
 import argparse
 from collections import defaultdict
 
@@ -306,7 +307,6 @@ def split_chunks(text, path, line_offset=0):
             #    （段是按标题行切的，标题行是段的第一行）。补插会让块正文出现
             #    "### X" 与 "## X" 连续两行的伪标题，并让块正文不再是原文的连续切片
             #    （char 区间无法覆盖它）——回指原文时看到的文字与块内文字对不上。
-            prev["text"] += "\n\n" + c["text"]
             # 合并后行号/字符区间取**并集**：否则合并块的 line_end 会小于它实际覆盖的
             # 最后一行，回指原文时会少覆盖一段（内容在块里、行号却指不到）。
             # 头部的 line_start/char_start 同理必须取 min——首块被并入次块时（块序
@@ -317,6 +317,7 @@ def split_chunks(text, path, line_offset=0):
             if prev.get("char_start") is not None and c.get("char_start") is not None:
                 prev["char_start"] = min(prev["char_start"], c["char_start"])
                 prev["char_end"] = max(prev["char_end"], c["char_end"])
+                prev["text"] = text[prev["char_start"]:prev["char_end"]]
         else:
             merged.append(dict(c))
     # 🔴 合并会把**位置更早**的块并入次块（重叠回退让后一块的起点可能更靠前），
@@ -363,15 +364,14 @@ def raw_to_source_map():
             pages = json.load(f).get("pages", {})
     except Exception:                            # noqa: BLE001
         return m
-    # 需要 source 页 frontmatter 里的 evidence 字段，故回读页面
-    src_dir = os.path.join(K.WIKI, "sources")
-    if not os.path.isdir(src_dir):
-        return m
-    for f in os.listdir(src_dir):
-        if not f.endswith(".md"):
+    # wiki 与 projects 的 source 卡都可能是 raw 的证据限定词来源
+    for page, row in pages.items():
+        if row.get("type") != "source" or not row.get("path"):
             continue
-        page = f[:-3]
-        fm_raw, _ = K.split_frontmatter(K.read_text(os.path.join(src_dir, f)))
+        path = os.path.join(K.VAULT, *row["path"].split("/"))
+        if not os.path.isfile(path):
+            continue
+        fm_raw, _ = K.split_frontmatter(K.read_text(path))
         fm = K.parse_frontmatter(fm_raw)
         for s in (fm.get("sources") or []):
             mm = re.search(r"\[\[(raw/[^\]]+?)\]\]", str(s))
@@ -389,8 +389,9 @@ EVIDENCE_FIELDS = ("evidence_base", "source_reliability", "si_status")
 def source_evidence(page):
     if not page:
         return {}
-    p = os.path.join(K.WIKI, "sources", page + ".md")
-    if not os.path.exists(p):
+    rel = K.page_path_for_type(page, "source")
+    p = os.path.join(K.VAULT, *rel.split("/")) if rel else ""
+    if not p or not os.path.exists(p):
         return {}
     fm_raw, _ = K.split_frontmatter(K.read_text(p))
     fm = K.parse_frontmatter(fm_raw)
@@ -422,6 +423,7 @@ def build():
     r2s = raw_to_source_map()
     ev_cache = {}
     chunks = []
+    file_hashes = {}
     n_files = 0
     char_mismatch = 0        # char_* 偏移无法在全文上取回正文的块数（见下面自证）
     for rel in iter_corpus_files():
@@ -429,6 +431,7 @@ def build():
             continue
         n_files += 1
         text = K.read_text(os.path.join(K.VAULT, *rel.split("/")))
+        file_hashes[rel] = hashlib.sha256(text.encode("utf-8")).hexdigest()
         # 只对**正文**分块：frontmatter（title/source/author/created…）不是知识内容，
         # 混进块里既污染检索（实测会靠 YAML 字段命中），也挤占块长。
         _, body = K.split_frontmatter(text)
@@ -473,15 +476,17 @@ def build():
     postings, df = K.build_postings(tf_map, names)
     doc_len = {n: sum(tf_map[n].values()) for n in names}
 
-    with open(CHUNKS_PATH, "w", encoding="utf-8") as f:
+    with open(CHUNKS_PATH + ".tmp", "w", encoding="utf-8", newline="\n") as f:
         for c in chunks:
-            f.write(json.dumps(c, ensure_ascii=False) + "\n")
-    with open(BM25_PATH, "w", encoding="utf-8") as f:
-        json.dump({"_version": 1, "doc_names": names, "doc_len": doc_len,
-                   "df": df, "n_docs": len(names), "postings": postings},
-                  f, ensure_ascii=False, separators=(",", ":"))
+            f.write(K.json_dumps(c, ensure_ascii=False) + "\n")
+    os.replace(CHUNKS_PATH + ".tmp", CHUNKS_PATH)
+    K.write_json_atomic(BM25_PATH,
+                        {"_version": 1, "doc_names": names, "doc_len": doc_len,
+                         "df": df, "n_docs": len(names), "postings": postings},
+                        ensure_ascii=False, separators=(",", ":"))
     meta = {"built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "files": n_files, "chunks": len(chunks),
+            "file_hashes": file_hashes,
             "vocab": len(df), "dirs": CORPUS_DIRS,
             "target_chars": TARGET_CHARS,
             "avg_chunk_chars": round(sum(c["chars"] for c in chunks)
@@ -489,8 +494,7 @@ def build():
             "with_evidence": sum(1 for c in chunks if c.get("source_page")),
             "char_offset_mismatch": char_mismatch,
             "elapsed_s": round(time.time() - t0, 1)}
-    with open(META_PATH, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=1)
+    K.write_json_atomic(META_PATH, meta, ensure_ascii=False, indent=1)
     # 把 char 偏移的可回指性**报出来**，不藏在 meta 里等人翻：
     #   0 是期望值；非 0 说明 `read_text(p)[char_start:char_end]` 取不到该块正文
     #   （2026-10-10 修复前全库 6332/25472 不匹配，因为偏移是"正文坐标"而字段文档说"原文坐标"）。
@@ -508,11 +512,18 @@ def build():
 _CACHE = {}
 
 
+def _cache_signature():
+    return tuple((p, os.path.getmtime(p), os.path.getsize(p)) if os.path.exists(p)
+                 else (p, None, None) for p in (CHUNKS_PATH, BM25_PATH, META_PATH))
+
+
 def load_corpus():
-    if _CACHE:
+    signature = _cache_signature()
+    if _CACHE and _CACHE.get("signature") == signature:
         return _CACHE
     if not (os.path.exists(CHUNKS_PATH) and os.path.exists(BM25_PATH)):
         return None
+    _CACHE.clear()
     with open(BM25_PATH, encoding="utf-8") as f:
         _CACHE["bm"] = json.load(f)
     chunks = []
@@ -522,7 +533,30 @@ def load_corpus():
             if line:
                 chunks.append(json.loads(line))
     _CACHE["chunks"] = chunks
+    _CACHE["signature"] = signature
     return _CACHE
+
+
+def check_corpus_freshness():
+    """全量核对文件集合与同名内容；供 doctor/收尾门禁调用。"""
+    if not os.path.exists(META_PATH):
+        return {"ok": False, "reason": "corpus meta 不存在"}
+    with open(META_PATH, encoding="utf-8") as f:
+        meta = json.load(f)
+    expected = meta.get("file_hashes")
+    if not isinstance(expected, dict):
+        return {"ok": False, "reason": "旧语料索引无内容哈希，请重建"}
+    current = set(iter_corpus_files())
+    missing = sorted(current - set(expected))
+    stale = sorted(set(expected) - current)
+    changed = []
+    for rel in sorted(current & set(expected)):
+        text = K.read_text(os.path.join(K.VAULT, *rel.split("/")))
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if digest != expected[rel]:
+            changed.append(rel)
+    return {"ok": not (missing or stale or changed), "missing": missing,
+            "stale": stale, "changed": changed, "files": len(current)}
 
 
 def search(query, k=8, expand_alias=True):
@@ -624,7 +658,7 @@ def _selftest_line_mapping():
         except Exception:                        # noqa: BLE001
             base = None
 
-    tmp = tempfile.mkdtemp(prefix="kbcorpus_fix_")
+    tmp = K.make_temp_dir(prefix="kbcorpus_fix_")
     old_paths = {"CHUNKS_PATH": CHUNKS_PATH, "BM25_PATH": BM25_PATH,
                  "META_PATH": META_PATH, "CORPUS_DIR": CORPUS_DIR}
     try:
@@ -841,6 +875,12 @@ def selftest():
     empty = split_chunks("", "raw/text/z.md")
     print(f"  [{'ok' if not empty else 'FAIL'}] 空文本产出 0 块（反例）")
     ok = ok and not empty
+    merged_doc = "# 标题\n" + "长" * 300 + "\n## 短\n短。"
+    merged_chunks = split_chunks(merged_doc, "raw/text/merge.md")
+    merged_exact = (len(merged_chunks) == 1 and all(
+        c["text"] == merged_doc[c["char_start"]:c["char_end"]] for c in merged_chunks))
+    print(f"  [{'ok' if merged_exact else 'FAIL'}] 短块合并保留原始空白与字符区间")
+    ok = ok and merged_exact
     ok = ok and _selftest_line_mapping()
     # 5) 索引存在性
     if os.path.exists(META_PATH):
@@ -895,7 +935,7 @@ def main():
             if r.get("heading"):
                 print(f'    § {r["heading"]}')
             if r.get("source_page"):
-                bits = [f'来源页 [[sources/{r["source_page"]}]]']
+                bits = ['来源页 ' + K.cite_page(r['source_page'], 'source')]
                 if r.get("evidence_base"):
                     bits.append(f'evidence_base={r["evidence_base"]}')
                 if r.get("source_reliability"):
@@ -911,8 +951,5 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    K.console_encoding()
     sys.exit(main())

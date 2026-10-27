@@ -15,15 +15,13 @@ Obsidian Bases / 检索层因此读不到作者列表。
 """
 import sys, os, re, glob, json, argparse
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, "tools")
 from kb_lib import read_text, qc_work_dir  # noqa: E402
+from kb_lib import console_encoding
+console_encoding()
 
 import yaml
 

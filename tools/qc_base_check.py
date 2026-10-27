@@ -36,14 +36,13 @@ import sys
 import json
 import argparse
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                                  # noqa: BLE001
-    pass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 from kb_lib import read_text, split_frontmatter, qc_file  # noqa: E402
+from kb_lib import console_encoding
+from kb_lib import make_temp_dir
+console_encoding()
 
 try:
     from ruamel.yaml import YAML as _RuamelYAML
@@ -405,7 +404,7 @@ def selftest():
     import shutil
     print("=== qc_base_check --selftest ===")
     ok = True
-    tmp = tempfile.mkdtemp(prefix="qc_base_check_")
+    tmp = make_temp_dir(prefix="qc_base_check_")
     try:
         def w(rel, content):
             p = os.path.join(tmp, *rel.split("/"))

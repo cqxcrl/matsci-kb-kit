@@ -15,9 +15,24 @@
 🔴 本工具**不生成领域结论**：推荐的"理由"只转述 gaps.json 的 reason 与 landscape 的
 证据链接。它做的是排序与排版，不是判断——每条推荐都必须能点回 source 卡逐条核对。
 
+另有两个**只重排/只对比、不生成领域结论**的模式：
+
+  N1 `--refine <topic>`：按用户偏好重排切入点（**默认干跑**，`--apply` 才写
+     `entry_points_refined.json`）。偏好 = 感兴趣的排名 / 降权关键词 / 加分关键词。
+     🔴 **不改原加权公式**：基础分原样取自 compute_entries，只在其上叠加可复算的加减项；
+     avoid 只降权**不删除**（仍列出于可行性），理由逐条写进输出。
+
+  N2 `--compare "A" "B"`：方向对比矩阵（`compare.md` + `compare.json`）。
+     每个数字都能从两方向的 landscape.json / gaps.json 复算；缺失字段标 `—` 并注明原因；
+     报告显式声明**哪些指标可横比、哪些不可**（`feasibility_score` 口径不同，禁止横比）。
+
 用法：
-  python tools/sci_topic_rec.py --topic 电解液设计
-  python tools/sci_topic_rec.py --topic 电解液设计 --top 3 --json --no-write
+  python tools/sci_topic_rec.py --topic 研究方向A
+  python tools/sci_topic_rec.py --topic 研究方向A --top 3 --json --no-write
+  python tools/sci_topic_rec.py --refine 研究方向A --interested 1,3 --avoid "计算" --top 5
+  python tools/sci_topic_rec.py --refine 研究方向A --interested 1,3 --apply
+  python tools/sci_topic_rec.py --compare "研究方向A" "机器学习势"
+  python tools/sci_topic_rec.py --compare "研究方向A" "机器学习势" --out <目录或文件>
   python tools/sci_topic_rec.py --selftest
 """
 
@@ -373,8 +388,454 @@ def _selftest():
     empty = compute_entries({"sub_directions": []}, {"gaps": []}, cfg)
     chk("空输入：返回空列表不崩", empty == [])
 
+    # ---------------- N1 偏好重排 ----------------
+    pr = parse_prefs("1, 3, x", "计算，DFT;", "表征")
+    chk("N1 解析：名次只认整数、关键词按中英文分隔符切",
+        pr["interested"] == [1, 3] and pr["avoid"] == ["计算", "DFT"]
+        and pr["prefer"] == ["表征"], str(pr))
+    ents = [
+        {"rank": 1, "sub_direction": "SEI 界面", "title": "t1", "rationale": "r1",
+         "feasibility_score": 0.50, "feasibility": "high",
+         "evidence_refs": [{"name": "a"}]},
+        {"rank": 2, "sub_direction": "计算筛选", "title": "t2", "rationale": "r2",
+         "feasibility_score": 0.48, "feasibility": "medium",
+         "evidence_refs": [{"name": "b"}]},
+        {"rank": 3, "sub_direction": "表征方法学", "title": "t3", "rationale": "r3",
+         "feasibility_score": 0.40, "feasibility": "medium",
+         "evidence_refs": [{"name": "c"}]},
+    ]
+    cfg_p = {"topic_rec": {"feasibility_high": 0.5, "feasibility_medium": 0.3}}
+    ref, rules = apply_preferences(ents, {"interested": [3], "avoid": ["计算"],
+                                          "prefer": []}, cfg_p)
+    by = {e["sub_direction"]: e for e in ref}
+    chk("N1 加分：感兴趣项分数 = 原分 + 0.10",
+        abs(by["表征方法学"]["feasibility_score"] - 0.50) < 1e-9)
+    chk("N1 加分：感兴趣项名次上升",
+        by["表征方法学"]["rank_after"] < by["表征方法学"]["rank_before"])
+    chk("N1 降权：回避词命中只降权、**仍列出**",
+        by["计算筛选"]["feasibility_score"] < 0.48 and
+        by["计算筛选"]["delta"] < 0 and "计算筛选" in by)
+    chk("N1 透明：delta 与 reasons 可复算",
+        abs((by["计算筛选"]["score_before"] + by["计算筛选"]["delta"]) -
+            by["计算筛选"]["feasibility_score"]) < 1e-6 and
+        any("回避词" in r for r in by["计算筛选"]["adjust_reasons"]))
+    chk("N1 证据不动：evidence_refs 原样保留",
+        by["SEI 界面"]["evidence_refs"] == [{"name": "a"}])
+    chk("N1 名次连续：rank_after = 1..n",
+        [e["rank_after"] for e in ref] == list(range(1, len(ref) + 1)))
+    cap_fix = [{"rank": 1, "sub_direction": "计算 表征 合成", "title": "",
+                "rationale": "", "feasibility_score": 0.5, "evidence_refs": []}]
+    ref_cap, _ = apply_preferences(cap_fix, {"interested": [], "avoid":
+                                             ["计算", "表征", "合成"], "prefer": []},
+                                   cfg_p)
+    chk("N1 上限：多条回避词扣分封顶 −0.30",
+        abs(ref_cap[0]["delta"] + 0.30) < 1e-9, str(ref_cap[0]["delta"]))
+    ref_all, _ = apply_preferences(ents, {"interested": [], "avoid":
+                                          ["SEI", "计算", "表征"], "prefer": []}, cfg_p)
+    chk("N1 反例：回避词全命中不崩且条目不丢", len(ref_all) == 3)
+    md_ref = "\n".join(render_refine(ref, rules))
+    chk("N1 渲染：含规则说明、前后名次与变化箭头",
+        "规则（全透明" in md_ref and "原名次" in md_ref and
+        ("↑" in md_ref or "↓" in md_ref or "持平" in md_ref))
+
+    # ---------------- N2 方向对比 ----------------
+    tmpc = K.make_temp_dir(prefix="sci_topic_cmp_")
+    try:
+        def _mk(name, direction, cand, subs, gaps_list, years, tiers):
+            d = os.path.join(tmpc, name)
+            os.makedirs(d, exist_ok=True)
+            land = {"query_direction": direction, "topic_id": name,
+                    "kb_coverage": {"total_sources": cand, "requested_top_k": 200,
+                                    "tier_distribution": tiers,
+                                    "time_range": [2020, 2026]},
+                    "facets": {"year": years},
+                    "sub_directions": [{"name": f"s{i}", "source_count": 1,
+                                        "share": 0.1,
+                                        "trend": {"label": "rising"}}
+                                       for i in range(subs)],
+                    "config": {"max_subdirections": 10},
+                    "candidates": [{"name": f"c{i}"} for i in range(cand)]}
+            gaps = {"gaps": gaps_list}
+            with open(os.path.join(d, "landscape.json"), "w", encoding="utf-8") as f:
+                json.dump(land, f, ensure_ascii=False)
+            with open(os.path.join(d, "gaps.json"), "w", encoding="utf-8") as f:
+                json.dump(gaps, f, ensure_ascii=False)
+            return os.path.join(d, "landscape.json")
+
+        gp = [{"sub_direction": "s0", "score": 0.6, "opportunity": "high",
+               "evidence_refs": [{"name": "x"}, {"name": "y"}]},
+              {"sub_direction": "s1", "score": 0.2, "opportunity": "low",
+               "evidence_refs": [{"name": "z"}]}]
+        a = _mk("A", "方向A", 200, 10, gp, {"2026": 80, "2020": 20},
+                {"T0": 50, "T1": 150})
+        b = _mk("B", "方向B", 50, 4, [gp[0]], {"2026": 10, "2020": 40},
+                {"T0": 10, "T1": 40})
+        ma = topic_metrics(a)
+        chk("N2 指标：候选数/子方向/空白数/密度复算正确",
+            ma["candidates"] == 200 and ma["sub_directions"] == 10 and
+            ma["gaps_total"] == 2 and abs(ma["gap_density_per_100"] - 1.0) < 1e-9)
+        chk("N2 指标：近两年占比与 tier 占比正确",
+            abs(ma["recent2y_share_pct"] - 80.0) < 1e-9 and
+            abs(ma["tier_share_pct"]["T0"] - 25.0) < 1e-9)
+        chk("N2 指标：平均空白分与证据数正确",
+            abs(ma["avg_gap_score"] - 0.4) < 1e-9 and ma["evidence_refs"] == 3)
+        os.remove(os.path.join(tmpc, "B", "gaps.json"))
+        mb = topic_metrics(b)
+        chk("N2 反例：缺 gaps.json 时空白记 0、不崩",
+            mb["gaps_total"] == 0 and mb["avg_gap_score"] is None)
+        try:
+            build_compare([a], cfg)
+            chk("N2 反例：单方向被拒", False)
+        except SystemExit:
+            chk("N2 反例：单方向被拒", True)
+        _mk("B", "方向B", 50, 4, [gp[0]], {"2026": 10, "2020": 40},
+            {"T0": 10, "T1": 40})
+        comp = build_compare([a, b], cfg)
+        chk("N2 矩阵：两方向都有行、行数与指标定义一致",
+            len(comp["rows"]) == len(COMPARE_ROWS) and comp["topics"] == ["方向A", "方向B"])
+        row_cand = [r for r in comp["rows"] if r["key"] == "candidates"][0]
+        chk("N2 可横比判定：一方向触顶 ⇒ 候选数标不可横比",
+            row_cand["comparable"] is False and comp["candidates_capped"] is True)
+        row_den = [r for r in comp["rows"] if r["key"] == "gap_density_per_100"][0]
+        chk("N2 可横比判定：归一化指标可横比",
+            row_den["comparable"] is True and row_den["display"] == ["1", "2"])
+        row_sub = [r for r in comp["rows"] if r["key"] == "sub_directions"][0]
+        chk("N2 可横比判定：子方向数触顶 max_subdirections 时标不可横比",
+            comp["sub_directions_capped"] is True and row_sub["comparable"] is False,
+            str(row_sub))
+        md_c = "\n".join(render_compare(comp))
+        chk("N2 渲染：显式声明 feasibility 永不可横比 + 触顶告警",
+            "永不可横比" in md_c and "触顶" in md_c)
+        p_md, p_js = write_compare(comp, os.path.join(tmpc, "cmp"))
+        chk("N2 写盘：md + json 均生成且 json 可解析",
+            os.path.isfile(p_md) and os.path.isfile(p_js) and
+            json.load(open(p_js, encoding="utf-8"))["topics"] == ["方向A", "方向B"])
+    finally:
+        K.remove_temp_dir(tmpc)
+
     print(f"SELFTEST {'PASSED' if not fails else 'FAILED'}: {len(fails)} failure(s)")
     return 0 if not fails else 1
+
+
+# ---------------------------------------------------------------- N1/N2（2026-10-23）
+#
+# N1 `--refine`：偏好重排切入点。规则**全部写进输出**，不做黑箱加权：
+#   标为感兴趣 +0.10/条；命中回避词 −0.15/词（上限 −0.30，**只降权不删除**）；
+#   命中偏好词 +0.08/词（上限 +0.16）。证据字段（evidence_refs）与 wikilink 一律不动
+#   ——偏好只调排序，不改证据，也不改各分量的原始值。
+#
+# N2 `--compare`：方向对比矩阵。🔴 **不同方向的 feasibility_score 不可横比**：
+#   它的分母是各自的候选集与子方向，口径不同。报告里逐项标「可横比 / 不可横比」并写口径，
+#   这一条不写清楚，矩阵就会被读成"哪个方向更值得做"的结论。
+
+PREF_DEFAULTS = {"interest_bonus": 0.10, "avoid_penalty": 0.15,
+                 "prefer_bonus": 0.08, "penalty_cap": 0.30, "prefer_cap": 0.16}
+
+
+def _split_terms(s):
+    return [x.strip() for x in re.split(r"[,，;；\s]+", str(s or "")) if x.strip()]
+
+
+def parse_prefs(interested="", avoid="", prefer=""):
+    """CLI 参数 → 偏好 dict。`--interested` 只认整数名次，非数字忽略（不猜）。"""
+    ids = [int(t) for t in _split_terms(interested) if t.isdigit()]
+    return {"interested": sorted(set(ids)), "avoid": _split_terms(avoid),
+            "prefer": _split_terms(prefer)}
+
+
+def apply_preferences(entries, prefs, cfg=None):
+    """按偏好重排 → (新 entries, 规则摘要)。纯函数，可在 selftest 里用假数据反算。"""
+    p = dict(PREF_DEFAULTS)
+    p.update(((cfg or {}).get("topic_rec") or {}).get("prefs") or {})
+    tr = (cfg or {}).get("topic_rec") or {}
+    high = float(tr.get("feasibility_high", 0.5))
+    med = float(tr.get("feasibility_medium", 0.3))
+    interested = set(int(i) for i in (prefs.get("interested") or []))
+    avoid = [a for a in (prefs.get("avoid") or []) if a]
+    prefer = [p2 for p2 in (prefs.get("prefer") or []) if p2]
+    out = []
+    for e in entries:
+        text = " ".join(str(e.get(k) or "") for k in
+                        ("sub_direction", "title", "rationale"))
+        base = float(e.get("feasibility_score") or 0)
+        delta, reasons = 0.0, []
+        if int(e.get("rank") or 0) in interested:
+            delta += float(p["interest_bonus"])
+            reasons.append(f"标为感兴趣（原标题第 {e.get('rank')} 名）"
+                           f"+{float(p['interest_bonus']):g}")
+        av = [a for a in avoid if a in text]
+        if av:
+            pen = min(float(p["penalty_cap"]), float(p["avoid_penalty"]) * len(av))
+            delta -= pen
+            reasons.append(f"命中回避词「{'、'.join(av)}」-{pen:g}（**只降权，仍列出**）")
+        pf = [x for x in prefer if x in text]
+        if pf:
+            bonus = min(float(p["prefer_cap"]), float(p["prefer_bonus"]) * len(pf))
+            delta += bonus
+            reasons.append(f"命中偏好词「{'、'.join(pf)}」+{bonus:g}")
+        new = dict(e)
+        new["rank_before"] = e.get("rank")
+        new["score_before"] = round(base, 3)
+        new["delta"] = round(delta, 3)
+        new["feasibility_score"] = round(max(0.0, min(1.0, base + delta)), 3)
+        new["feasibility"] = feasibility_level(new["feasibility_score"], high, med)
+        new["adjust_reasons"] = reasons
+        out.append(new)
+    out.sort(key=lambda x: (-x["feasibility_score"], x["sub_direction"]))
+    for i, e in enumerate(out, 1):
+        e["rank"] = i
+        e["rank_after"] = i
+    return out, {"rules": p, "interested": sorted(interested),
+                 "avoid": avoid, "prefer": prefer}
+
+
+def render_refine(entries, rules):
+    """「调整前 → 调整后」对比表（markdown 行列表）。"""
+    L = ["# 切入点偏好重排", ""]
+    L.append("> 规则（全透明，可复算）："
+             f"感兴趣 +{float(rules['rules']['interest_bonus']):g}/条 ｜ "
+             f"回避词 −{float(rules['rules']['avoid_penalty']):g}/词"
+             f"（上限 −{float(rules['rules']['penalty_cap']):g}）｜ "
+             f"偏好词 +{float(rules['rules']['prefer_bonus']):g}/词"
+             f"（上限 +{float(rules['rules']['prefer_cap']):g}）。")
+    L.append("> 🔴 只调排序：`gap/literature/relevance` 三分量原值、`evidence_refs`、"
+             "wikilink 全部不变。回避词命中项**仍列出**（只降权），便于判断是否真的不做。")
+    L.append("")
+    L.append(f"> 感兴趣：{rules['interested'] or '—'} ｜ 回避：{rules['avoid'] or '—'}"
+             f" ｜ 偏好：{rules['prefer'] or '—'}")
+    L.append("")
+    L.append("| 新名次 | 原名次 | 变化 | 切入点 | 原分 | 调整 | 新分 | 等级 | 原因 |")
+    L.append("|---|---|---|---|---|---|---|---|---|")
+    for e in entries:
+        before = e.get("rank_before") or e.get("rank")
+        diff = (before or 0) - (e.get("rank_after") or e.get("rank") or 0)
+        arrow = "→ 持平" if diff == 0 else (f"↑{diff}" if diff > 0 else f"↓{-diff}")
+        L.append(f"| {e.get('rank_after')} | {before} | {arrow} | {e.get('sub_direction')} | "
+                 f"{e.get('score_before')} | {e.get('delta'):+g} | "
+                 f"{e.get('feasibility_score')} | {e.get('feasibility')} | "
+                 f"{'；'.join(e.get('adjust_reasons') or []) or '无偏好命中'} |")
+    L.append("")
+    moved = [e for e in entries if (e.get("rank_before") or 0) != e.get("rank_after")]
+    L.append(f"> 名次变化 {len(moved)} 项；其余项分数与名次未动。")
+    L.append("")
+    return L
+
+
+def _rel(p):
+    """相对库根的展示路径；跨盘符（selftest 临时目录）时退回绝对路径。"""
+    try:
+        return os.path.relpath(p, K.VAULT).replace("\\", "/")
+    except ValueError:
+        return str(p).replace("\\", "/")
+
+
+def topic_metrics(topic, cfg=None):
+    """一个方向的可比较指标（全部从 landscape.json / gaps.json 现算，不写死）。"""
+    d = topic_dir(topic)
+    lp = os.path.join(d, "landscape.json")
+    if not os.path.isfile(lp):
+        raise SystemExit(f"[!] 缺少 {lp}")
+    gp = os.path.join(d, "gaps.json")
+    land = load_json(lp)
+    gaps = load_json(gp) if os.path.isfile(gp) else {}
+    cov = land.get("kb_coverage") or {}
+    land_cfg = land.get("config") or {}
+    n = int(cov.get("total_sources") or len(land.get("candidates") or []) or 0)
+    subs = land.get("sub_directions") or []
+    # 截断上限必须能溯源：landscape.json 只回显了 candidate_top_k，
+    # max_subdirections 在 sci_assistant_config.yaml 里 ⇒ 允许从 cfg 传入。
+    top_k_cap = cov.get("requested_top_k") or land_cfg.get("candidate_top_k")
+    max_sub_cap = ((cfg or {}).get("landscape") or {}).get("max_subdirections") \
+        or land_cfg.get("max_subdirections")
+    gl = gaps.get("gaps") or []
+    scores = [float(g.get("score") or 0) for g in gl]
+    opp = {}
+    for g in gl:
+        k = str(g.get("opportunity") or "unknown")
+        opp[k] = opp.get(k, 0) + 1
+    years = ((land.get("facets") or {}).get("year") or {})
+    tot_y = sum(int(v or 0) for v in years.values()) or 0
+    recent = 0
+    for y, c in years.items():
+        try:
+            if int(y) >= 2025:
+                recent += int(c or 0)
+        except (TypeError, ValueError):
+            continue
+    tiers = cov.get("tier_distribution") or {}
+    trend = {}
+    for s in subs:
+        lab = (s.get("trend") or {}).get("label") or "unknown"
+        trend[lab] = trend.get(lab, 0) + 1
+    return {
+        "topic": land.get("query_direction") or topic,
+        "topic_id": land.get("topic_id") or topic,
+        "landscape": _rel(lp),
+        "candidates": n,
+        "top_k_cap": top_k_cap,
+        "sub_directions": len(subs),
+        "max_sub_cap": max_sub_cap,
+        "gaps_total": len(gl),
+        "gap_density_per_100": round(100.0 * len(gl) / n, 2) if n else None,
+        "avg_gap_score": round(sum(scores) / len(scores), 3) if scores else None,
+        "opportunity_counts": opp,
+        "high_per_100": (round(100.0 * opp.get("high", 0) / n, 2) if n else None),
+        "tier_share_pct": ({k: (round(100.0 * int(v or 0) / n, 1) if n else None)
+                            for k, v in tiers.items()}),
+        "recent2y_share_pct": round(100.0 * recent / tot_y, 1) if tot_y else None,
+        "trend_counts": trend,
+        "evidence_refs": sum(len(g.get("evidence_refs") or []) for g in gl),
+        "time_range": cov.get("time_range"),
+    }
+
+
+COMPARE_ROWS = (
+    # (显示名, key, 是否计数型可横比, 口径/不可横比原因)
+    ("候选文献数", "candidates", False,
+     "受 `landscape.candidate_top_k` 截断；两个方向都触顶时恒等，**不能当文献量横比**"),
+    ("子方向数", "sub_directions", False,
+     "受 `max_subdirections` 截断；触顶时恒等"),
+    ("空白总数", "gaps_total", False, "随候选集大小变化；触顶时可比性弱"),
+    ("空白密度（每 100 张候选）", "gap_density_per_100", True, "已按候选数归一"),
+    ("平均空白分", "avg_gap_score", True, "同一评分公式"),
+    ("高机会数（每 100 张）", "high_per_100", True, "已按候选数归一"),
+    ("近两年文献占比 %", "recent2y_share_pct", True, "年份分布占比"),
+    ("证据引用总数", "evidence_refs", False, "随空白条数变化；条数不同则不可直接比"),
+    ("可行性分（top1）", "_feasibility_top1", False,
+     "**分母不同（各自候选集/子方向）⇒ 永不可横比**"),
+)
+
+
+def _fmt(v):
+    if v is None:
+        return "—"
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
+
+
+def _feasibility_top1(topic):
+    d = topic_dir(topic)
+    ep = os.path.join(d, "entry_points.json")
+    if not os.path.isfile(ep):
+        return None
+    try:
+        ents = (load_json(ep) or {}).get("entry_points") or []
+    except Exception:                                  # noqa: BLE001
+        return None
+    return float(ents[0]["feasibility_score"]) if ents else None
+
+
+def build_compare(topics, cfg=None):
+    """两（或多）方向对比矩阵。数值全部由 topic_metrics 现算。"""
+    topics = [t for t in (topics or []) if t]
+    if len(topics) < 2:
+        raise SystemExit("[!] --compare 至少需要两个方向（单方向没有可比对象）")
+    ms = [topic_metrics(t, cfg) for t in topics]
+    names = [m["topic"] for m in ms]
+    capped = any(m["top_k_cap"] and m["candidates"] and
+                 m["candidates"] >= int(m["top_k_cap"]) for m in ms)
+    sub_capped = any(m["max_sub_cap"] and
+                     m["sub_directions"] >= int(m["max_sub_cap"]) for m in ms)
+    rows = []
+    for label, key, comparable, basis in COMPARE_ROWS:
+        if key == "_feasibility_top1":
+            vals = [_feasibility_top1(t) for t in topics]
+        else:
+            vals = [m.get(key) for m in ms]
+        ok = bool(comparable)
+        why = basis
+        if key == "candidates" and not capped:
+            ok, why = True, "两方向候选集均未触顶"
+        if key == "sub_directions" and not sub_capped:
+            ok, why = True, "两方向子方向数均未触顶"
+        if key == "gaps_total" and not capped:
+            ok, why = True, "候选集均未触顶"
+        if key == "evidence_refs" and len({m["gaps_total"] for m in ms}) == 1:
+            ok, why = True, "空白条数相同，可逐条对应比"
+        rows.append({"metric": label, "key": key, "comparable": ok,
+                     "basis": why, "values": vals,
+                     "display": [_fmt(v) for v in vals]})
+    return {"topics": names, "metrics": {m["topic"]: m for m in ms},
+            "rows": rows, "generated_at": datetime.date.today().isoformat(),
+            "candidates_capped": capped, "sub_directions_capped": sub_capped,
+            "config": (cfg or {}).get("topic_rec") or {}}
+
+
+def render_compare(comp):
+    names = comp["topics"]
+    L = ["# 方向对比矩阵", ""]
+    L.append(f"> 生成于 {comp['generated_at']} ｜ 方向：{'、'.join(names)}")
+    L.append("> 🔴 **哪些能横比**：本表逐行标注。「计数型」指标只有在两方向的候选集"
+             "**都未被截断**时才可横比；归一化指标（每 100 张、占比）可横比；"
+             "**`feasibility_score` 永不可横比**——它的分母是各自候选集与子方向。")
+    L.append("")
+    head = "| 指标 | " + " | ".join(names) + " | 可横比 | 口径 / 为什么不能比 |"
+    L.append(head)
+    L.append("|---|---" * len(names) + "|---|---|")
+    for r in comp["rows"]:
+        vals = " | ".join(r["display"])
+        L.append(f"| {r['metric']} | {vals} | {'✅' if r['comparable'] else '❌'} | {r['basis']} |")
+    L.append("")
+    if comp.get("candidates_capped"):
+        L.append("> ⚠️ 至少一个方向的候选集已触顶 `candidate_top_k`"
+                 f"（{comp['metrics'][names[0]].get('top_k_cap')}）"
+                 "⇒ 「候选文献数 / 空白总数」只能当**同规模样本内的计数**看，"
+                 "不是方向真实体量。")
+    if comp.get("sub_directions_capped"):
+        L.append("> ⚠️ 至少一个方向的子方向数已触顶 `max_subdirections` ⇒ 该行不可横比。")
+    L.append("")
+    L.append("## 各方向 tier 分布（%）")
+    L.append("")
+    tiers = sorted({k for n in names for k in
+                    (comp["metrics"][n].get("tier_share_pct") or {})})
+    L.append("| tier | " + " | ".join(names) + " |")
+    L.append("|---" * (len(names) + 1) + "|")
+    for t in tiers:
+        cells = []
+        for n in names:
+            v = (comp["metrics"][n].get("tier_share_pct") or {}).get(t)
+            cells.append("—" if v is None else f"{v:g}")
+        L.append(f"| {t} | " + " | ".join(cells) + " |")
+    L.append("")
+    L.append("## 各方向子方向趋势分布（子方向个数）")
+    L.append("")
+    trends = sorted({k for n in names for k in
+                     (comp["metrics"][n].get("trend_counts") or {})})
+    L.append("| 趋势 | " + " | ".join(names) + " |")
+    L.append("|---" * (len(names) + 1) + "|")
+    for t in trends:
+        cells = [str((comp["metrics"][n].get("trend_counts") or {}).get(t, 0))
+                 for n in names]
+        L.append(f"| {t} | " + " | ".join(cells) + " |")
+    L.append("")
+    L.append("> 口径提示：`trend` 由 `sci_landscape` 按子方向近年占比判定"
+             "（rising / stable / falling），两方向用的是同一规则。")
+    L.append("")
+    return L
+
+
+def default_compare_dir():
+    return os.path.join(K.VAULT, "projects/sci-assistant/topics/_compare")
+
+
+def write_compare(comp, out=None):
+    """写 compare.md + compare.json；out 可为目录或 .md 路径。"""
+    target = out or default_compare_dir()
+    if target.lower().endswith(".md"):
+        md_path = target if os.path.isabs(target) else os.path.join(K.VAULT, target)
+        d = os.path.dirname(md_path)
+    else:
+        d = target if os.path.isabs(target) else os.path.join(K.VAULT, target)
+        md_path = os.path.join(d, "compare.md")
+    os.makedirs(d, exist_ok=True)
+    md = "\n".join(render_compare(comp)) + "\n"
+    K.write_text_verified(md_path, md)
+    js_path = os.path.join(d, "compare.json")
+    K.write_text_verified(js_path, json.dumps(comp, ensure_ascii=False, indent=2) + "\n")
+    return md_path, js_path
 
 
 # ---------------------------------------------------------------- 组装 / CLI
@@ -407,6 +868,19 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="C1 切入点推荐 + 报告（Phase 1c）")
     ap.add_argument("--topic", help="方向名或 landscape.json 路径")
     ap.add_argument("--top", type=int, default=None, help="推荐条数（默认取配置 5）")
+    ap.add_argument("--refine", default="", metavar="TOPIC",
+                    help="N1：按偏好重排切入点（默认干跑，--apply 才写 entry_points_refined.json）")
+    ap.add_argument("--interested", default="", metavar="1,3",
+                    help="N1：感兴趣的切入点名次（逗号分隔）")
+    ap.add_argument("--avoid", default="", metavar="计算,DFT",
+                    help="N1：回避关键词（命中只降权，仍列出）")
+    ap.add_argument("--prefer", default="", metavar="表征",
+                    help="N1：偏好关键词（命中加分）")
+    ap.add_argument("--compare", nargs="+", default=None, metavar="TOPIC",
+                    help="N2：方向对比矩阵（≥2 个方向）")
+    ap.add_argument("--out", default=None,
+                    help="N2：输出目录或 compare.md 路径（默认 topics/_compare/）")
+    ap.add_argument("--apply", action="store_true", help="N1：真正写盘（默认干跑）")
     ap.add_argument("--json", action="store_true", help="结果 JSON 打印到 stdout（含 markdown）")
     ap.add_argument("--no-write", action="store_true", help="不写盘")
     ap.add_argument("--selftest", action="store_true", help="自检（不依赖知识库）")
@@ -414,6 +888,59 @@ def main(argv=None):
 
     if args.selftest:
         return _selftest()
+
+    if args.compare:
+        cfg = load_config()
+        comp = build_compare(args.compare, cfg)
+        if args.json:
+            print(json.dumps(comp, ensure_ascii=False, indent=2))
+        if args.no_write:
+            print("\n".join(render_compare(comp)))
+        else:
+            md_path, js_path = write_compare(comp, args.out)
+            print("\n".join(render_compare(comp)))
+            print(f"[ok] 对比矩阵：{os.path.relpath(md_path, K.VAULT)}"
+                  f" / {os.path.relpath(js_path, K.VAULT)}")
+        return 0
+
+    if args.refine:
+        cfg = load_config()
+        prefs = parse_prefs(args.interested, args.avoid, args.prefer)
+        d = topic_dir(args.refine)
+        lp, gp = os.path.join(d, "landscape.json"), os.path.join(d, "gaps.json")
+        if not os.path.isfile(lp):
+            raise SystemExit(f"[!] 缺少 {lp}")
+        if not os.path.isfile(gp):
+            raise SystemExit(f"[!] 缺少 {gp}")
+        land, gaps = load_json(lp), load_json(gp)
+        # 全量重新算一遍（不被 --top 截断），偏好重排后再取 top
+        base = compute_entries(land, gaps, cfg,
+                               top_n=len(land.get("sub_directions") or []) or None)
+        refined, rules = apply_preferences(base, prefs, cfg)
+        top_n = int(args.top or (cfg.get("topic_rec") or {}).get("top_n", 5))
+        shown = refined[:top_n]
+        payload = {"topic_id": land.get("topic_id") or args.refine,
+                   "direction": land.get("query_direction") or args.refine,
+                   "generated_at": datetime.date.today().isoformat(),
+                   "preferences": prefs, "rules": rules,
+                   "entry_points": shown}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print("\n".join(render_refine(shown, rules)))
+        if args.apply:
+            ep = os.path.join(d, "entry_points_refined.json")
+            K.write_text_verified(ep, json.dumps(payload, ensure_ascii=False,
+                                                 indent=2) + "\n")
+            back = load_json(ep)
+            if len(back.get("entry_points") or []) != len(shown):
+                raise SystemExit("[!] entry_points_refined.json 写盘复算失败")
+            print(f"[ok] 已写：{os.path.relpath(ep, K.VAULT)}"
+                  f"（{len(shown)} 条；干跑请去掉 --apply）")
+        else:
+            print("（干跑：未写盘；确认后加 --apply）")
+        return 0
+
     if not args.topic:
         ap.print_help()
         return 1

@@ -39,18 +39,84 @@ import re
 import shutil
 import sys
 
-try:                                                           # noqa: SIM105
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                                              # noqa: BLE001
-    pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import kb_lib as K                                            # noqa: E402
+K.console_encoding()
 
 DOI_RE = re.compile(r"10\.\d{4,9}/[^\s()\[\]{}<>;,\"']+", re.IGNORECASE)
 DEFAULT_INBOX = os.path.join(K.VAULT, "raw", "pdf", "Manual Download")
 QUARANTINE = os.path.join(K.VAULT, "raw", "pdf", "_unmatched")
+
+# 🆕 2026-10-12：补充材料（SI）识别。
+#   背景（真实踩坑）：Pentasil 沸石那篇的 SI 文件 `ja6c14341_si_001.pdf` 与主文
+#   `jacs.6c14341.pdf` **共用同一 DOI**，收编时按 DOI/标题命中同一候选 ⇒ 被改名成
+#   **与主文完全相同的** `<标题> - JACS - 2026.pdf`，与主文**撞名**（一度覆盖主文的风险）。
+#   这里在收编**前**把 SI 分流到 `raw/pdf/si/<主文 stem>.si.pdf`，与 `lit_fetch.fetch_si`
+#   的落点一致（`lit_ingest.find_si_file` 正是按此命名回找 SI）。
+#   文件名判据：带 si/supp/suppl/supplement(ary)/supporting/esi/moesm/misc 的**独立词段**
+#   （需被 `_ - .` 或数字边界包住，避免误伤 "Silylation" 之类）。
+SI_NAME_RE = re.compile(
+    r"(?:^|[_\-. ])"
+    r"(?:si|supp|suppl|supplement|supplementary|supporting|esi|moesm|misc)"
+    r"(?:$|[_\-. 0-9])", re.IGNORECASE)
+# 正文首页的 SI 标题（SI 通常第一页就是 "Supporting Information" 抬头）
+SI_HEAD_RE = re.compile(
+    r"(?:electronic\s+)?supporting\s+information"
+    r"|supplementary\s+(?:information|material|materials|data)"
+    r"|supporting\s+(?:material|materials|data)",
+    re.IGNORECASE)
+# SI 的页数上限（正文极少短于这个数；SI 常见 1–30 页）
+SI_MAX_PAGES = 30
+# 🔴 2026-10-14：仅"首页含 SI 抬头"不够——ACS 排版在作者栏后有一段 section 指针
+#   "* Supporting Information / ABSTRACT: ..."，会把它误判为 SI（真实事故：本轮 5 个
+#   ACS 主文 chemmater/jcim/jacs×2/acsnano 全被误判、将改名进 raw/pdf/si/）。
+#   稳健判据：**主文首页必有 Abstract，SI 首页必无**。故加"无 abstract"闸。
+#   （曾试过"SI 抬头须在首页前 200 字"，但窗口对短标题主文仍会误伤，已弃用。）
+SI_HEAD_WINDOW = 600
+ABSTRACT_RE = re.compile(r"\babstract\b", re.IGNORECASE)
+
+
+def looks_like_si(path):
+    """判断一个 PDF 是不是**补充材料**，返回 (bool, reason)。
+
+    两道判据（任一命中即判 SI，顺序即优先级）：
+      ①**文件名**含 SI 独立词段（`_si_`、`-sup-`、`_Supporting_Information`、`-MOESM1-`…）；
+      ②**内容**：页数 ≤ SI_MAX_PAGES **且**首页含 "Supporting Information" 抬头
+        **且**首页无 "Abstract"。
+    只按文件名会漏掉浏览器另存的 `下载.pdf`；只按内容会误伤 ACS 那种把
+    "Supporting Information" 当 section 指针（与 "ABSTRACT:" 并列）的主文——
+    故内容路径**加了页数闸 + 无摘要闸**。读 PDF 失败时**判否**（不猜），
+    交由后续 DOI/标题匹配与隔离流程兜底。
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if SI_NAME_RE.search(stem):
+        return True, f"文件名含 SI 词段（{stem}）"
+    try:
+        import fitz
+        with fitz.open(path) as doc:
+            if doc.needs_pass:
+                return False, ""
+            npages = doc.page_count
+            if npages > SI_MAX_PAGES:
+                return False, ""
+            page1_all = doc[0].get_text() if npages else ""
+    except Exception:                                          # noqa: BLE001
+        return False, ""
+    # SI 抬头只看页首窗口；"ABSTRACT" 要扫**整页**。
+    # 事故：ACS 主文作者/单位栏很长时，"ABSTRACT:" 落在 600 字之外，
+    # 旧写法只看 page1[:600]，于是 9 页正文被误判成 SI（jacs.9b00911）。
+    page1_head = page1_all[:SI_HEAD_WINDOW]
+    if SI_HEAD_RE.search(page1_head) and not ABSTRACT_RE.search(page1_all):
+        return True, f"首页含 SI 抬头且无摘要、仅 {npages} 页"
+    return False, ""
+
+
+def si_filename(main_entry):
+    """SI 的目标文件名：与主文同 stem + `.si.pdf`（与 lit_fetch.fetch_si 一致）。"""
+    import lit_fetch
+    return lit_fetch.pdf_filename(main_entry)[:-4] + ".si.pdf"
 
 
 def _cfg():
@@ -307,8 +373,50 @@ def pdf_probe(path, pages=2):
             m = DOI_RE.search(str(meta.get(key) or ""))
             if m:
                 return _doi_norm(m.group(0)), text
+    # 🔴 2026-10-14：正文里 DOI 常**换行/空格断开**（尤其 PNAS 的
+    #   "…/lookup/suppl/doi:10.1073/pnas. \n2610214123/-/DCSupplemental."），
+    #   首个正则命中会截到 `10.1073/pnas` 这个**残缺 DOI**，遮蔽页脚/页眉里的完整
+    #   DOI，导致真 DOI 在池中却匹配不上（真实事故：luo-et-al PNAS 文件）。
+    #   修法（**不整段去空白**——那会把后面的正常文字也粘进 DOI）：
+    #   ① 命中以 `.` 结尾（如 `10.1073/pnas.`，是典型"断在 suffix 前"的残缺）
+    #      且其后（可跨空白）紧跟数字续体时，桥接成完整 DOI；
+    #   ② 去掉 DOI 后缀分隔路径 `/-/...`（`…/pnas.26…/-/DCSupplemental` → 主 DOI）；
+    #   ③ 仅丢弃**确证为残缺**（以 `.` 结尾）且是另一候选**前缀**的项——
+    #      正常 DOI（不以 `.` 结尾）即便恰好是某个更长串的前缀也**不丢**。
+    seen, cands = {}, []
+
+    def _add(c, truncated):
+        c = re.split(r"/-/", _doi_norm(c or ""), maxsplit=1)[0]
+        if not c:
+            return
+        if c in seen:
+            seen[c] = seen[c] and truncated     # 只要有一次非残缺，就按非残缺算
+            return
+        seen[c] = truncated
+        cands.append(c)
+
+    for m in DOI_RE.finditer(text):
+        raw = m.group(0)
+        trunc = raw.endswith(".")
+        _add(raw, trunc)
+        if trunc:
+            mm2 = re.match(r"\s*([0-9][^\s()\[\]{}<>;,\"']*)", text[m.end():m.end() + 24])
+            if mm2:
+                _add(raw + mm2.group(1), False)
+    kept = [c for c in cands
+            if not (seen.get(c) and any(o != c and o.startswith(c) for o in cands))]
+    if kept:
+        return kept[0], text
     m = DOI_RE.search(text)
     return (_doi_norm(m.group(0)) if m else None), text
+
+
+# 🔴 2026-10-26：**近乎满分**的标题命中（候选标题的词全部出现在 PDF 前两页）不再受
+#   margin 规则约束。真实事故：Science 2018 `10.1126/science.aas9100` 的 PDF **首页无 DOI**，
+#   标题 1.00 精确命中，但池里另有若干 CO2RR 论文标题覆盖到 0.90（重叠词更多、分母更大），
+#   旧逻辑 1.00-0.90=0.10 < margin 0.15 ⇒ 判 ambiguous ⇒ 真论文被推去 `_unmatched/`。
+#   margin 的本意是「两条都像、分不清」，不是「满分之外还有别的候选」。
+NEAR_PERFECT_SCORE = 0.95
 
 
 def match_one(path, by_doi, with_title, min_score=0.5, margin=0.15):
@@ -333,7 +441,7 @@ def match_one(path, by_doi, with_title, min_score=0.5, margin=0.15):
     second = scored[1][0] if len(scored) > 1 else 0.0
     if best[0] < min_score:
         return None, f"weak-title({best[0]:.2f})", best[0], doi
-    if best[0] - second < margin and second > 0:
+    if best[0] - second < margin and second > 0 and best[0] < NEAR_PERFECT_SCORE:
         return None, f"ambiguous({best[0]:.2f} vs {second:.2f})", best[0], doi
     return best[2], f"title={best[0]:.2f}", best[0], doi
 
@@ -378,6 +486,20 @@ def plan_import(inboxes, fresh_since=None, min_score=0.5, on_dup="skip",
         if not looks_like_pdf(p):
             bad.append({"pdf": p, "why": "魔数不是 %PDF（可能是 HTML/下载不完整）"})
             continue
+        # 🆕 SI 先分流：SI 与主文常共用同一 DOI/标题，若走主文流程会改名成与主文
+        #    **完全相同的文件名**（撞名/覆盖风险）。这里提前识别并改走 si/ 落点。
+        is_si, si_why = looks_like_si(p)
+        if is_si:
+            hit, how, score, doi = match_one(p, by_doi, with_title, min_score=min_score)
+            if not hit:
+                unmatched.append({"pdf": p, "why": f"SI（{si_why}）但未匹配到主文：{how}",
+                                  "doi": doi or ""})
+                continue
+            rec = {"src": p, "name": si_filename(hit), "title": hit.get("title", ""),
+                   "doi": hit.get("doi", ""), "how": f"si[{si_why}];{how}",
+                   "score": score, "dup": False, "si": True}
+            plan.append(rec)
+            continue
         hit, how, score, doi = match_one(p, by_doi, with_title, min_score=min_score)
         if not hit:
             unmatched.append({"pdf": p, "why": how, "doi": doi or ""})
@@ -410,6 +532,11 @@ def render_report(res, dry=True):
         L.append("## ✅ 可收编（将改名为库内规范并移入 raw/pdf/）")
         L.append("")
         for r in res["plan"]:
+            if r.get("si"):
+                # SI 分流到 raw/pdf/si/，避免与主文撞名
+                L.append(f"- 📎 `{os.path.basename(r['src'])}` → `raw/pdf/si/{r['name']}`"
+                         f"　[{r['how']}]（识别为补充材料 SI）")
+                continue
             flag = "（库内已有同 DOI，按 --on-dup 处理）" if r["dup"] else ""
             L.append(f"- `{os.path.basename(r['src'])}` → `{r['name']}`　[{r['how']}]{flag}")
         L.append("")
@@ -440,10 +567,15 @@ def render_report(res, dry=True):
 
 def do_import(res, on_dup="skip"):
     dst_dir = os.path.join(K.VAULT, "raw", "pdf")
+    si_dir = os.path.join(dst_dir, "si")
     os.makedirs(dst_dir, exist_ok=True)
     moved, skipped = [], []
     for r in res["plan"]:
-        dst = os.path.join(dst_dir, r["name"])
+        # SI 落 raw/pdf/si/（不混进主文目录）；主文落 raw/pdf/ 根。
+        target_dir = si_dir if r.get("si") else dst_dir
+        if r.get("si"):
+            os.makedirs(si_dir, exist_ok=True)
+        dst = os.path.join(target_dir, r["name"])
         if os.path.exists(dst):
             skipped.append({**r, "why": "目标已存在同名文件"})
             continue
@@ -560,6 +692,59 @@ def selftest():
             hit, how, score, doi = match_one(real, by_doi, with_title)
             chk("按 PDF 内 DOI 精确匹配", hit is not None and how.startswith("doi="),
                 f"{how} {doi}")
+            # 🆕 2026-10-14 回归夹具：DOI 在正文里**换行断开**（PNAS style
+            #    "…/suppl/doi:10.1073/pnas. \n2610214123/-/DCSupplemental."）。
+            #    旧逻辑正则取首个命中 ⇒ 截到残缺的 `10.1073/pnas`，真 DOI 在池中却匹配不上。
+            #    真实事故：luo-et-al PNAS 文件（DOI 10.1073/pnas.2610214123）。
+            wrap = os.path.join(tmp, "wrapped_doi.pdf")
+            doc = fitz.open()
+            pg = doc.new_page()
+            pg.insert_text((72, 72), "The more you automate, the less you see")
+            pg.insert_text((72, 120), "https://www.pnas.org/lookup/suppl/doi:10.1073/pnas. ")
+            pg.insert_text((72, 138), "2610214123/-/DCSupplemental.")
+            doc.save(wrap)
+            doc.close()
+            dw, _ = pdf_probe(wrap)
+            chk("换行断开的 DOI 取完整形态（非残缺前缀）",
+                dw == "10.1073/pnas.2610214123", str(dw))
+
+            # 🆕 2026-10-26 回归夹具（真实事故：Science 2018 `10.1126/science.aas9100`
+            #    PDF 首页无 DOI ⇒ 只能靠标题；标题 1.00 精确命中，但池中另一篇 CO2RR
+            #    论文覆盖到 0.90，旧 margin 0.15 规则把真论文判 ambiguous 推去 `_unmatched/`）。
+            np_pdf = os.path.join(tmp, "near_perfect.pdf")
+            doc = fitz.open()
+            pg = doc.new_page()
+            pg.insert_text((72, 72), "Hydroxide Mediated Copper Catalysis at an Abrupt Interface")
+            pg.insert_text((72, 96), "electroreduction ethylene selectively operating alkaline "
+                                     "flow electrolyzer demonstrated performance")
+            doc.save(np_pdf)
+            doc.close()
+            pool_np = [{"doi": "10.1126/science.aas9100",
+                        "title": "Hydroxide Mediated Copper Catalysis at an Abrupt Interface"},
+                       {"doi": "10.1021/acscatal.3c03576",
+                        "title": "electroreduction ethylene selectively operating alkaline flow "
+                                 "electrolyzer demonstrated performance novelword"}]
+            hit_np, how_np, sc_np, doi_np = match_one(np_pdf, *index_pool(pool_np))
+            chk("正例：标题 1.00 精确命中不被 0.90 的次优候选拖成 ambiguous",
+                hit_np is not None and sc_np == 1.0
+                and (hit_np or {}).get("doi") == "10.1126/science.aas9100",
+                f"{how_np} {sc_np}")
+
+            # 反例：两条都不满分且分数相同 ⇒ 仍必须判 ambiguous（不得因放宽阈值而乱猜）
+            amb_pdf = os.path.join(tmp, "still_ambiguous.pdf")
+            doc = fitz.open()
+            pg = doc.new_page()
+            pg.insert_text((72, 72), "alpha beta gamma delta epsilon zeta theta kappa "
+                                     "lambda omega")
+            doc.save(amb_pdf)
+            doc.close()
+            pool_amb = [{"doi": "10.9999/x",
+                         "title": "alpha beta gamma delta epsilon zeta theta kappa lambda xnovel"},
+                        {"doi": "10.9999/y",
+                         "title": "alpha beta gamma delta epsilon zeta theta kappa omega ynovel"}]
+            hit_amb, how_amb, _, _ = match_one(amb_pdf, *index_pool(pool_amb))
+            chk("反例：两条 0.90 平分仍判 ambiguous（放宽不失守）",
+                hit_amb is None and how_amb.startswith("ambiguous"), how_amb)
         except ImportError:
             chk("（无 PyMuPDF，跳过真实 PDF 匹配用例）", True)
 
@@ -624,6 +809,86 @@ def selftest():
             {"10.9999/newroot.2", "10.9999/dailyman.1"} <= dois3, str(sorted(dois3)[:5]))
         chk("台账落点不在 _archive/ 下",
             "_archive" not in ledger_path().replace("\\", "/"))
+
+        # 🆕 2026-10-12 回归夹具：SI 识别（真实事故：`ja6c14341_si_001.pdf`
+        #    与主文同 DOI ⇒ 曾被改名成与主文**完全同名**，有覆盖主文的风险）。
+        # 仅文件名即可判定（不依赖 PyMuPDF）
+        chk("SI 文件名 `_si_` 被识别",
+            looks_like_si(os.path.join(tmp, "ja6c14341_si_001.pdf"))[0])
+        chk("SI 文件名 `_Supporting Information` 被识别",
+            looks_like_si(os.path.join(tmp, "X - Supporting Information.pdf"))[0])
+        chk("SI 文件名 `-MOESM1-` 被识别",
+            looks_like_si(os.path.join(tmp, "s41467-026-1-MOESM1-ESM.pdf"))[0])
+        # 反例：正常标题里的 Silylation 不得被 SI 词段误伤
+        chk("反例：`Silylation` 不被误判为 SI",
+            not looks_like_si(os.path.join(tmp, "Silylation of Amines - JACS - 2026.pdf"))[0])
+        chk("反例：含 `Simplified`/`Simulation` 的正常标题不被误判",
+            not looks_like_si(os.path.join(tmp, "Simplified Simulation of Solar Cells.pdf"))[0])
+        # 内容判据（需 PyMuPDF）：首页含 SI 抬头且页数少 → SI
+        try:
+            import fitz
+            si_c = os.path.join(tmp, "ambiguous_download.pdf")
+            d = fitz.open()
+            pg = d.new_page()
+            pg.insert_text((72, 72), "Supporting Information")
+            pg.insert_text((72, 90), "Figure S1. XRD patterns")
+            d.save(si_c)
+            d.close()
+            chk("内容判据：首页开头含 SI 抬头且页数少 → SI",
+                looks_like_si(si_c)[0])
+            # 反例：多页正文（> SI_MAX_PAGES）即便首页含 SI 抬头也不判 SI
+            long_pdf = os.path.join(tmp, "long_main.pdf")
+            d = fitz.open()
+            for _ in range(SI_MAX_PAGES + 1):
+                d.new_page().insert_text((72, 72), "Supporting Information")
+            d.save(long_pdf)
+            d.close()
+            chk("反例：超 SI_MAX_PAGES 页不判 SI（防误伤长正文）",
+                not looks_like_si(long_pdf)[0])
+            # 🔴 2026-10-14 回归夹具：ACS 排版把 "Supporting Information" 当 section
+            #    指针写在作者栏后（首页 char≈274–348），旧判据（全页 600 字）会把它
+            #    误判为 SI，导致正常主文被改名进 raw/pdf/si/。真实事故：本轮 5 个
+            #    ACS 主文（chemmater/jcim/jacs×2/acsnano）全被误判。
+            acs_main = os.path.join(tmp, "acs.chemmater.6c01600.pdf")
+            d = fitz.open()
+            pg = d.new_page()
+            pg.insert_text((72, 72), "Scalable Thermoset Informatics Integrated with "
+                                     "Autonomous Experimentation for On-Demand Discovery")
+            pg.insert_text((72, 120), "Marcus R. Fratarcangeli, Ayush Jain, Farzad Gholami")
+            pg.insert_text((72, 150), "* Supporting Information")
+            pg.insert_text((72, 168), "ABSTRACT: As photopolymer additive manufacturing ...")
+            for _ in range(13):
+                d.new_page().insert_text((72, 72), "body text")
+            d.save(acs_main)
+            d.close()
+            chk("反例：ACS 主文（SI 抬头在作者栏后，非首页开头）不判 SI",
+                not looks_like_si(acs_main)[0])
+            # 🔴 2026-10-26 回归夹具：作者/单位栏很长，ABSTRACT 落在 600 字之外。
+            #    旧写法只看 page1[:600]，会把 jacs.9b00911 这种 9 页主文误判成 SI。
+            acs_long = os.path.join(tmp, "acs.long-affiliation.pdf")
+            d = fitz.open()
+            pg = d.new_page()
+            pg.insert_text((72, 72), "Branched Copper Oxide Nanoparticles Induce Highly "
+                                     "Selective Ethylene Production by Electrochemical "
+                                     "Carbon Dioxide Reduction")
+            pg.insert_text((72, 110), "Jinmo Kim, Woong Choi, Joon Woo Park, Cheonghee Kim, "
+                                      "Minjun Kim, Hyunjoon Song")
+            pg.insert_text((72, 128), "* Supporting Information")
+            y = 146
+            for i in range(12):
+                pg.insert_text((72, y), f"Affiliation {i + 1}: Department of Chemistry and "
+                                        f"Institute for Basic Science, Daejeon 34141, "
+                                        f"Republic of Korea, long address line {i + 1}")
+                y += 18
+            pg.insert_text((72, y + 18), "ABSTRACT: For long-term storage of renewable energy, ...")
+            for _ in range(8):
+                d.new_page().insert_text((72, 72), "body text")
+            d.save(acs_long)
+            d.close()
+            chk("反例：ACS 主文 ABSTRACT 在 600 字外也不判 SI",
+                not looks_like_si(acs_long)[0])
+        except ImportError:
+            chk("（无 PyMuPDF，跳过 SI 内容判据用例）", True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -670,23 +935,25 @@ def main():
     res = plan_import(inboxes, fresh_since=since, min_score=args.min_score,
                       on_dup=args.on_dup, limit=args.limit)
     report = render_report(res, dry=not args.apply)
-    rp = args.report or os.path.join(downloads_dir(), "手动导入报告.md")
-    try:
-        os.makedirs(os.path.dirname(rp), exist_ok=True)
-        with open(rp, "w", encoding="utf-8", newline="\n") as f:
-            f.write(report)
-        print(f"报告：{rp}")
-    except OSError as e:                       # 只读环境（或沙箱）下也要能看到结果
-        print(f"[warn] 报告写不进去（{rp}）：{e}", file=sys.stderr)
-
-    if not args.apply:
+    if args.apply:
+        rp = args.report or os.path.join(downloads_dir(), "手动导入报告.md")
+        try:
+            os.makedirs(os.path.dirname(rp), exist_ok=True)
+            with open(rp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(report)
+            print(f"报告：{rp}")
+        except OSError as e:                   # 只读环境（或沙箱）下也要能看到结果
+            print(f"[warn] 报告写不进去（{rp}）：{e}", file=sys.stderr)
+    else:
+        print(report, end="")
         print("（干跑结束。确认无误后加 --apply 才会改名与搬移）")
         return 0
 
     moved, skipped, quarantined = do_import(res, on_dup=args.on_dup)
     led = append_ledger([{"at": datetime.datetime.now().isoformat(timespec="seconds"),
                           "src": m["src"], "dst": m["dst"], "doi": m["doi"],
-                          "how": m["how"], "title": m["title"]} for m in moved])
+                          "how": m["how"], "title": m["title"],
+                          "si": bool(m.get("si"))} for m in moved])
     print(f"\n已收编 {len(moved)} 个 → raw/pdf/")
     print(f"隔离未匹配 {len(quarantined)} 个 → {QUARANTINE}")
     if skipped:

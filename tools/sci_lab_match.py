@@ -172,7 +172,11 @@ def profile_entries(profile):
             if isinstance(it, dict):
                 name = it.get("name") or it.get("type") or ""
                 model = it.get("model") or ""
-                caps = it.get("capabilities") or it.get("aliases") or []
+                caps = list(it.get("capabilities") or it.get("aliases") or [])
+                # `specs` 里写的能力同样算登记：工作站条目的 `specs: "CV / LSV / EIS …"`
+                # 若不算，CV/LSV/EIS 会被判 missing——档案明明写了，工具却读不到。
+                if it.get("specs"):
+                    caps.append(str(it["specs"]))
                 out.append({"kind": kind, "name": name, "model": model,
                             "caps": caps, "status": str(it.get("status") or "available"),
                             "raw": it})
@@ -244,13 +248,21 @@ def mark_reagents_complete_text(text, complete=True):
 
 
 def match_item(required, entries, kind=None):
-    """required: 文本；返回 (status, matched_entry, reason)。"""
+    """required: 文本；返回 (status, matched_entry, reason)。
+
+    🔴 匹配不是同 kind 封闭的：**表征技术可能登记在设备条目的能力里**
+    （电化学工作站 `specs: CV / LSV / EIS`），计算资源也可能写在 equipment 里。
+    只按同 kind 找，会让「档案明明写了 CV」照样判 missing。
+    """
+    kinds_ok = {"characterization": ("characterization", "equipment"),
+                "compute": ("compute", "equipment"),
+                "equipment": ("equipment",)}.get(kind, (kind,) if kind else None)
     req_norm = norm(required)
     req_fams = families(required)
     req_in_situ = ("原位" in str(required)) or ("in situ" in req_norm)
     best = None
     for e in entries:
-        if kind and e["kind"] != kind:
+        if kinds_ok and e["kind"] not in kinds_ok:
             continue
         text = _entry_text(e)
         # 单字名（如「水」）不做子串匹配：会命中「缩水甘油醚」这类无关条目
@@ -318,6 +330,397 @@ def match_method(method, profile):
     return rows, summary
 
 
+# ---------------------------------------------------------------- 处方层（E2，诊断意见 #2 差距 6）
+#
+# 匹配只回答「缺什么」；处方层回答「怎么办」。两类证据必须分开：
+#   · 库内可执行替代 —— 由 methods_db 推出，可回指 method_id（**库内证据**）；
+#   · 通用经验路径 —— 来自 substitution_rules.yaml，标 source=domain_convention
+#     （**非库内证据**，只是获取方向与周期量级）。
+# 🔴 本层不放宽任何匹配口径：missing/partial/unregistered 的判定权仍在 match_item。
+
+SUBSTITUTION_REL = "projects/sci-assistant/config/substitution_rules.yaml"
+
+VERDICTS = ("ready", "ready-pending-confirmation",
+            "feasible-with-substitution", "blocked")
+
+VERDICT_ZH = {
+    "ready": "可按原文执行（全部可用）",
+    "ready-pending-confirmation": "无缺失，但有未确认项（purchased/unregistered）",
+    "feasible-with-substitution": "需替代或走获取路径后才能执行",
+    "blocked": "存在既无替代又无路径的必需项：该方案当前不可执行",
+}
+
+_IO_DB = None
+
+
+def unlock_advice(target, methods, profile, top=5):
+    """库内统计：同类方法被什么卡住最多？补齐哪一项能立刻解锁最多方法？
+
+    🔴 这是**按当前档案做的算术**，不是采购建议：补齐后仍须逐项核对型号/能力。
+    `immediate_unlock` = 只差这一项就能执行的方法数（确定性最强）。
+    """
+    cat = target.get("category")
+    tid = target.get("method_id")
+    counter, sole, n_exec, n_tot = {}, {}, 0, 0
+    for m in (methods or []):
+        if m.get("category") != cat or m.get("method_id") == tid:
+            continue
+        n_tot += 1
+        ok, hard, _pend = executable_in_lab(m, profile)
+        if ok:
+            n_exec += 1
+            continue
+        keys = {h.split("=")[0] for h in hard}
+        for k in keys:
+            counter[k] = counter.get(k, 0) + 1
+        if len(keys) == 1:
+            k = next(iter(keys))
+            sole[k] = sole.get(k, 0) + 1
+    rows = [{"capability": k, "methods_blocked": v,
+             "immediate_unlock": sole.get(k, 0)}
+            for k, v in counter.items()]
+    rows.sort(key=lambda r: (-r["immediate_unlock"], -r["methods_blocked"]))
+    return {"category": cat, "same_category_methods": n_tot,
+            "executable_now": n_exec, "advice": rows[:top]}
+
+
+def render_unlock_advice(adv):
+    L = ["### 补齐建议（库内统计，非采购建议）", ""]
+    L.append(f"方法库中同类（{adv.get('category')}）方法共 **{adv.get('same_category_methods')}** 条，"
+             f"按当前档案可执行 **{adv.get('executable_now')}** 条。")
+    L.append("")
+    if not adv.get("advice"):
+        L.append("（无阻断项统计）")
+        L.append("")
+        return L
+    L.append("| 补齐该项 | 可立刻解锁 | 累计解除阻断 |")
+    L.append("|---|---|---|")
+    for r in adv["advice"]:
+        L.append(f"| `{r['capability']}` | {r['immediate_unlock']} 条 | "
+                 f"{r['methods_blocked']} 条 |")
+    L.append("")
+    L.append("> 口径：只差该项即可执行的方法数 = `可立刻解锁`；"
+             "含该项在内被卡住的方法数 = `累计解除阻断`。补齐后仍须核对型号/能力。")
+    L.append("")
+    return L
+
+
+def load_substitution_rules(path=None):
+    """读通用惯例规则；文件缺失返回 {}（处方层降级为「无路径」，不报错）。"""
+    import yaml
+    p = path or os.path.join(K.VAULT, SUBSTITUTION_REL)
+    if not os.path.isfile(p):
+        return {}
+    with open(p, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def rule_for(name, rules):
+    """按 family keywords 命中一条替代惯例 → (family_key, rule)。未命中返回 (None, {})。
+
+    🔴 「原位/operando」优先于具体技术：原位能力是平台属性，不是仪器属性
+    （有 Raman 但没有原位池 ⇒ 原位 Raman 仍不可自用）。漏掉这一条会把
+    「有 Raman」误读成「能做原位 Raman」。
+    """
+    fams = (rules or {}).get("families") or {}
+    t = norm(name)
+    if re.search(r"原位|in-?situ|operando", t) and "in-situ" in fams:
+        return "in-situ", (fams["in-situ"] or {})
+    for key, r in fams.items():
+        kws = [norm(k) for k in ((r or {}).get("keywords") or [])] or [norm(key)]
+        if any(k and k in t for k in kws):
+            return key, (r or {})
+    # 再按同义词族兜底（如 "X射线光电子能谱" 已由 keywords 覆盖，这里只是保险）
+    fam_norm = families(name)
+    for key, r in fams.items():
+        if norm(key) in fam_norm:
+            return key, (r or {})
+    return None, {}
+
+
+def purpose_tokens(method):
+    """方法「在解决什么问题」的词袋（名称 + 摘要），用于同类目的重叠判据。"""
+    txt = " ".join(str(method.get(k) or "") for k in ("name_zh", "name_en", "summary"))
+    try:
+        toks = K.tokenize(txt)
+    except Exception:                                   # noqa: BLE001
+        toks = re.split(r"[^0-9A-Za-z\u4e00-\u9fff]+", txt)
+    return {str(t).lower() for t in toks if len(str(t)) >= 2}
+
+
+def load_io():
+    """方法 IO 记录（produces/requires）；文件缺失时返回 {}（空 ≠ 断言没有 IO）。"""
+    global _IO_DB
+    if _IO_DB is not None:
+        return _IO_DB
+    p = os.path.join(K.VAULT, "projects/sci-assistant/knowledge/method_io.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            _IO_DB = (json.load(f) or {}).get("methods") or {}
+    except Exception:                                   # noqa: BLE001
+        _IO_DB = {}
+    return _IO_DB
+
+
+def io_artifacts(method_id, io_db=None):
+    rec = (io_db if io_db is not None else load_io()).get(method_id) or {}
+    out = set()
+    for key in ("produces", "requires"):
+        for it in rec.get(key) or []:
+            a = str((it or {}).get("artifact") or "").strip()
+            if a:
+                out.add(a)
+    return out
+
+
+def executable_in_lab(method, profile, allow_pending=True):
+    """该方法所需项是否可在实验室执行 → (bool, hard_bad, pending)。
+
+    硬阻断（严格）：设备/表征/计算缺失，或试剂在**清单已登记完整**时仍缺失；
+    软待确认（`allow_pending` 时不算阻断）：试剂 `unregistered`/`purchased`（口径是
+    「未确认」不是「没有」），以及设备/表征 `partial`（同类但型号/能力待核对）。
+
+    🔴 计算类方法还要求档案显式登记 `compute` 资源——否则「不需要设备」会让
+    任何计算类方法自动变成"可执行"，那正是缺省值制造的假结论。
+    """
+    rows, _ = match_method(method, profile)
+    hard, pending = [], []
+    for r in rows:
+        st, kind = r["status"], r["kind"]
+        if st == "available":
+            continue
+        label = f"{kind}:{r['required']}={st}"
+        if kind == "reagent" and st in ("unregistered", "purchased"):
+            (pending if allow_pending else hard).append(label)
+            continue
+        if kind == "reagent" and st == "missing":
+            hard.append(label)       # 清单完整仍未命中 ⇒ 确实是"没有"
+            continue
+        if st == "partial" and kind in ("equipment", "characterization"):
+            (pending if allow_pending else hard).append(label)
+            continue
+        hard.append(label)
+    if method.get("category") == "计算":
+        lab = (profile or {}).get("lab") or profile or {}
+        if not (lab.get("compute") or []):
+            hard.append("档案未登记 compute 资源")
+    return (not hard), sorted(set(hard)), sorted(set(pending))
+
+
+def find_alternatives(required, target, methods, profile,
+                      io_db=None, rules=None, max_alts=3):
+    """在方法库找**同类且实验室可执行**的替代方法（库内证据）。
+
+    收条条件（全部满足）：
+      1) 与目标方法同 category（同类目的域）；
+      2) 该方法自身 required_items 全部可在实验室执行（保守口径见 executable_in_lab）；
+      3) 目的重叠：共享目的词，或本身承担同一技术族，或产出物与目标方法有交集。
+    返回 [{method_id, name_zh, source_ref, same_tech, overlap, shared_output, risk}]。
+    """
+    methods = methods or []
+    tgt_id = target.get("method_id")
+    tgt_cat = target.get("category")
+    tgt_tokens = purpose_tokens(target)
+    tgt_io = io_artifacts(tgt_id, io_db)
+    req_fams = families(required)
+    out = []
+    for m in methods:
+        mid = m.get("method_id")
+        if not mid or mid == tgt_id or m.get("category") != tgt_cat:
+            continue
+        ok, _why, pending = executable_in_lab(m, profile)
+        if not ok:
+            continue
+        spec_fams = set()
+        for _k, v in required_items(m):
+            spec_fams |= families(v)
+        same_tech = bool(req_fams & spec_fams)
+        overlap = sorted(tgt_tokens & purpose_tokens(m))
+        shared_io = sorted(tgt_io & io_artifacts(mid, io_db))
+        if not (same_tech or overlap or shared_io):
+            continue
+        # 强弱：同名技术 > 共享产出物 > 仅目的词重叠
+        strength = 3 if same_tech else (2 if shared_io else 1)
+        out.append({
+            "method_id": mid,
+            "name_zh": m.get("name_zh") or "",
+            "category": m.get("category"),
+            "source_ref": m.get("source_ref") or "",
+            "same_tech": same_tech,
+            "techniques": sorted(spec_fams),
+            "overlap": overlap[:6],
+            "shared_output": shared_io[:3],
+            "strength": strength,
+            "pending": pending,
+            "risk": ("同类技术但参数/适用体系未必一致：分辨率、检出限、样品要求需逐项核对"
+                     if same_tech else
+                     "替代的是**目的**而非该项本身：不提供「" + str(required) +
+                     "」的直接证据，写进结论时须声明证据类型已改变") +
+                    ("；另有待确认项（" + "、".join(pending) + "）" if pending else ""),
+            "evidence": "methods_db（库内证据）",
+        })
+    out.sort(key=lambda a: (-a["strength"], a["method_id"]))
+    return out[:int(max_alts)]
+
+
+def build_pathway(row, fam, rule, rules):
+    """给非 available 项配一条获取路径（通用惯例，非库内证据）。"""
+    p = dict((rule or {}).get("pathway") or {})
+    if not p:
+        fb = ((rules or {}).get("fallback") or {}).get(row["status"]) or {}
+        p = dict(fb)
+    if not p:
+        # 无据就不编周期：kind=unknown，lead_time_days=None ⇒ 该项不会被判为"可处置"
+        p = {"kind": "unknown", "lead_time_days": None, "cost": "—"}
+    p.setdefault("lead_time_days", None)
+    p.setdefault("cost", "—")
+    p["family"] = fam or ""
+    p["source"] = "domain_convention"
+    p["caveat"] = (rule or {}).get("caveat") or p.get("caveat") or ""
+    return p
+
+
+def prescribe(method, rows, profile, methods=None, rules=None,
+              io_db=None, max_alts=3):
+    """对每个非 available 需求项给出处置 → 处方 dict。"""
+    methods = methods or []
+    io_db = io_db if io_db is not None else load_io()
+    items = []
+    for r in rows:
+        if r["status"] == "available":
+            continue
+        item = {"required": r["required"], "kind": r["kind"], "status": r["status"],
+                "matched": r["matched"], "reason": r["reason"],
+                "alts": [], "cross": [], "pathway": None,
+                "resolution": "none", "evidence": ""}
+        # 1) 库内可执行替代（试剂不走方法级替代：换试剂落不到方法库里）
+        if r["kind"] != "reagent" and methods:
+            item["alts"] = find_alternatives(r["required"], method, methods, profile,
+                                             io_db=io_db, rules=rules,
+                                             max_alts=max_alts)
+        fam, rule = rule_for(r["required"], rules)
+        # 2) 跨技术替代惯例（弱建议，仅当无库内替代时给出）
+        for ct in (rule or {}).get("cross_technique") or []:
+            item["cross"].append({"technique": str((ct or {}).get("technique") or ""),
+                                  "caveat": str((ct or {}).get("caveat") or ""),
+                                  "source": "domain_convention"})
+        # 3) 获取路径
+        item["pathway"] = build_pathway(r, fam, rule, rules)
+        # 4) 处置判定
+        if item["alts"]:
+            item["resolution"] = "substitute-method"
+            item["evidence"] = "methods_db"
+        elif item["pathway"].get("lead_time_days") is not None:
+            item["resolution"] = "pathway"
+            item["evidence"] = "domain_convention"
+        items.append(item)
+    verdict = verdict_of(items)
+    advice = unlock_advice(method, methods, profile) if methods else None
+    return {"verdict": verdict,
+            "verdict_zh": VERDICT_ZH[verdict],
+            "blocked_items": [i["required"] for i in items
+                              if i["status"] in ("missing", "partial")
+                              and i["resolution"] == "none"],
+            "advice": advice,
+            "items": items}
+
+
+def verdict_of(items):
+    """四项判定。blocked 只在「必需项既无替代又无路径」时成立。"""
+    if not items:
+        return "ready"
+    hard = [i for i in items if i["status"] in ("missing", "partial")]
+    if any(i["resolution"] == "none" for i in hard):
+        return "blocked"
+    if hard:
+        return "feasible-with-substitution"
+    return "ready-pending-confirmation"
+
+
+def render_prescription(prescription):
+    """处方小节（markdown 行列表）。"""
+    items = prescription.get("items") or []
+    L = ["## 处方（替代与获取路径）", ""]
+    L.append(f"**判定：{prescription.get('verdict')}** —— "
+             f"{prescription.get('verdict_zh') or VERDICT_ZH.get(prescription.get('verdict'), '')}")
+    L.append("")
+    if not items:
+        L.append("全部需求项可用，无需替代或获取路径。")
+        L.append("")
+        return L
+    L.append("| 需求 | 类型 | 状态 | 处置 | 依据 |")
+    L.append("|---|---|---|---|---|")
+    res_zh = {"substitute-method": "库内替代方法", "pathway": "获取路径", "none": "**无法处置**"}
+    ev_zh = {"methods_db": "methods_db（库内）",
+             "domain_convention": "通用惯例（**非库内证据**）"}
+    for it in items:
+        L.append(f"| {it['required']} | {it['kind']} | {it['status']} | "
+                 f"{res_zh.get(it['resolution'], it['resolution'])} | "
+                 f"{ev_zh.get(it['evidence'], '—')} |")
+    L.append("")
+    # 库内替代
+    alt_items = [i for i in items if i["alts"]]
+    L.append("### 库内可执行替代（证据：`methods_db.json`）")
+    L.append("")
+    if alt_items:
+        for it in alt_items:
+            L.append(f"**缺「{it['required']}」（{it['status']}）** —— 方法库里有可执行的同类方法：")
+            L.append("")
+            for a in it["alts"]:
+                why = []
+                if a["same_tech"]:
+                    why.append("承担同名技术（" + "、".join(a["techniques"]) + "）")
+                if a["shared_output"]:
+                    why.append("产出物重叠：" + "；".join(a["shared_output"]))
+                if a["overlap"]:
+                    why.append("目的词重叠：" + "、".join(a["overlap"]))
+                L.append(f"- `{a['method_id']}`（{a['name_zh']}）｜ {a['source_ref']}")
+                L.append(f"  - 依据：{'；'.join(why)}")
+                L.append(f"  - 风险：{a['risk']}")
+            L.append("")
+    else:
+        L.append("（无）。方法库里没有同类且实验室可执行的替代方法——")
+        L.append("这不等于「不可能替代」，只等于**库内无此记录**；勿用通用知识补一个替代方案。")
+        L.append("")
+        if prescription.get("advice"):
+            L.extend(render_unlock_advice(prescription["advice"]))
+    # 获取路径
+    path_items = [i for i in items if i["resolution"] == "pathway"]
+    L.append("### 获取路径（通用实验室惯例，**非库内证据**）")
+    L.append("")
+    if path_items:
+        L.append("| 需求 | 路径 | 预计周期 | 成本 | 说明 |")
+        L.append("|---|---|---|---|---|")
+        for it in path_items:
+            p = it["pathway"]
+            days = p.get("lead_time_days")
+            L.append(f"| {it['required']} | {p.get('kind')} | "
+                     f"{str(days) + ' 天' if days is not None else '—'} | "
+                     f"{p.get('cost')} | {p.get('caveat') or '—'} |")
+        L.append("")
+        L.append("> 口径：`substitution_rules.yaml` 的 `source: domain_convention`；"
+                 "周期与成本是量级估计，不是承诺。")
+        L.append("")
+    else:
+        L.append("（无）。")
+        L.append("")
+    # 跨技术弱建议
+    cross_items = [(i, c) for i in items for c in i["cross"] if not i["alts"]]
+    if cross_items:
+        L.append("### 跨技术替代（弱建议，**非库内证据**；仅当库内无替代时给出）")
+        L.append("")
+        for it, c in cross_items:
+            L.append(f"- 「{it['required']}」→ {c['technique']}：{c['caveat']}")
+        L.append("")
+    if prescription.get("verdict") == "blocked":
+        L.append("### 阻塞项")
+        L.append("")
+        for r in prescription.get("blocked_items") or []:
+            L.append(f"- 「{r}」：既无库内可执行替代，也无已知获取路径 ⇒ **该方案当前不可执行**。")
+        L.append("")
+    return L
+
+
 # ---------------------------------------------------------------- 档案自检
 
 def profile_check(profile):
@@ -344,7 +747,7 @@ def profile_check(profile):
 
 # ---------------------------------------------------------------- 渲染
 
-def render_report(method, rows, summary, profile):
+def render_report(method, rows, summary, profile, prescription=None):
     L = [f"# 实验室匹配：{method.get('name_zh')}", ""]
     L.append(f"> 方法 `{method.get('method_id')}` ｜ 类别 {method.get('category')} ｜ "
              f"来源 {method.get('source_ref')} ｜ {datetime.date.today().isoformat()}")
@@ -368,7 +771,8 @@ def render_report(method, rows, summary, profile):
         L.append(f"| {r['kind']} | {r['required']} | {r['status']} | "
                  f"{r['matched'] or '—'} | {r['reason']} |")
     L.append("")
-    L.append("## 处置建议（模板，不含库内证据）")
+    L.append("## 通用处置提示（模板，不含库内证据）" if prescription else
+             "## 处置建议（模板，不含库内证据）")
     L.append("")
     for r in rows:
         if r["status"] == "missing" and r["kind"] == "equipment":
@@ -388,6 +792,8 @@ def render_report(method, rows, summary, profile):
         elif r["status"] == "partial":
             L.append(f"- 「{r['required']}」：档案有同类（{r['matched']}），需确认型号/原位能力。")
     L.append("")
+    if prescription:
+        L.extend(render_prescription(prescription))
     L.append("## 边界")
     L.append("")
     L.append("- 只按 `lab_profile.yaml` 现有条目判断；设备/表征未写的一律 `missing`，**不假设有**。")
@@ -554,6 +960,129 @@ def _selftest():
             and len(p4.get("reagents") or []) == 1)
     finally:
         K.remove_temp_dir(tmp2)
+
+    # ---------------- 处方层（E2）：替代方法 / 获取路径 / 判定 ----------------
+    rules_t = {
+        "fallback": {"missing": {"kind": "borrow-or-purchase", "lead_time_days": 30,
+                                 "cost": "中"}},
+        "families": {
+            "raman": {"keywords": ["raman", "拉曼"],
+                      "cross_technique": [{"technique": "FTIR", "caveat": "互补但不一致"}]},
+            "tem": {"keywords": ["tem", "透射电镜"],
+                    "pathway": {"kind": "approval-or-send-out", "lead_time_days": 14,
+                                "cost": "高", "caveat": "需导师审批"},
+                    "cross_technique": [{"technique": "SEM/EDS",
+                                         "caveat": "给不出晶格像与内部结构"}]},
+        },
+    }
+    alt_ok = {"method_id": "source:OK", "name_zh": "乙酸钾 Zn(Ac)2 合成（XRD 跟踪）",
+              "category": "合成", "summary": "以乙酸钾与 Zn(Ac)2 合成电解液并用 XRD 跟踪",
+              "source_ref": "[[sources/OK]]", "equipment": [],
+              "characterization": [{"technique": "XRD"}],
+              "materials": [{"name": "Zn(Ac)2"}]}
+    alt_ok2 = dict(alt_ok, method_id="source:OK2", name_zh="乙酸钾合成（SEM 跟踪）",
+                   source_ref="[[sources/OK2]]",
+                   characterization=[{"technique": "SEM"}])
+    alt_bad = {"method_id": "source:BAD", "name_zh": "乙酸钾 Zn(Ac)2 合成（Raman 跟踪）",
+               "category": "合成", "summary": "以乙酸钾与 Zn(Ac)2 合成电解液并用 Raman 跟踪",
+               "source_ref": "[[sources/BAD]]", "equipment": [],
+               "characterization": [{"technique": "Raman"}, {"technique": "TEM"}],
+               "materials": [{"name": "Zn(Ac)2"}]}
+    alt_cat = {"method_id": "source:CAT", "name_zh": "乙酸钾合成（XRD）", "category": "表征",
+               "summary": "乙酸钾 Zn(Ac)2 的 XRD 表征", "source_ref": "[[sources/CAT]]",
+               "equipment": [], "characterization": [{"technique": "XRD"}], "materials": []}
+    alt_comp = {"method_id": "source:COMP", "name_zh": "乙酸钾电解液 MD 模拟", "category": "计算",
+                "summary": "乙酸钾 Zn(Ac)2 体系 MD 模拟", "source_ref": "[[sources/COMP]]",
+                "equipment": [], "characterization": [], "materials": []}
+    pool = [alt_ok, alt_ok2, alt_bad, alt_cat, alt_comp]
+    # 目标方法要有真实摘要：替代判据靠「目的词重叠」，没有摘要就没有目的词可比
+    m_presc = {"method_id": "source:TGT", "name_zh": "乙酸钾配位电解液合成",
+               "category": "合成",
+               "summary": "以乙酸钾与 Zn(Ac)2 合成非可燃电解液，并用 XRD 跟踪物相",
+               "source_ref": "[[sources/TGT]]",
+               "equipment": [{"type": "电化学工作站"}],
+               "characterization": [{"technique": "XRD"}, {"technique": "Raman"}],
+               "materials": [{"name": "KAc"}, {"name": "Zn(Ac)2"}]}
+    rows_p, summary_p = match_method(m_presc, profile)
+    p = prescribe(m_presc, rows_p, profile, methods=pool, rules=rules_t, io_db={})
+    by_req = {i["required"]: i for i in p["items"]}
+    chk("处方：有替代可用 ⇒ verdict=feasible-with-substitution",
+        p["verdict"] == "feasible-with-substitution", str(p["verdict"]))
+    chk("处方：Raman 项给出库内替代且回指 method_id",
+        [a["method_id"] for a in by_req["Raman"]["alts"]] and
+        by_req["Raman"]["alts"][0]["method_id"].startswith("source:OK"))
+    chk("处方：不可执行的候选（需 Raman/TEM）**不**被推荐为替代",
+        all(a["method_id"] != "source:BAD" for i in p["items"] for a in i["alts"]))
+    chk("处方：异 category 方法不当替代",
+        all(a["method_id"] != "source:CAT" for i in p["items"] for a in i["alts"]))
+    chk("处方：计算类方法在档案无 compute 资源时不算可执行",
+        all(a["method_id"] != "source:COMP" for i in p["items"] for a in i["alts"]))
+    chk("处方：unregistered 试剂不算阻塞项",
+        by_req["KAc"]["status"] == "unregistered" and p["verdict"] != "blocked")
+    chk("处方：路径来源标 domain_convention",
+        by_req["Raman"]["pathway"]["source"] == "domain_convention")
+    m_tem = {"method_id": "source:TEM", "name_zh": "TEM 观察形貌", "category": "表征",
+             "source_ref": "[[sources/TEM]]", "equipment": [],
+             "characterization": [{"technique": "TEM"}], "materials": []}
+    rows_tem, _ = match_method(m_tem, profile)
+    p_tem = prescribe(m_tem, rows_tem, profile, methods=[], rules=rules_t, io_db={})
+    chk("处方：受限/缺失表征走审批-送测路径并带周期",
+        p_tem["verdict"] == "feasible-with-substitution" and
+        p_tem["items"][0]["pathway"]["lead_time_days"] == 14)
+    m_blk = {"method_id": "source:BLK", "name_zh": "未知仪器 ZZZ", "category": "表征",
+             "source_ref": "[[sources/BLK]]", "equipment": [],
+             "characterization": [{"technique": "未知仪器ZZZ"}], "materials": []}
+    rows_blk, _ = match_method(m_blk, profile)
+    p_blk = prescribe(m_blk, rows_blk, profile, methods=[],
+                      rules={"families": {}}, io_db={})
+    chk("处方：既无替代又无路径 ⇒ blocked（不臆造周期）",
+        p_blk["verdict"] == "blocked" and p_blk["blocked_items"] == ["未知仪器ZZZ"])
+    p_no_rules = prescribe(m_presc, rows_p, profile, methods=[], rules=None, io_db={})
+    chk("处方：规则文件缺失时不崩（退化为只有诊断）",
+        p_no_rules["verdict"] in VERDICTS)
+    p_one = prescribe(m_presc, rows_p, profile, methods=pool, rules=rules_t,
+                      io_db={}, max_alts=1)
+    chk("处方：max_alts 生效（≤1 个替代/项）",
+        all(len(i["alts"]) <= 1 for i in p_one["items"]))
+    m_all_av = {"method_id": "source:AV", "name_zh": "全可用方法", "category": "表征",
+                "source_ref": "[[sources/AV]]", "equipment": [{"type": "电化学工作站"}],
+                "characterization": [{"technique": "XRD"}], "materials": []}
+    rows_av, _ = match_method(m_all_av, profile)
+    p_av = prescribe(m_all_av, rows_av, profile, methods=[], rules=rules_t, io_db={})
+    chk("处方：全部可用 ⇒ verdict=ready 且无待处置项",
+        p_av["verdict"] == "ready" and p_av["items"] == [])
+    m_unreg = {"method_id": "source:UR", "name_zh": "只用未登记试剂", "category": "合成",
+               "source_ref": "[[sources/UR]]", "equipment": [],
+               "characterization": [], "materials": [{"name": "KAc"}]}
+    rows_ur, _ = match_method(m_unreg, profile)
+    p_ur = prescribe(m_unreg, rows_ur, profile, methods=[], rules=rules_t, io_db={})
+    chk("处方：仅未确认项 ⇒ ready-pending-confirmation",
+        p_ur["verdict"] == "ready-pending-confirmation")
+    md_p = render_report(m_presc, rows_p, summary_p, profile, prescription=p)
+    chk("渲染：含处方小节、判定与两类证据标注",
+        "## 处方" in md_p and "非库内证据" in md_p and "methods_db" in md_p)
+    md_tem = render_report(m_tem, rows_tem, match_method(m_tem, profile)[1],
+                           profile, prescription=p_tem)
+    chk("渲染：跨技术弱建议只给无库内替代的项",
+        "「TEM」→" in md_tem and "「Raman」→" not in md_tem)
+
+    # 能力登记在 `specs` 里也要读得到（否则「档案写了 CV 却判 missing」）
+    prof_specs = {"lab": {"name": "t", "equipment": [{"name": "电化学工作站",
+                                                      "specs": "CV / LSV / EIS"}],
+                          "characterization": [{"name": "XRD"}], "constraints": ["c"]}}
+    rows_specs, _ = match_method({"method_id": "source:SP", "name_zh": "t",
+                                  "category": "表征", "equipment": [],
+                                  "characterization": [{"technique": "CV"},
+                                                       {"technique": "LSV"}],
+                                  "materials": []}, prof_specs)
+    chk("匹配：能力写在 specs 字段里也算登记（CV/LSV 不误判 missing）",
+        [r["status"] for r in rows_specs] == ["available", "available"])
+    adv = unlock_advice(m_presc, pool, profile)
+    chk("补齐建议：只统计同 category 方法（pool 中 3 条为合成）",
+        adv["same_category_methods"] == 3 and isinstance(adv["advice"], list))
+    chk("补齐建议：可执行方法计数正确（alt_ok/alt_ok2 可执行）",
+        adv["executable_now"] >= 1)
+
     print(f"SELFTEST {'PASSED' if not fails else 'FAILED'}: {len(fails)} failure(s)")
     return 0 if not fails else 1
 
@@ -570,6 +1099,10 @@ def main(argv=None):
     ap.add_argument("--mark-reagents-complete", action="store_true",
                     help="把 reagents_meta.inventory_complete 置 true（清单已列全时用）")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-prescription", action="store_true",
+                    help="只做匹配诊断，不生成替代/获取路径处方（E2）")
+    ap.add_argument("--max-alts", type=int, default=3,
+                    help="每项最多列几个库内可执行替代方法（默认 3）")
     ap.add_argument("--no-write", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
@@ -605,10 +1138,16 @@ def main(argv=None):
     if not m:
         raise SystemExit(f"[!] 方法库找不到：{args.method}")
     rows, summary = match_method(m, profile)
-    md = render_report(m, rows, summary, profile)
+    presc = None
+    if not args.no_prescription:
+        presc = prescribe(m, rows, profile, methods=list(methods.values()),
+                          rules=load_substitution_rules(),
+                          max_alts=args.max_alts)
+    md = render_report(m, rows, summary, profile, prescription=presc)
     if args.json:
         print(json.dumps({"method": m.get("method_id"), "summary": summary,
-                          "rows": rows}, ensure_ascii=False, indent=2))
+                          "rows": rows, "prescription": presc},
+                         ensure_ascii=False, indent=2))
     if not args.no_write:
         out = os.path.join(K.VAULT, "projects/sci-assistant/lab_match",
                            f"{datetime.date.today().isoformat()}-{m.get('method_id').split(':')[-1][:40]}.md")
@@ -620,6 +1159,12 @@ def main(argv=None):
               f"purchased={summary.get('purchased', 0)} "
               f"missing={summary.get('missing', 0)} "
               f"unregistered={summary.get('unregistered', 0)}")
+        if presc:
+            print(f"     处方判定：{presc['verdict']}（{presc['verdict_zh']}）")
+            alts = sum(len(i["alts"]) for i in presc["items"])
+            paths = sum(1 for i in presc["items"] if i["resolution"] == "pathway")
+            print(f"     库内替代 {alts} 条 / 获取路径 {paths} 项 / "
+                  f"阻塞 {len(presc['blocked_items'])} 项")
     return 0
 
 

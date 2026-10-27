@@ -13,9 +13,25 @@ L2（source 卡，LLM 提取）/ L3（全文）留给后续块。
 提取字段：category / equipment（类型）/ parameters_raw（值+单位+原文上下文）/
 steps（协议类小节里的编号项）/ characterization（表征技术）/ pitfalls（警示类小节）
 
+整批编排（--auto / --status）：把「--plan → 人工派子 agent → --merge-dir → --recheck」
+包成可恢复状态机：
+  python tools/sci_method_extract.py --from sources --auto --topic 研究方向A --out-dir <目录>
+      → preflight（config / methods_db / 卡可读 / 已有批次产物 / 目录可写）
+      → 复用 plan_l2 切批 → 为每批写 <目录>/prompts/batch_XX.md（自包含：schema +
+        该批卡路径 + 输出文件名 batch_XX.json + quote 纪律 + 禁止编造）→ 打印下一步
+  python tools/sci_method_extract.py --status --out-dir <目录>
+      → 逐批三态：缺结果 / 有结果但 quote 校验失败 N 条 / 通过；给下一步命令与汇总
+  python tools/sci_method_extract.py --from sources --merge-dir <目录> --recheck
+      → 合并 + 重检（--auto 可与 --merge-dir 组合：结果齐全时一路合并 + recheck）
+
+🔴 自动化边界：本工具**只做编排与机械校验**，**不调用任何 LLM**。提取由子 agent 执行；
+工具只判断「quote 是否真是卡片正文的连续子串」，「提取得全不全、字段选得对不对」判不了。
+
 用法：
   python tools/sci_method_extract.py --from concepts
   python tools/sci_method_extract.py --from concepts --limit 30 --json --no-write
+  python tools/sci_method_extract.py --from sources --auto --topic 研究方向A --out-dir _scratch/l2
+  python tools/sci_method_extract.py --status --out-dir _scratch/l2
   python tools/sci_method_extract.py --selftest
 """
 
@@ -436,7 +452,7 @@ def validate_l2_record(rec, body_norm):
     return clean, stats
 
 
-def merge_l2(merge_dir, cfg, db_path=None, sources_dir=None):
+def merge_l2(merge_dir, cfg, db_path=None, sources_dir=None, direction=None):
     manifest_p = os.path.join(merge_dir, "manifest.json")
     if not os.path.isfile(manifest_p):
         raise SystemExit(f"[!] 缺少 {manifest_p}")
@@ -475,6 +491,8 @@ def merge_l2(merge_dir, cfg, db_path=None, sources_dir=None):
             # 同类别重复仍按 duplicate 拒收，保证重跑幂等。
             if mk in by_id and clean.get("category") != by_id[mk].get("category"):
                 mk = f"{mk}#{clean.get('category')}"
+            if direction:
+                clean["directions"] = [direction]
             clean.update({
                 "method_id": mk,
                 "tier": "source",
@@ -538,6 +556,38 @@ def merge_l2(merge_dir, cfg, db_path=None, sources_dir=None):
     return db, accepted, rejected, total_stats
 
 
+
+def tag_direction(cfg, direction, cards, apply=False, db_path=None):
+    """给**指定来源卡**的方法补 ``directions``（方向归因：由卡定，不靠方法名撞词）。
+
+    返回 [(method_id, name_zh, directions, already)]；默认干跑，``apply=True`` 才写。
+    """
+    db_p = db_path or out_path(cfg)
+    if not os.path.isfile(db_p):
+        raise SystemExit(f"[!] 方法库不存在: {db_p}")
+    with open(db_p, encoding="utf-8") as f:
+        db = json.load(f)
+    want = {str(c).strip()[:-3] if str(c).strip().endswith(".md") else str(c).strip()
+            for c in cards}
+    rows = []
+    for m in db.get("methods") or []:
+        card = os.path.basename(str(m.get("page_path") or ""))
+        if card.endswith(".md"):
+            card = card[:-3]
+        if card not in want:
+            continue
+        dirs = list(m.get("directions") or [])
+        already = direction in dirs
+        if not already:
+            dirs.append(direction)
+            if apply:
+                m["directions"] = dirs
+        rows.append((m.get("method_id"), m.get("name_zh"), dirs, already))
+    if apply and rows:
+        write_db(db_p, db)
+    return rows
+
+
 def _squash(s):
     s = re.sub(r"\s+", "", str(s or ""))
     return s.replace("–", "-").replace("−", "-").replace("→", "-").replace("~", "-")
@@ -574,6 +624,496 @@ def recheck_db(db_path):
     db.setdefault("meta", {}).setdefault("l2", {})["value_unsupported"] = bad
     write_db(db_path, db)
     return db, bad
+
+
+# ---------------------------------------------------------------- 编排层：--auto / --status
+#
+# 🔴 自动化边界（写进 --help 与每次运行输出，不许含糊）：
+#    本工具只做**编排与机械校验** —— 选卡、切批、写提示文件、逐条 quote 校验、合并入库。
+#    **它不调用任何 LLM**：--auto 只是把「给子 agent 的活」准备好并落成自包含提示文件，
+#    真正的提取由子 agent 执行。机械能判的只有「quote 是否真是卡片正文的连续子串」；
+#    「提取得全不全、字段选得对不对」不在本工具的判定能力内，别把 --status「通过」读成质量合格。
+AUTO_BOUNDARY = (
+    "🔴 自动化边界：本工具只做编排与机械校验（选卡 / 切批 / 写提示文件 / quote 校验 / 合并入库）；"
+    "LLM 提取由子 agent 执行，本工具不调用任何 LLM。")
+
+DEFAULT_L2_JOBS = "projects/sci-assistant/knowledge/l2_jobs"
+PROMPT_DIRNAME = "prompts"
+PROMPT_MARKER = "本文件由 `tools/sci_method_extract.py --auto` 生成"
+STATUS_LABELS = {"missing": "缺结果", "invalid": "校验失败", "ok": "通过"}
+
+
+def _load_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _rel(path):
+    """展示用路径：库内给相对库根，库外直接给绝对路径（不出现一串 ..\\..）。"""
+    try:
+        r = os.path.relpath(path, K.VAULT)
+    except ValueError:
+        return path
+    return path if r.startswith("..") else r.replace(os.sep, "/")
+
+
+def resolve_dir(path, default=None):
+    """目录参数解析：相对路径按**知识库根**（与既有 --out-dir 行为一致），不按 cwd。"""
+    p = path or default
+    if not p:
+        raise SystemExit("[!] 缺少目录参数")
+    return os.path.abspath(p if os.path.isabs(p) else os.path.join(K.VAULT, p))
+
+
+def _card_file(rel_path, sources_dir=None):
+    """卡的物理路径：给了 sources_dir（自检夹具）就按 basename 去那儿找。"""
+    name = os.path.basename(rel_path)
+    if sources_dir:
+        return os.path.join(sources_dir, name)
+    return rel_path if os.path.isabs(rel_path) else os.path.join(K.VAULT, rel_path)
+
+
+def _safe(fn, *a, **kw):
+    """把 SystemExit/异常收成 (None, 原因)——SystemExit 不是 Exception 子类，必须显式列。"""
+    try:
+        return fn(*a, **kw), None
+    except (SystemExit, Exception) as e:                       # noqa: BLE001
+        return None, str(e)
+
+
+def load_config_safe(path=None):
+    try:
+        return load_config(path), None
+    except Exception as e:                                     # noqa: BLE001
+        return {}, f"{type(e).__name__}: {e}"
+
+
+def preflight(cfg, out_dir, topic=None, query=None, limit=48, batch_size=8,
+              min_hits=1, sources_dir=None, db_path=None, cfg_error=None):
+    """起跑前体检 -> {"ok", "items", "cards", "out_dir", "db_path"}。
+
+    items 每项 `{name, level: ok|warn|fail, detail}`；**fail 才阻断**，warn 只提示。
+    检查项 = 诊断意见点名的四样（config / methods_db / 卡可读 / 已有批次产物）
+    ＋「输出目录可写」（写不进去的话后面全是空转）。
+    """
+    items = []
+
+    def add(name, level, detail=""):
+        items.append({"name": name, "level": level, "detail": detail})
+
+    ok = True
+
+    # ① 配置（能读出来、methods_db 有指向）
+    if cfg_error:
+        add("config", "fail", f"读不出配置：{cfg_error}")
+        ok = False
+    elif not cfg:
+        add("config", "fail", "配置为空")
+        ok = False
+    else:
+        sci = cfg.get("sci") or {}
+        add("config", "ok", f"已加载；methods_db={sci.get('methods_db') or '(默认路径)'}")
+        if not sci.get("methods_db"):
+            add("config", "warn", "未配 sci.methods_db，按默认路径找方法库")
+
+    # ② 方法库（缺了不算致命：合并时会新建；坏了才是致命，否则合并必崩）
+    dbp = db_path or out_path(cfg or {})
+    if os.path.isfile(dbp):
+        db, err = _safe(_load_json, dbp)
+        if err:
+            add("methods_db", "fail", f"{_rel(dbp)} 解析失败：{err}（先修复，否则合并会崩）")
+            ok = False
+        else:
+            add("methods_db", "ok", f"{_rel(dbp)}（{len(db.get('methods') or [])} 条方法）")
+    else:
+        add("methods_db", "warn", f"{_rel(dbp)} 不存在（合并时会新建，不影响提取）")
+
+    # ③ 选卡 + ④ 卡可读
+    cards = []
+    if not topic and not query:
+        add("选卡", "fail", "缺少 --topic 或 --query，无法选卡")
+        ok = False
+    else:
+        cards, err = _safe(select_l2_cards, topic=topic, limit=limit,
+                           query=query, min_hits=min_hits, sources_dir=sources_dir)
+        if err:
+            add("选卡", "fail", err)
+            ok = False
+        elif not cards:
+            add("选卡", "fail", f"选出 0 张卡（topic={topic} query={query}）")
+            ok = False
+        else:
+            nb = (len(cards) + int(batch_size) - 1) // int(batch_size)
+            add("选卡", "ok", f"{topic or 'query:' + str(query)} → {len(cards)} 张卡，"
+                              f"{batch_size} 张/批 = {nb} 批")
+    if cards:
+        bad = []
+        for c in cards:
+            p = _card_file(c.get("path") or (c["name"] + ".md"), sources_dir)
+            try:
+                if not K.read_text(p).strip():
+                    bad.append(f"{c['name']}（空文件）")
+            except OSError as e:
+                bad.append(f"{c['name']}（{e.__class__.__name__}）")
+        if bad:
+            add("卡可读", "fail", f"{len(bad)}/{len(cards)} 张读不了：{', '.join(bad[:4])}")
+            ok = False
+        else:
+            add("卡可读", "ok", f"{len(cards)}/{len(cards)}")
+
+    # ⑤ 输出目录可写（真写探针，不信「目录建出来了」）
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        probe = os.path.join(out_dir, ".preflight_probe")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.remove(probe)
+        add("输出目录", "ok", f"{_rel(out_dir)} 可写")
+    except OSError as e:
+        add("输出目录", "fail", f"{_rel(out_dir)} 不可写：{e}")
+        ok = False
+
+    # ⑥ 已有批次产物（重跑幂等：清单覆盖、结果不删）
+    man_p = os.path.join(out_dir, "manifest.json")
+    results = sorted(f for f in os.listdir(out_dir)
+                     if f.startswith("batch_") and f.endswith(".json")) \
+        if os.path.isdir(out_dir) else []
+    new_label = topic or f"query:{query}"
+    if os.path.isfile(man_p):
+        old = None
+        old_label = None
+        try:
+            old = _load_json(man_p)
+            old_label = old.get("topic")
+        except Exception:                                      # noqa: BLE001
+            pass
+        det = (f"manifest.json 已存在（topic={old_label}），本次将覆盖清单；"
+               f"已有结果 {len(results)} 个不会被删除")
+        if old_label and old_label != new_label:
+            add("已有批次产物", "warn",
+                det + f"；⚠️ 旧清单 topic 与新选择器（{new_label}）不同，旧结果可能与新批次不对应")
+        else:
+            add("已有批次产物", "ok", det)
+    else:
+        add("已有批次产物", "ok", "无 manifest" + (f"；已有结果 {len(results)} 个" if results else ""))
+
+    return {"ok": ok, "items": items, "cards": cards,
+            "out_dir": out_dir, "db_path": dbp}
+
+
+def _prompt_text(batch, label, out_dir_rel, total_batches):
+    """单批自包含提示文件正文。
+
+    幂等要求：**不含时间戳/随机量/绝对临时路径**——同选择器、同批次 → 逐字相同。
+    """
+    bid = batch.get("batch_id") or "batch_XX"
+    cards = batch.get("cards") or []
+    lines = [
+        f"# {label} · {bid} 方法提取任务（子 agent 执行；共 {total_batches} 批）",
+        "",
+        f"> {PROMPT_MARKER}；重跑会覆盖同名文件，内容稳定。",
+        "> 🔴 自动化边界：本工具只做**编排与机械校验**（选卡 / 切批 / 写提示 / quote 校验 / 合并），",
+        "> **不调用任何 LLM**。提取动作由子 agent 执行；工具不会替你生成内容，",
+        "> 也判断不了「提取得全不全、对不对」——它只判断 quote 是不是卡片正文的连续子串。",
+        "",
+        "## 一、任务",
+        f"1. 逐张读本批 {len(cards)} 张 source 卡（完整读全文，不要只看标题或摘要）。",
+        "2. 每张卡输出**一条**记录；卡里没有可提取的方法，就写一条 `no_method: true` 的记录"
+        "（保留 `card` 与 `no_method_reason`）。",
+    ]
+    lines.append("3. 整批结果写成 `" + out_dir_rel + "/" + bid +
+                 ".json`，顶层形如 `{\"records\": [记录, ...]}`（裸数组也接受）。")
+    lines.append("4. 合并与入库由编排者执行（`--status` 校验 / `--merge-dir` 合并），你不要动方法库。")
+    lines += ["", f"## 二、本批卡片（{len(cards)} 张）", "",
+              "| # | 卡名 | 路径（相对知识库根） |", "|---|------|------|"]
+    for i, c in enumerate(cards, 1):
+        name = str(c.get("name") or "").replace("|", "\\|")
+        path = str(c.get("path") or "").replace("|", "\\|")
+        lines.append(f"| {i} | {name} | `{path}` |")
+    lines += ["", "## 三、schema（每张卡一条记录，逐字照此结构）", "", "```text",
+              L2_SCHEMA_SPEC, "```", "",
+              "## 四、quote 纪律（合并时机械校验，违反即丢弃该条目）", "",
+              "1. 每个字段值都必须带 `quote`，且 quote 必须是**该卡正文的连续子串**"
+              "（空白差异会被归一化后比较）。",
+              "2. **禁止编造**：原文没写的值不要写；拿不准就不写这个字段——宁缺勿造。",
+              "3. 不得把两处原文拼成一个 quote、不得翻译后写回、不得自补单位或数值。",
+              "4. `category` 只能是 合成 / 表征 / 测试 / 计算 四选一；方法名用原文术语，勿自造。",
+              "5. 一张卡一条记录；同卡同类别重复记录会在合并时按 `duplicate` 拒收。",
+              "", "## 五、输出与验收", "",
+              f"- 输出文件：`{out_dir_rel}/{bid}.json`",
+              "- 每条记录必须带 `card` 字段，值与上表卡名**完全一致**（不含 `.md`）。",
+              f"- 校验：`python tools/sci_method_extract.py --status --out-dir {out_dir_rel}`",
+              "- 判定：`通过` 才可合并；`校验失败` 说明有 quote 不在原文——"
+              "回原文重写该条目，不要改 quote 去凑字段。",
+              ""]
+    return "\n".join(lines)
+
+
+def prune_stale_prompts(pdir, keep):
+    """删掉**本工具以前生成的**、已不在本次清单里的 batch_*.md。
+
+    只删带生成标记（PROMPT_MARKER）的文件：prompts 目录里用户自己放的东西一律不动
+    （selftest 已把「外来文件必须保留」固化成反例）。
+    """
+    gone = []
+    if not os.path.isdir(pdir):
+        return gone
+    for fn in sorted(os.listdir(pdir)):
+        if fn in keep or not (fn.startswith("batch_") and fn.endswith(".md")):
+            continue
+        p = os.path.join(pdir, fn)
+        try:
+            head = K.read_text(p)[:600]
+        except OSError:
+            continue
+        if PROMPT_MARKER not in head:
+            continue
+        try:
+            os.remove(p)
+            gone.append(fn)
+        except OSError:
+            pass
+    return gone
+
+
+def write_batch_prompts(out_dir, manifest):
+    """为每批写 `<out_dir>/prompts/batch_XX.md` -> {"written": [(bid, path)], "pruned": [...]}。"""
+    pdir = os.path.join(out_dir, PROMPT_DIRNAME)
+    os.makedirs(pdir, exist_ok=True)
+    label = manifest.get("topic") or "方法提取"
+    out_rel = _rel(out_dir)
+    batches = manifest.get("batches") or []
+    written, keep = [], set()
+    for b in batches:
+        bid = b.get("batch_id") or "batch_XX"
+        p = os.path.join(pdir, bid + ".md")
+        ok, detail = K.write_text_verified(p, _prompt_text(b, label, out_rel, len(batches)),
+                                          quiet=True)
+        if not ok:
+            raise SystemExit(f"[!] 提示文件写盘复算失败：{p}（{detail}）")
+        keep.add(bid + ".md")
+        written.append((bid, p))
+    return {"written": written, "pruned": prune_stale_prompts(pdir, keep)}
+
+
+def batch_status(out_dir, sources_dir=None, manifest=None):
+    """逐批三态判定 -> {"rows", "counts", "ready", "total", "out_dir", "note"}。
+
+    三态：`missing`（没有 batch_XX.json）/ `invalid`（有结果但 quote 校验失败，
+    或 JSON 坏、结构错、空结果）/ `ok`（每条 quote 都是卡片正文连续子串且有有效记录）。
+    `no_method` 记录不算失败——那是合法结论。
+    """
+    out_dir = resolve_dir(out_dir)
+    man_p = os.path.join(out_dir, "manifest.json")
+    note = ""
+    if manifest is None and os.path.isfile(man_p):
+        manifest, err = _safe(_load_json, man_p)
+        if err:
+            note, manifest = f"manifest.json 解析失败：{err}", None
+    if manifest and manifest.get("batches"):
+        batches = [{"batch_id": b.get("batch_id"), "cards": b.get("cards") or []}
+                   for b in manifest["batches"]]
+    else:
+        files = sorted(f for f in os.listdir(out_dir)
+                       if f.startswith("batch_") and f.endswith(".json")) \
+            if os.path.isdir(out_dir) else []
+        batches = [{"batch_id": f[:-5], "cards": []} for f in files]
+        if not batches:
+            note = note or "目录里既没有 manifest.json，也没有 batch_*.json"
+    rows = []
+    for b in batches:
+        bid = b["batch_id"]
+        rp = os.path.join(out_dir, str(bid) + ".json")
+        row = {"batch_id": bid, "path": rp, "cards": len(b.get("cards") or []),
+               "state": "missing", "records": 0, "valid": 0, "no_method": 0,
+               "quotes_checked": 0, "quotes_failed": 0, "bad_records": 0, "detail": ""}
+        if not os.path.isfile(rp):
+            row["detail"] = "无 " + str(bid) + ".json"
+            rows.append(row)
+            continue
+        payload, err = _safe(_load_json, rp)
+        if err:
+            row["state"] = "invalid"
+            row["detail"] = f"JSON 解析失败：{err}"
+            rows.append(row)
+            continue
+        records = payload if isinstance(payload, list) else (payload.get("records") or [])
+        row["records"] = len(records)
+        reasons = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                row["bad_records"] += 1
+                reasons.append("记录不是对象")
+                continue
+            card = str(rec.get("card") or "").strip()
+            body = _card_body(card, sources_dir) if card else None
+            clean, st = validate_l2_record(rec, body)
+            row["quotes_checked"] += st.get("checked", 0)
+            row["quotes_failed"] += st.get("failed", 0)
+            if clean is None:
+                row["bad_records"] += 1
+                reasons.append(f"{card or '?'}:{st.get('error') or 'invalid'}")
+            elif clean.get("no_method"):
+                row["no_method"] += 1
+            else:
+                row["valid"] += 1
+        if not records:
+            row["state"] = "invalid"
+            row["detail"] = "空结果（0 条记录）"
+        elif row["quotes_failed"] or row["bad_records"] or not row["valid"]:
+            row["state"] = "invalid"
+            parts = [f"记录 {row['records']} 条"]
+            if row["quotes_failed"]:
+                parts.append(f"quote 失败 {row['quotes_failed']} 条")
+            if row["bad_records"]:
+                parts.append(f"结构错误 {row['bad_records']} 条")
+            if row["no_method"]:
+                parts.append(f"no_method {row['no_method']} 条")
+            if not row["valid"]:
+                parts.append("无有效记录")
+            row["detail"] = "，".join(parts) + (f"（{reasons[0]}）" if reasons else "")
+        else:
+            row["state"] = "ok"
+            row["detail"] = (f"记录 {row['records']} 条，quote 校验 "
+                             f"{row['quotes_checked']} 条全过"
+                             + (f"，no_method {row['no_method']} 条"
+                                if row["no_method"] else ""))
+        rows.append(row)
+    counts = {"missing": 0, "invalid": 0, "ok": 0}
+    for r in rows:
+        counts[r["state"]] += 1
+    return {"out_dir": out_dir, "rows": rows, "counts": counts, "total": len(rows),
+            "ready": bool(rows) and counts["ok"] == len(rows), "note": note}
+
+
+def next_commands(st, direction=None):
+    """按状态生成下一步命令（注释行以 # 开头，便于整段粘贴）。"""
+    d = _rel(st["out_dir"])
+    pend = [r["batch_id"] for r in st["rows"] if r["state"] != "ok"]
+    bad = [r["batch_id"] for r in st["rows"] if r["state"] == "invalid"]
+    cmds = []
+    if pend:
+        shown = "、".join(f"{d}/prompts/{b}.md" for b in pend[:6])
+        more = f" 等 {len(pend)} 批" if len(pend) > 6 else ""
+        cmds.append(f"# ① 派子 agent 按提示文件提取：{shown}{more}")
+        cmds.append(f"#    每批结果写回 {d}/batch_XX.json（顶层 {{\"records\": [...]}}）")
+    if bad:
+        cmds.append("# ② 校验失败的批次回原文重写 quote，再重跑下面的 --status："
+                    + "、".join(bad[:6]))
+    cmds.append(f"python tools/sci_method_extract.py --status --out-dir {d}")
+    if st["ready"]:
+        cmds.append("python tools/sci_method_extract.py --from sources --merge-dir "
+                    f"{d} --recheck"
+                    + (f" --direction {direction}" if direction else ""))
+    else:
+        cmds.append("# ③ 全部批次「通过」后再合并："
+                    f"python tools/sci_method_extract.py --from sources --merge-dir {d} --recheck")
+    return cmds
+
+
+def run_auto(cfg, out_dir=None, topic=None, query=None, limit=48, batch_size=8,
+             min_hits=1, sources_dir=None, db_path=None, direction=None,
+             merge_dir=None, do_merge=False, cfg_error=None):
+    """--auto：preflight → plan_l2 → 写提示文件 → 状态 →（可选）合并 + recheck。
+
+    纯编排：**不调用任何 LLM**。返回 dict 供 main 渲染与 selftest 断言。
+    """
+    out_dir = resolve_dir(out_dir, os.path.join(K.VAULT, DEFAULT_L2_JOBS))
+    db_p = db_path or out_path(cfg or {})
+    pre = preflight(cfg, out_dir, topic=topic, query=query, limit=limit,
+                    batch_size=batch_size, min_hits=min_hits,
+                    sources_dir=sources_dir, db_path=db_p, cfg_error=cfg_error)
+    res = {"boundary": AUTO_BOUNDARY, "out_dir": out_dir, "db_path": db_p,
+           "preflight": pre, "aborted": not pre["ok"]}
+    if res["aborted"]:
+        return res
+    p, man = plan_l2(topic=topic, limit=limit, batch_size=batch_size,
+                     out_dir=out_dir, query=query, min_hits=min_hits,
+                     sources_dir=sources_dir)
+    res["manifest_path"], res["manifest"] = p, man
+    w = write_batch_prompts(out_dir, man)
+    res["prompts"], res["pruned"] = w["written"], w["pruned"]
+    st_dir = resolve_dir(merge_dir) if merge_dir else out_dir
+    st = batch_status(st_dir, sources_dir=sources_dir,
+                      manifest=man if st_dir == out_dir else None)
+    res["status"], res["status_dir"] = st, st_dir
+    res["next"] = next_commands(st, direction=direction)
+    if do_merge:
+        if not st["ready"]:
+            res["merge_skipped"] = (f"结果不齐全（缺 {st['counts']['missing']} 批 / "
+                                    f"校验失败 {st['counts']['invalid']} 批）")
+        else:
+            db, acc, rej, tst = merge_l2(st_dir, cfg, db_path=db_p,
+                                         sources_dir=sources_dir, direction=direction)
+            res["merged"] = {"accepted": len(acc), "rejected": len(rej),
+                             "quotes_checked": tst["checked"],
+                             "quotes_failed": tst["failed"],
+                             "db_records": db["meta"]["records"]}
+            dbb, bad = recheck_db(db_p)
+            res["recheck"] = {"value_unsupported": bad,
+                              "records": dbb["meta"]["records"]}
+    return res
+
+
+def render_counts(st):
+    c = st["counts"]
+    return (f"通过 {c['ok']} / 校验失败 {c['invalid']} / 缺结果 {c['missing']}"
+            f"（共 {st['total']} 批）" + ("；结果齐全，可合并" if st["ready"] else ""))
+
+
+def render_row(row):
+    return f"{row['batch_id']}  {STATUS_LABELS[row['state']]}  {row['detail']}"
+
+
+def render_status(st):
+    out = [f"[status] 批次目录：{_rel(st['out_dir'])}"]
+    if st.get("note"):
+        out.append(f"  [!] {st['note']}")
+    if not st["rows"]:
+        out.append("  （没有任何批次可判——先跑 --auto 生成清单与提示文件）")
+        return "\n".join(out)
+    for row in st["rows"]:
+        out.append("  " + render_row(row))
+    out.append("汇总：" + render_counts(st))
+    return "\n".join(out)
+
+
+def render_auto(res):
+    out = [f"[AUTO] 批次目录：{_rel(res['out_dir'])}"]
+    out.append("[preflight]")
+    for it in res["preflight"]["items"]:
+        out.append(f"  {it['level']:<4} {it['name']}：{it['detail']}")
+    if res.get("aborted"):
+        out.append("[中止] preflight 有 fail 项，未生成批次（先修掉上面标 fail 的项）")
+        return "\n".join(out)
+    man = res["manifest"]
+    out.append(f"[批次] {len(man['batches'])} 批 / {man['total_cards']} 张卡"
+               f"（每批 {man['batch_size']} 张）→ {_rel(res['manifest_path'])}")
+    out.append(f"[提示文件] {len(res['prompts'])} 个（自包含：schema + 本批卡路径 + "
+               f"输出文件名 + quote 纪律 + 禁止编造）")
+    for _, p in res["prompts"]:
+        out.append(f"     {_rel(p)}")
+    if res.get("pruned"):
+        out.append(f"[清理] 过期批次提示文件 {len(res['pruned'])} 个："
+                   + "、".join(res["pruned"]))
+    st = res["status"]
+    out.append(f"[状态] 目录 {_rel(res['status_dir'])}：{render_counts(st)}")
+    for row in st["rows"]:
+        out.append("     " + render_row(row))
+    if res.get("merged"):
+        m = res["merged"]
+        out.append(f"[合并] 接受 {m['accepted']}，拒绝 {m['rejected']}；"
+                   f"quote 校验 {m['quotes_checked']} 条，失败 {m['quotes_failed']}；"
+                   f"方法库 {m['db_records']} 条")
+        r = res.get("recheck") or {}
+        out.append(f"[recheck] value_in_quote=false {r.get('value_unsupported')} 条"
+                   f"（库内共 {r.get('records')} 条）")
+    elif res.get("merge_skipped"):
+        out.append("[合并] 跳过：" + res["merge_skipped"])
+    out.append("下一步：")
+    for c in res.get("next") or []:
+        out.append(f"     {c}")
+    return "\n".join(out)
 
 
 def _selftest():
@@ -750,6 +1290,175 @@ evidence_base: strong
                 all("techniques" in c for b in man2["batches"] for c in b["cards"]))
         finally:
             K.remove_temp_dir(tmp2)
+
+        # 方向归因：tag_direction 默认干跑，--apply 才写；重复打标必须幂等
+        tmp3 = K.make_temp_dir(prefix="sci_dir_")
+        try:
+            db_p = os.path.join(tmp3, "db.json")
+            db_fixture = {"meta": {"records": 2}, "methods": [
+                {"method_id": "source:卡A", "name_zh": "可控应力台架",
+                 "page_path": "wiki/sources/卡A.md", "directions": []},
+                {"method_id": "source:卡B", "name_zh": "别的方法",
+                 "page_path": "wiki/sources/卡B.md"}]}
+            with open(db_p, "w", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(db_fixture, ensure_ascii=False))
+            rows = tag_direction({"extraction": {}}, "锌沉积", ["卡A"], db_path=db_p)
+            chk("归因：只命中清单里的卡",
+                len(rows) == 1 and rows[0][0] == "source:卡A", str(rows))
+            back = json.load(open(db_p, encoding="utf-8"))
+            chk("归因：默认干跑不写库",
+                all(not m.get("directions") for m in back["methods"]))
+            tag_direction({"extraction": {}}, "锌沉积", ["卡A.md"], apply=True,
+                          db_path=db_p)
+            back = json.load(open(db_p, encoding="utf-8"))
+            chk("归因：--apply 后卡A 带方向、卡B 不带（.md 后缀也能认）",
+                back["methods"][0].get("directions") == ["锌沉积"]
+                and not back["methods"][1].get("directions"))
+            rows2 = tag_direction({"extraction": {}}, "锌沉积", ["卡A"], apply=True,
+                                  db_path=db_p)
+            back = json.load(open(db_p, encoding="utf-8"))
+            chk("归因：重复打标幂等（不重复追加）",
+                rows2[0][3] is True and back["methods"][0]["directions"] == ["锌沉积"],
+                str(back["methods"][0].get("directions")))
+        finally:
+            K.remove_temp_dir(tmp3)
+
+        # 8) 编排层：preflight / --auto 提示文件 / --status 三态 / 幂等 / 组合合并
+        tmp4 = K.make_temp_dir(prefix="sci_auto_")
+        try:
+            src4 = os.path.join(tmp4, "sources")
+            os.makedirs(src4)
+            body_a = "采用水热法合成样品，180 °C 保温 12 h，用 XRD 与 SEM 表征。"
+            body_c = "用 EIS 测阻抗，扰动 10 mV。"
+            for fn, txt in (("cardA.md", body_a), ("cardC.md", body_c)):
+                with open(os.path.join(src4, fn), "w",
+                          encoding="utf-8", newline="\n") as f:
+                    f.write(txt)
+            jobs4 = os.path.join(tmp4, "jobs")
+            db4 = os.path.join(tmp4, "db.json")
+            cfg4 = {"extraction": {}, "sci": {}}
+            sel = dict(query="XRD EIS", limit=10, batch_size=1, min_hits=1,
+                       sources_dir=src4)
+
+            pre = preflight(cfg4, jobs4, db_path=db4, **sel)
+            chk("编排：preflight 通过（config/选卡/卡可读/目录可写齐）",
+                pre["ok"] and len(pre["cards"]) == 2)
+            chk("编排：methods_db 缺失只 warn 不阻断",
+                any(i["name"] == "methods_db" and i["level"] == "warn"
+                    for i in pre["items"]))
+            pre_bad = preflight(cfg4, jobs4, db_path=db4, query="XRD EIS", min_hits=1,
+                                sources_dir=os.path.join(tmp4, "无此卡源目录"))
+            chk("编排：preflight 反例——卡源目录不存在判 fail", pre_bad["ok"] is False)
+            pre_no = preflight(cfg4, jobs4, db_path=db4, sources_dir=src4)
+            chk("编排：preflight 反例——缺 --topic/--query 判 fail", pre_no["ok"] is False)
+
+            res = run_auto(cfg4, out_dir=jobs4, db_path=db4, **sel)
+            chk("编排：--auto 切出 2 批并各写一个提示文件",
+                len(res["manifest"]["batches"]) == 2 and len(res["prompts"]) == 2
+                and all(os.path.isfile(p) for _, p in res["prompts"]))
+            ptxt = K.read_text(os.path.join(jobs4, "prompts", "batch_01.md"))
+            chk("提示文件：含该批卡的相对路径", "wiki/sources/cardA.md" in ptxt)
+            chk("提示文件：含 L2 schema 与 quote 纪律",
+                "L2 提取 schema" in ptxt and "连续子串" in ptxt and "no_method" in ptxt)
+            chk("提示文件：写明输出文件名与「禁止编造」",
+                "batch_01.json" in ptxt and "禁止编造" in ptxt)
+            chk("提示文件：写明本工具不调用任何 LLM",
+                "不调用任何 LLM" in ptxt and "子 agent" in ptxt)
+
+            before = {b: K.read_text(os.path.join(jobs4, "prompts", b + ".md"))
+                      for b in ("batch_01", "batch_02")}
+            man_before = json.dumps(res["manifest"]["batches"], ensure_ascii=False,
+                                    sort_keys=True)
+            res2 = run_auto(cfg4, out_dir=jobs4, db_path=db4, **sel)
+            after = {b: K.read_text(os.path.join(jobs4, "prompts", b + ".md"))
+                     for b in ("batch_01", "batch_02")}
+            chk("幂等：重跑提示文件逐字相同", before == after)
+            chk("幂等：重跑批次清单不变（不重复追加）",
+                json.dumps(res2["manifest"]["batches"], ensure_ascii=False,
+                           sort_keys=True) == man_before)
+
+            st0 = batch_status(jobs4, sources_dir=src4)
+            chk("状态：无结果时判「缺结果」并给出计数",
+                st0["counts"] == {"missing": 2, "invalid": 0, "ok": 0}
+                and st0["ready"] is False)
+            chk("状态：缺结果时下一步指向提示文件与 --status",
+                any("prompts/batch_01.md" in c for c in next_commands(st0))
+                and any("--status" in c for c in next_commands(st0)))
+
+            rec_a = {"card": "cardA", "name_zh": "水热法", "category": "合成",
+                     "parameters": [{"name": "温度", "value": "180", "unit": "°C",
+                                     "quote": "180 °C 保温 12 h"}],
+                     "characterization": [{"technique": "XRD", "quote": "XRD"}],
+                     "materials": [], "equipment": [], "steps": [], "key_metrics": []}
+
+            def _wb(bid, records):
+                with open(os.path.join(jobs4, bid + ".json"), "w",
+                          encoding="utf-8", newline="\n") as f:
+                    f.write(json.dumps({"records": records}, ensure_ascii=False))
+
+            _wb("batch_01", [rec_a])
+            st1 = batch_status(jobs4, sources_dir=src4)
+            chk("状态：合格批次判「通过」（1 通过 / 1 缺结果）",
+                st1["rows"][0]["state"] == "ok"
+                and st1["counts"] == {"ok": 1, "missing": 1, "invalid": 0})
+
+            with open(os.path.join(jobs4, "batch_02.json"), "w",
+                      encoding="utf-8", newline="\n") as f:
+                f.write("{ 这不是 JSON")
+            st_bad = batch_status(jobs4, sources_dir=src4)
+            chk("状态：坏 JSON 判「校验失败」且不崩",
+                st_bad["rows"][1]["state"] == "invalid"
+                and "JSON 解析失败" in st_bad["rows"][1]["detail"])
+
+            rec_bad = {"card": "cardC", "name_zh": "EIS", "category": "表征",
+                       "parameters": [{"name": "扰动", "value": "999", "unit": "mV",
+                                       "quote": "999 mV 扰动"}],
+                       "materials": [], "equipment": [], "steps": [],
+                       "characterization": [], "key_metrics": []}
+            _wb("batch_02", [rec_bad])
+            st2 = batch_status(jobs4, sources_dir=src4)
+            chk("状态：伪造 quote 判「校验失败」且计数到 N 条",
+                st2["rows"][1]["state"] == "invalid"
+                and st2["rows"][1]["quotes_failed"] == 1)
+            chk("状态：未全部通过时 ready=False", st2["ready"] is False)
+
+            rec_c = {"card": "cardC", "name_zh": "EIS 测阻抗", "category": "表征",
+                     "parameters": [{"name": "扰动", "value": "10", "unit": "mV",
+                                     "quote": "扰动 10 mV"}],
+                     "materials": [], "equipment": [], "steps": [],
+                     "characterization": [], "key_metrics": []}
+            _wb("batch_02", [rec_c])
+            st3 = batch_status(jobs4, sources_dir=src4)
+            chk("状态：全部通过时 ready=True 且计数 2/0/0",
+                st3["ready"] is True
+                and st3["counts"] == {"ok": 2, "missing": 0, "invalid": 0})
+            chk("状态：全部通过时下一步给 --merge-dir 命令",
+                any("--merge-dir" in c for c in next_commands(st3)))
+
+            res_m = run_auto(cfg4, out_dir=jobs4, db_path=db4, do_merge=True, **sel)
+            chk("组合：--auto + --merge-dir 结果齐全时合并入库",
+                os.path.isfile(db4) and res_m["merged"]["accepted"] == 2)
+            chk("组合：合并后自动 recheck 打标",
+                (res_m.get("recheck") or {}).get("records") == 2)
+
+            jobs5 = os.path.join(tmp4, "jobs5")
+            db5 = os.path.join(tmp4, "db5.json")
+            res_skip = run_auto(cfg4, out_dir=jobs5, db_path=db5, do_merge=True, **sel)
+            chk("组合：结果不齐时跳过合并（不写库）",
+                (not os.path.isfile(db5)) and bool(res_skip.get("merge_skipped")))
+
+            pdir = os.path.join(jobs4, "prompts")
+            foreign = os.path.join(pdir, "notes.md")
+            with open(foreign, "w", encoding="utf-8", newline="\n") as f:
+                f.write("用户自己的备注，任何情况下都不要删。\n")
+            stale = os.path.join(pdir, "batch_09.md")
+            with open(stale, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# 旧批次 · batch_09 方法提取任务\n> " + PROMPT_MARKER + "\n")
+            run_auto(cfg4, out_dir=jobs4, db_path=db4, **sel)
+            chk("清理：过期批次提示被删、用户文件保留",
+                (not os.path.isfile(stale)) and os.path.isfile(foreign))
+        finally:
+            K.remove_temp_dir(tmp4)
     finally:
         K.remove_temp_dir(tmp)
 
@@ -759,29 +1468,88 @@ evidence_base: strong
 
 # ---------------------------------------------------------------- CLI
 
+def _run_orchestrator(args):
+    """--auto / --status 的执行入口（编排层，不调用任何 LLM）。"""
+    cfg, cfg_err = load_config_safe()
+    out_dir = resolve_dir(args.out_dir, os.path.join(K.VAULT, DEFAULT_L2_JOBS))
+    print(AUTO_BOUNDARY)
+
+    if args.status and not args.auto:
+        st = batch_status(out_dir)
+        print(render_status(st))
+        print("下一步：")
+        for c in next_commands(st, direction=args.direction):
+            print(f"     {c}")
+        return 0 if st["ready"] else 1
+
+    db_p = out_path(cfg or {}, args.out)
+    merge_dir = resolve_dir(args.merge_dir) if args.merge_dir else None
+    res = run_auto(cfg, out_dir=out_dir, topic=args.topic, query=args.query,
+                   limit=args.limit or 48, batch_size=args.batch_size,
+                   min_hits=args.min_hits, db_path=db_p, direction=args.direction,
+                   merge_dir=merge_dir, do_merge=bool(merge_dir),
+                   cfg_error=cfg_err)
+    print(render_auto(res))
+    if args.status:
+        # --auto --status 组合：再报一次三态汇总（含合并后的状态）
+        print(render_status(res["status"]))
+    return 2 if res.get("aborted") else 0
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="实验方法结构化提取（Phase 2a：L1 概念页 / L2 source 卡）")
+    ap = argparse.ArgumentParser(
+        description=("实验方法结构化提取（L1 概念页 / L2 source 卡）+ 批次编排状态机"
+                     "（--auto / --status）\n\n" + AUTO_BOUNDARY),
+        epilog=("编排三件套（可恢复状态机）：\n"
+                "  1) python tools/sci_method_extract.py --from sources --auto "
+                "--topic 研究方向A --out-dir _scratch/l2\n"
+                "     → preflight + 切批 + 写 <out-dir>/prompts/batch_XX.md（幂等可重跑）\n"
+                "  2) 派子 agent 按提示文件提取，每批把结果写回 <out-dir>/batch_XX.json\n"
+                "  3) python tools/sci_method_extract.py --status --out-dir _scratch/l2\n"
+                "     → 逐批三态（缺结果 / 校验失败 N 条 / 通过）；通过则\n"
+                "       python tools/sci_method_extract.py --from sources "
+                "--merge-dir _scratch/l2 --recheck\n"
+                "  （--auto 可与 --merge-dir 组合：结果齐全时一路合并 + recheck）\n\n"
+                "🔴 边界：--status 的「通过」只表示**引文是原文连续子串**，"
+                "不表示提取得全、字段选得对。\n"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--from", dest="src", default="concepts", choices=["concepts", "sources"],
                     help="提取层级：concepts（规则收割）/ sources（子 agent 提取 + 校验合并）")
+    ap.add_argument("--auto", action="store_true",
+                    help="编排：preflight → 生成批次 → 写 <out-dir>/prompts/batch_XX.md "
+                         "→ 打印下一步（不调用 LLM；可与 --merge-dir 组合）")
+    ap.add_argument("--status", action="store_true",
+                    help="逐批三态（缺结果 / 校验失败 / 通过）+ 下一步命令；"
+                         "全部通过时退出码 0，否则 1")
     ap.add_argument("--topic", default=None,
-                    help="---from sources 用：方向名（读其 landscape.json 选卡）")
+                    help="---from sources / --auto 用：方向名（读其 landscape.json 选卡）")
     ap.add_argument("--query", default=None,
-                    help="---from sources 用：技术词（空格分隔），跨全库 source 卡按命中选卡"
+                    help="---from sources / --auto 用：技术词（空格分隔），跨全库 source 卡按命中选卡"
                          "（表征补全用，如 \"EIS XRD SEM XPS\"）")
     ap.add_argument("--min-hits", type=int, default=1,
                     help="---from sources --query 用：至少命中几种技术词（默认 1）")
     ap.add_argument("--out-dir", default=None,
-                    help="---from sources --plan 用：批次目录（默认 knowledge/l2_jobs；"
-                         "可指定子目录如 knowledge/l2_jobs/表征方法）")
+                    help="---from sources --plan / --auto / --status 用：批次目录"
+                         "（默认 knowledge/l2_jobs；可指定子目录如 knowledge/l2_jobs/表征方法）")
     ap.add_argument("--limit", type=int, default=None,
                     help="---from sources 用：抽多少张卡（默认 48）")
-    ap.add_argument("--batch-size", type=int, default=8, help="---from sources --plan 用：每批卡数")
+    ap.add_argument("--batch-size", type=int, default=8, help="---from sources --plan/--auto 用：每批卡数")
     ap.add_argument("--plan", action="store_true",
-                    help="---from sources：生成批次清单（不提交给 LLM，只落 manifest）")
+                    help="---from sources：只生成批次清单（manifest，不写提示文件、不提交 LLM）")
     ap.add_argument("--merge-dir", default=None,
-                    help="---from sources：合并该目录下的 batch_*.json（逐条 quote 校验）")
+                    help="---from sources：合并该目录下的 batch_*.json（逐条 quote 校验）；"
+                         "与 --auto 组合时结果齐全才合并")
     ap.add_argument("--recheck", action="store_true",
-                    help="---from sources：对已有库重跑「value 数字是否在 quote 里」并打标")
+                    help="---from sources：对已有库重跑「value 数字是否在 quote 里」并打标；"
+                         "与 --merge-dir 同时给出时在合并后执行")
+    ap.add_argument("--direction", default=None,
+                    help="---merge-dir 用：给本轮合入的方法打方向归因，如 \"锌沉积\"")
+    ap.add_argument("--tag-direction", default=None, metavar="DIR",
+                    help="只补标签：把该方向打到 --cards 列出的卡上（默认干跑）")
+    ap.add_argument("--cards", nargs="+", default=None,
+                    help="配合 --tag-direction：来源卡名列表（不含 .md 也行）")
+    ap.add_argument("--apply", action="store_true",
+                    help="配合 --tag-direction：真正写库（默认只打印计划）")
     ap.add_argument("--out", default=None, help="输出路径（默认取配置 sci.methods_db）")
     ap.add_argument("--json", action="store_true", help="结果 JSON 打印到 stdout")
     ap.add_argument("--no-write", action="store_true", help="不写盘")
@@ -791,14 +1559,13 @@ def main(argv=None):
     if args.selftest:
         return _selftest()
 
+    # ---- 编排层：--auto / --status（不需要 --from，也不调用任何 LLM）
+    if args.auto or args.status:
+        return _run_orchestrator(args)
+
     cfg = load_config()
 
     if args.src == "sources":
-        if args.recheck:
-            db, bad = recheck_db(out_path(cfg, args.out))
-            print(f"[ok] 重检：value_in_quote=false {bad} 条；"
-                  f"库内共 {db['meta']['records']} 条")
-            return 0
         if args.plan:
             if not args.topic and not args.query:
                 raise SystemExit("[!] --plan 需要 --topic 或 --query")
@@ -815,18 +1582,45 @@ def main(argv=None):
                 print(f"     {b['batch_id']}: {len(b['cards'])} 张")
             print(f"     清单: {os.path.relpath(p, K.VAULT)}")
             return 0
+        if args.tag_direction:
+            if not args.cards:
+                raise SystemExit("[!] --tag-direction 需要 --cards（来源卡名列表）")
+            rows = tag_direction(cfg, args.tag_direction, args.cards,
+                                 apply=args.apply, db_path=out_path(cfg, args.out))
+            print(f"[{'ok' if args.apply else 'dry-run'}] 方向「{args.tag_direction}」"
+                  f"命中 {len(rows)} 个方法（新增打标 "
+                  f"{sum(1 for r in rows if not r[3])} 个）")
+            for mid, name, dirs, already in rows:
+                print(f"     {'=' if already else '+'} {name}  [{mid}]"
+                      + ("" if already else f" → {dirs}"))
+            if not args.apply:
+                print("     [dry-run] 加 --apply 才写库")
+            return 0
+
         if args.merge_dir:
             merge_dir = args.merge_dir if os.path.isabs(args.merge_dir) \
                 else os.path.join(K.VAULT, args.merge_dir)
-            db, acc, rej, st = merge_l2(merge_dir, cfg, db_path=out_path(cfg, args.out))
+            db_p = out_path(cfg, args.out)
+            db, acc, rej, st = merge_l2(merge_dir, cfg, db_path=db_p,
+                                        direction=args.direction)
             print(f"[ok] 合并：接受 {len(acc)}，拒绝 {len(rej)}；"
                   f"quote 校验 {st['checked']} 条，失败 {st['failed']}")
             for r in rej[:8]:
                 print(f"     - {r['card']}: {r['reason']}")
             print(f"     方法库总计: {db['meta']['records']} 条")
-            print(f"     输出: {os.path.relpath(out_path(cfg, args.out), K.VAULT)}")
+            if args.recheck:
+                # 合并 + 重检是一套收尾（旧版 --recheck 会抢在 --merge-dir 前面，等于没合并）
+                dbb, bad = recheck_db(db_p)
+                print(f"[ok] 重检：value_in_quote=false {bad} 条；"
+                      f"库内共 {dbb['meta']['records']} 条")
+            print(f"     输出: {os.path.relpath(db_p, K.VAULT)}")
             return 0
-        raise SystemExit("[!] --from sources 需要 --plan 或 --merge-dir")
+        if args.recheck:
+            db, bad = recheck_db(out_path(cfg, args.out))
+            print(f"[ok] 重检：value_in_quote=false {bad} 条；"
+                  f"库内共 {db['meta']['records']} 条")
+            return 0
+        raise SystemExit("[!] --from sources 需要 --plan / --merge-dir / --recheck / --auto")
 
     concepts_dir = os.path.join(K.VAULT, (cfg.get("kb") or {}).get("concepts_dir")
                                 or "wiki/concepts")

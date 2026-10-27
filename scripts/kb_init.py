@@ -34,7 +34,7 @@ def read_lines(p):
 def _disp(p):
     try:
         return os.path.relpath(p)
-    except ValueError:                    # 跨盘符（C:\ vs E:\）
+    except ValueError:                    # 跨盘符（Windows 上两个不同盘符之间无相对路径）
         return p
 
 

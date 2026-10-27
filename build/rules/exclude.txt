@@ -5,9 +5,16 @@ kb_deabs.py                 # 迁移期工具：把硬编码旧路径改成 __fi
 kb_restructure.py           # 受控执行本库 Phase-2 结构精简；引用历史文件
 kb_fix_frontmatter_quotes.py # 一次性修复：frontmatter 内裸引号（已修完）
 kb_baseline.py              # 本库历史验收基线（硬编码期望值）
-# 调度脚本（out of MCP scope，随 OS 侧交付文档给用户）
+# 调度/OS 侧脚本（out of MCP scope，随交付文档给用户；且硬编码本机库根）
 lit_daily_task.ps1
 migrate-folder.ps1
+git_checkpoint.ps1          # 回滚点脚本：$Kb 默认值硬编码本机库根；属 OS 侧运维件
+# 配置与库内文档（真源含用户真实方向/邮箱/事故记录，一律不随包）
+lit_config.yaml             # 真源配置；kit 只发 scaffold/lit_config.template.yaml（去个人化模板）
+_README.md                  # 库内工具索引；经 build_kit 变换后落成 docs/TOOLS.md
+_MAINTENANCE.md             # 本库运维史（双运行时/junction/版本沿革）
+_INCIDENTS.md               # 本库事故记录
+_LIT-WATCH-NEXT.md          # 本库下一步待办
 # QC 审计/修复趟（绑本库历史语料；仅保留编码方法论的少数，见 build_kit.py 的 EXTRAS）
 qc_status.py qc_ledger.py qc_batch_progress.py qc_same_text.py qc_si_sweep.py
 qc_si_template_sweep.py qc_author_gate.py qc_author_gate_apply.py qc_find_ai_deps.py

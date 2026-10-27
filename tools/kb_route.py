@@ -31,6 +31,7 @@ L1 是「本库的当前综合」，L3 是「某篇论文某一段的字面表�
 
 import os
 import sys
+import glob
 import json
 import argparse
 
@@ -40,15 +41,19 @@ import kb_lib as K
 
 DEFAULT_BUDGET = {"L1": 5, "L2": 5, "L3": 8}
 
-# 类型 → wiki 子目录（**不能加 s 拼接**：entity → "entitys" 不存在，正确是 entities。
-# 这个坑在 kb_search.py 里已经踩过一次，此处一并显式化。）
-TYPE_DIR = {"concept": "concepts", "entity": "entities", "source": "sources",
-            "topic": "topics", "output": "outputs"}
+# 类型 → wiki 子目录（**不能加 s 拼接**：entity → "entitys" 不存在，正确是 entities）。
+# 🔴 2026-10-14：本文件与 `kb_search.py` 曾**各有一份**该常量（诊断 P1-4），
+#    现已收敛到 `kb_lib.TYPE_DIR`；此处保留同名别名以免既有引用断裂。
+TYPE_DIR = K.TYPE_DIR
 
 
 def _cite(name, ptype):
-    d = TYPE_DIR.get(ptype)
-    return f"[[{d}/{name}]]" if d else f"[[{name}]]"
+    """wikilink 用**页面真实路径**，不用「类型 → 目录」猜。
+
+    🆕 2026-10-22：项目卡 `type` 也是 `source`，按类型拼会得到
+    `[[sources/<卡名>]]`——指向一个不存在的 wiki 页。引用要能点开。
+    """
+    return K.cite_page(name, ptype)
 
 
 def _meta_and_bm():
@@ -91,22 +96,37 @@ def layer2(query, k, KS, meta, bm):
     for c in canon:
         qt.extend(K.tokenize(c))
     ranked = KS.bm25_score(qt, bm, canon, query_raw=query)
+    page_fm = K.load_page_fm(meta)               # 🆕 侧车/内嵌双读（2026-10-15）
     out = []
     for name, score in ranked:
         s, u, tags, al, t = KS.meta_of(meta, name)
         if t != "source":
             continue
-        # 补来源可靠性（检索层一直没用上的字段）
-        rel = ""
-        p = os.path.join(K.WIKI, "sources", name + ".md")
-        if os.path.exists(p):
-            fmr, _ = K.split_frontmatter(K.read_text(p))
-            fm = K.parse_frontmatter(fmr)
-            rel = str(fm.get("source_reliability") or "")[:160]
+        # 来源可靠性：**从索引取**，不再逐页 read_text（旧实现是 O(k) 文件 IO，每次查询都做）。
+        # 兼容旧索引：`page_fm` 缺席或该页无条目时回落到读盘一次（构建索引前的过渡态），
+        # 而不是静默给空串——**静默空值比慢更危险**（限定词一丢，L2 的立身之本就没了）。
+        rel = str((page_fm.get(name) or {}).get("source_reliability") or "")[:160]
+        if not rel:
+            # 回落到读盘。两个触发条件都要覆盖：
+            #   ① 旧索引没有 `page_fm` 侧车（索引构建前的过渡态）；
+            #   ② 侧车存在但**没有这一页**（项目卡在索引重建前就已被检索到）。
+            # 旧写法要求 `not page_fm`，于是 ② 会静默给空串——限定词丢失，L2 就只剩摘要。
+            # 🔴 2026-10-23：候选路径加上 `projects/*/sources/`。项目卡的
+            #   `source_reliability` 与 wiki 卡同等重要（165 张项目卡全部带该字段）。
+            cands = [os.path.join(K.WIKI, "sources", name + ".md")]
+            cands += glob.glob(os.path.join(K.VAULT, "projects", "*", "sources",
+                                            name + ".md"))
+            for p in cands:
+                if not os.path.exists(p):
+                    continue
+                fmr, _ = K.split_frontmatter(K.read_text(p))
+                rel = str(K.parse_frontmatter(fmr).get("source_reliability") or "")[:160]
+                if rel:
+                    break
         out.append({"layer": "L2", "name": name, "type": t,
                     "score": round(score, 3), "summary": s,
                     "source_reliability": rel,
-                    "citation": f"[[sources/{name}]]",
+                    "citation": _cite(name, t),
                     "path": KS.page_path(name, t)})
         if len(out) >= k:
             break
@@ -267,7 +287,7 @@ def main():
             if x.get("heading"):
                 print(f"      § {x['heading']}")
             if x.get("source_page"):
-                bits = [f"来源页 [[sources/{x['source_page']}]]"]
+                bits = ["来源页 " + K.cite_page(x['source_page'], 'source')]
                 if x.get("source_reliability"):
                     bits.append(f"可靠性={x['source_reliability'][:70]}")
                 print("      " + "  ".join(bits))
@@ -280,8 +300,5 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    K.console_encoding()
     sys.exit(main())

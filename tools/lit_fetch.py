@@ -37,15 +37,11 @@ from pathlib import Path
 
 # 🔴 不再用 `sys.stdout = io.TextIOWrapper(sys.stdout.buffer, ...)`：宿主若把 stdout
 #    换成没有 .buffer 的对象（测试台/嵌入环境），这一行在 **import 期**就 AttributeError。
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                            # noqa: BLE001
-    pass
 
 # 知识库共享库（同目录）——库根由 __file__ 推导；用于取 runs_dir 等配置路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kb_lib as K
+K.console_encoding()
 
 # ⚠️ 这里曾有 `socket.setdefaulttimeout(45)`（进程级全局副作用）。
 #    它会被**每个 import 本模块的脚本**继承：`lit_finish.py:81` 与
@@ -98,6 +94,9 @@ def _doi_tag(doi):
 # 这里是给 **PDF 文件名**用的 ISO4 形态（Nat. Commun.）——两者用途不同，勿混。
 JOURNAL_ISO4 = {
     "nature": "Nature", "science": "Science",
+    "science advances": "Sci. Adv.",
+    "proceedings of the national academy of sciences": "Proc. Natl. Acad. Sci. U.S.A.",
+    "journal of energy chemistry": "J. Energy Chem.",
     "chemical reviews": "Chem. Rev.", "accounts of chemical research": "Acc. Chem. Res.",
     "chemical society reviews": "Chem. Soc. Rev.",
     "journal of the american chemical society": "J. Am. Chem. Soc.",
@@ -454,6 +453,19 @@ def candidate_urls(p, institution_proxy=True, notes=None, cfg=None):
     return urls
 
 
+def _si_step(pdf_path, si_dir):
+    """判定 + 尝试取 SI（委托 lit_si；任何异常都降级为 unknown，不阻断主流程）。
+
+    返回 lit_si.fetch 的结果 dict；lit_si 不可用时返回 {"status": "unknown"}。
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import lit_si
+        return lit_si.fetch(pdf_path, si_dir=str(si_dir), apply=True, verbose=False)
+    except Exception as e:                                     # noqa: BLE001
+        return {"status": "unknown", "reason": f"lit_si 不可用：{type(e).__name__}: {e}"}
+
+
 def _dl_worker(u, box, idx):
     """在线程里下载单个 URL，结果（bytes/ctype/url 或异常）放回 box[idx]。
 
@@ -570,12 +582,28 @@ def fetch_one(p, outdir, tried_log, institution_proxy=True, cfg=None):
     return None, reasons
 
 
-def write_manifest(failed, path, label, download_dir):
+def _title_search_link(title):
+    """无 DOI / 无直链时的兜底可点击链接。
+
+    2026-10-22 定规：**凡是要人手动下载的条目，必须带可点击链接**——
+    只给标题等于让人自己去猜。DOI 缺失时给按标题的检索链接，仍满足"可点击"。
+    """
+    q = urllib.parse.quote_plus((title or "").strip()[:200])
+    return f"https://scholar.google.com/scholar?q={q}"
+
+
+def write_manifest(failed, path, label, download_dir, si_failed=None):
     lines = [f"# lit-watch 手动下载清单 · {label}", ""]
     lines.append(f"> 生成日期：{datetime.date.today().isoformat()}")
-    lines.append("> 下列文献阶段A已锁定方向，但阶段B 自动取全文失败（付费墙 / 风控挑战页 / 非PDF）。")
-    lines.append("> 请在浏览器点开 DOI 或直链下载 PDF，放入：")
-    lines.append(f"> `{download_dir}`")
+    if failed:
+        lines.append("> 下列文献阶段A已锁定方向，但阶段B 自动取全文失败（付费墙 / 风控挑战页 / 非PDF）。")
+        lines.append("> 请在浏览器点开 DOI 或直链下载 PDF，放入：")
+        lines.append(f"> `{download_dir}`")
+    if si_failed:
+        lines.append(">")
+        lines.append("> **📎 另有 %d 篇主文已下到、但补充材料（SI）没取到**——见文末「SI 待手动下载」。"
+                     % len(si_failed))
+        lines.append("> SI 放 `raw/pdf/si/<与主文同名>.si.<pdf|docx>`（`lit_si` 与 `lit_ingest` 都按这个名字找）。")
     lines.append("")
     for i, (p, reasons) in enumerate(failed, 1):
         doi = p.get("doi") or ""
@@ -585,15 +613,73 @@ def write_manifest(failed, path, label, download_dir):
         lines.append(f"- **通讯作者**：{p.get('corresponding_author','—')}")
         if doi:
             lines.append(f"- **DOI**：[{doi}](https://doi.org/{doi})")
+        if not (doi or p.get("oa_url") or p.get("pdf_url")):
+            lines.append(f"- **按标题检索**：[Google Scholar]({_title_search_link(p.get('title'))})")
         if p.get("oa_url"):
             lines.append(f"- **OA 页**：[打开]({p.get('oa_url')})")
         if p.get("pdf_url"):
             lines.append(f"- **PDF 直链**：[点击下载]({p.get('pdf_url')})")
         lines.append(f"- 自动失败原因：`{(reasons[0] if isinstance(reasons, list) and reasons else str(reasons))[:120]}`")
         lines.append("")
+
+    # —— 📎 SI 待手动下载（2026-10-22 定规：有 SI 但取不到，必须在这里提醒）
+    if si_failed:
+        lines.append("---")
+        lines.append("")
+        lines.append("## 📎 SI 待手动下载")
+        lines.append("")
+        lines.append("> 这 %d 篇**主文已入库**，但补充材料按当前通道取不到（反爬/需登录）。"
+                     % len(si_failed))
+        lines.append("> 全文里已确认它们**确有 SI**；取到后放到 `raw/pdf/si/`，"
+                     "命名 `<与主文同名>.si.<pdf|docx|xlsx>`。")
+        lines.append("")
+        for i, (p, r) in enumerate(si_failed, 1):
+            doi = p.get("doi") or ""
+            sc = r.get("scan") or {}
+            lines.append(f"### S{i}. {p.get('title','')}")
+            lines.append(f"- **期刊**：{p.get('journal','')}（{p.get('publication_date','')}）")
+            if doi:
+                lines.append(f"- **DOI**：[{doi}](https://doi.org/{doi})")
+            else:
+                lines.append(f"- **按标题检索**：[Google Scholar]({_title_search_link(p.get('title'))})")
+            if doi and doi.lower().startswith("10.1021/"):
+                lines.append(f"- **SI 页**：[ACS SI 专题页](https://pubs.acs.org/doi/suppl/{doi})")
+            elif doi and doi.lower().startswith("10.1126/"):
+                lines.append(f"- **SI 页**：[Science SI 页](https://www.science.org/doi/suppl/{doi})")
+            elif doi and doi.lower().startswith("10.1038/"):
+                lines.append("- **SI 页**：文章页底部 **Supplementary information**")
+            # 若是 Wiley 且扫描到了文件名，给文件级直链
+            for fn in (sc.get("filenames") or [])[:3]:
+                if doi:
+                    lines.append(f"- **SI 直链**：[⬇ {fn}]"
+                                 f"(https://onlinelibrary.wiley.com/action/downloadSupplement?"
+                                 f"doi={urllib.parse.quote(doi, safe='')}&file={urllib.parse.quote(fn, safe='')})")
+            if doi and doi.lower().startswith("10.1002/") and not (sc.get("filenames") or []):
+                lines.append(f"- **SI 区**：[Wiley Supporting Information]"
+                             f"(https://onlinelibrary.wiley.com/doi/{doi}#support-information-section)")
+            if doi and doi.lower().startswith("10.1149/"):
+                lines.append(f"- **SI 页**：[IOP suppdata](https://iopscience.iop.org/article/{doi}/suppdata)")
+            if doi and doi.lower().startswith("10.1039/"):
+                # RSC 的 article-supplement 直链需文章页上的编号，**不可由 DOI 推导** ⇒ 只给 DOI，
+                # 并注明去文章页文末取「Supplementary information」（不编造 URL）
+                lines.append("- **RSC 取法**：文章页文末 **Supplementary information**（新版 `article-supplement/…` 直链只在该页出现）")
+            ev = (sc.get("evidence") or [""])[0]
+            if ev:
+                lines.append(f"- 判定依据：`{ev[:140]}`")
+            if r.get("reason"):
+                lines.append(f"- 自动失败：`{r['reason'][:100]}`")
+            lines.append("")
+
     # 🔴 父目录不存在时 write_text 直接 FileNotFoundError（--manifest 常指向尚未创建的目录）
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text("\n".join(lines), encoding="utf-8")
+    txt = "\n".join(lines)
+    # 🔴 写后复算（2026-10-22 定规：手动下载项**必须**带可点击链接）。
+    #    按 `### ` 切块逐块数有没有 `](http`——没有就是"只给了标题，让人自己去找"，等于没给。
+    blocks = re.split(r"(?m)^### ", txt)[1:]
+    linkless = [b.splitlines()[0].strip() for b in blocks if "](http" not in b]
+    if linkless:
+        print(f"[warn] 手动下载清单有 {len(linkless)} 条没有下载链接：{linkless[:3]}")
+    Path(path).write_text(txt, encoding="utf-8")
     return str(Path(path))
 
 
@@ -720,7 +806,7 @@ def selftest():
 
     # 原子写：落正名、不留 .part（半截文件不得以最终名出现）
     import tempfile
-    at_dir = tempfile.mkdtemp(prefix="lit_fetch_atomic_")
+    at_dir = K.make_temp_dir(prefix="lit_fetch_atomic_")
     try:
         ap = Path(at_dir) / "x.pdf"
         _atomic_write_bytes(ap, b"%PDF-1.7 atomic")
@@ -779,6 +865,16 @@ def selftest():
         good = md_p.exists()
         print(f"  [{'ok' if good else 'FAIL'}] write_manifest 自建父目录 -> {good}")
         ok = ok and good
+
+        # 正例：**没有 DOI 的失败项也必须带可点击链接**（2026-10-22 定规）
+        md2 = Path(base_tmp) / "no-doi.md"
+        write_manifest([({"title": "A paper without DOI", "journal": "J",
+                          "publication_date": "2026"}, ["x"])],
+                       str(md2), "夹具2", manual_inbox())
+        txt2 = md2.read_text(encoding="utf-8")
+        good2 = "](http" in txt2
+        print(f"  [{'ok' if good2 else 'FAIL'}] 无 DOI 的失败项仍带可点击链接 -> {good2}")
+        ok = ok and good2
     except Exception as e:                        # noqa: BLE001
         print(f"  [FAIL] write_manifest 自建父目录 -> {type(e).__name__}: {e}")
         ok = False
@@ -840,25 +936,34 @@ def main():
     si_dir = Path(args.si_dir) if args.si_dir else (outdir / "si")
 
     ok, failed, tried = [], [], []
-    si_hits = []
+    si_hits, si_failed, si_none = [], [], []
     for i, p in enumerate(papers, 1):
         print(f"[{i}/{len(papers)}] {p.get('title','')[:80]}", flush=True)
         path, info = fetch_one(p, outdir, tried, institution_proxy=inst_proxy, cfg=cfg)
         if path:
             ok.append((p, path, info))
             print(f"  ✅ {Path(path).name}")
-            # 🆕 T0/T1 增强精读：尽力抓 SI（失败不影响主文）
-            if p.get("ingest_depth") == "enhanced":
-                si = fetch_si(p, si_dir)
-                if si:
-                    si_hits.append((p, si))
-                    print(f"    📎 SI 已获取：{Path(si).name}")
+            # 🔴 SI 随主文下载（2026-10-22 定规）：**不按 tier**，先判存在再取；
+            #    有 SI 但取不到 → 必须进手动下载清单，不得静默。
+            si_res = _si_step(path, si_dir)
+            if si_res.get("status") == "present":
+                si_hits.append((p, si_res["file"]))
+                print(f"    📎 SI 已获取：{Path(si_res['file']).name}")
+            elif si_res.get("status") == "missing":
+                si_failed.append((p, si_res))
+                print("    ⚠️ 有 SI 但没取到 —— 已列入手动下载清单")
+            elif si_res.get("status") == "no_si":
+                si_none.append((p, si_res))
+                print("    ⛔ 全文核查无 SI（综述/评论常见），不下载")
         else:
             failed.append((p, info))
             print(f"  ❌ 自动取全文失败（{len(info) if isinstance(info,list) else 1} 个来源均未拿到真 PDF）")
         time.sleep(0.6)   # 温和节流，避免触发风控
 
     print(f"\n===== 阶段B 结果：成功 {len(ok)} / 失败 {len(failed)} / 共 {len(papers)} =====")
+    if failed:
+        print("提示：失败项可先试浏览器兜底（真实 Edge + 类人鼠标）："
+              "python tools/lit_browser_fetch.py --latest --apply --import")
     for p, path, info in ok:
         print(f"  ✅ {p.get('title','')[:70]}\n     → {Path(path).name}")
     for p, info in failed:
@@ -869,6 +974,13 @@ def main():
                       "pdf": str(path)} for p, path, _ in ok],
               "si": [{"title": p.get("title"), "doi": p.get("doi"),
                       "si_pdf": str(si)} for p, si in si_hits],
+              "si_missing": [{"title": p.get("title"), "doi": p.get("doi"),
+                              "reason": r.get("reason", ""),
+                              "scan": r.get("scan", {}).get("verdict", "")}
+                             for p, r in si_failed],
+              "si_not_applicable": [{"title": p.get("title"), "doi": p.get("doi"),
+                                     "pages": r.get("scan", {}).get("pages", 0)}
+                                    for p, r in si_none],
               "failed": [{"title": p.get("title"), "doi": p.get("doi"),
                           "journal": p.get("journal"), "oa_url": p.get("oa_url"),
                           "reasons": info if isinstance(info, list) else [str(info)]}
@@ -889,15 +1001,25 @@ def main():
             K.lit_runs_dir(cfg, "downloads"),
             f"manifest-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.md")
         mp = write_manifest(failed, mpath, args.label or data.get("query", ""),
-                            manual_inbox(cfg))
+                            manual_inbox(cfg), si_failed=si_failed)
         print(f"手动下载清单(可点开): {mp}")
+    elif si_failed:
+        # 主文全下到了、但 SI 没取到：同样要落清单（用户规则：取不到必须提醒）
+        mpath = args.manifest or os.path.join(
+            K.lit_runs_dir(cfg, "downloads"),
+            f"manifest-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.md")
+        mp = write_manifest([], mpath, args.label or data.get("query", ""),
+                            manual_inbox(cfg), si_failed=si_failed)
+        print(f"📎 SI 手动下载清单(可点开): {mp}")
 
     # 🔴 退出码：全失败必须与"跑完了"区分开。
     #    旧实现无条件 `sys.exit(0)` —— 一批 20 篇全被风控挡回来，上层脚本读到的仍是"成功"，
     #    与 CLAUDE.md「失败要能被读出来」直接冲突。4 = 全部失败（与 lit_daily 同一语义）。
     if not ok:
         print(f"[!] 阶段B **全部失败**（{len(failed)}/{len(papers)} 篇均未取到真 PDF）"
-              f"⇒ 退出码 4；这通常不是「没有 OA 版本」，请按清单人工下载。", file=sys.stderr)
+              f"⇒ 退出码 4；这通常不是「没有 OA 版本」。先试浏览器兜底：\n"
+              f"    python tools/lit_browser_fetch.py --latest --apply --import\n"
+              f"    仍失败再按清单人工下载。", file=sys.stderr)
         sys.exit(4)
     sys.exit(0)
 

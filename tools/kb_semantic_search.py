@@ -30,18 +30,15 @@ import importlib.util
 import numpy as np
 
 # Windows 控制台 UTF-8
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kb_lib as K
+K.console_encoding()
 
 # ---------------------------------------------------------------- 路径常量
 EMBED_PATH = os.path.join(K.INDEX_DIR, "embeddings.npy")
 EMBED_MAP_PATH = os.path.join(K.INDEX_DIR, "embed_map.json")
+EMBED_HASH_PATH = os.path.join(K.INDEX_DIR, "embed_hashes.json")
 TFIDF_VECTORIZER_PATH = os.path.join(K.INDEX_DIR, "_tfidf_vectorizer.pkl")
 TFIDF_SVD_PATH = os.path.join(K.INDEX_DIR, "_tfidf_svd.pkl")
 BACKEND_MARKER_PATH = os.path.join(K.INDEX_DIR, "_embed_backend.json")
@@ -62,6 +59,7 @@ ST_MODEL_CANDIDATES = [
 _BACKEND = None       # "st" | "tfidf" | None
 _ST_MODEL = None
 _ST_MODEL_NAME = None  # 实际加载成功的模型名
+_ST_MODELS = {}        # {模型名: SentenceTransformer} —— 按索引标记精确复用
 _TFIDF_DATA = None    # {vectorizer, svd, embed_matrix}
 
 
@@ -117,8 +115,7 @@ def _write_backend_marker(backend, model=None, dim=None, pages=None):
         "pages": pages,
         "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    with open(BACKEND_MARKER_PATH, "w", encoding="utf-8") as f:
-        json.dump(marker, f, ensure_ascii=False, indent=1)
+    K.write_json_atomic(BACKEND_MARKER_PATH, marker, ensure_ascii=False, indent=1)
     return marker
 
 
@@ -153,7 +150,8 @@ def _configure_hf_endpoint():
         reachable = False
     if not reachable:
         os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-        print("  [i] huggingface.co 不可达，改用镜像 HF_ENDPOINT=https://hf-mirror.com")
+        print("  [i] huggingface.co 不可达，改用镜像 HF_ENDPOINT=https://hf-mirror.com",
+              file=sys.stderr)
     return os.environ.get("HF_ENDPOINT")
 
 
@@ -165,7 +163,14 @@ def _get_st_model(preferred=None):
     模型使用 HuggingFace 默认缓存目录（~/.cache/huggingface），不在 vault 内存储。
     """
     global _ST_MODEL, _ST_MODEL_NAME
-    if _ST_MODEL is not None:
+    # 🔴 必须按**索引标记的模型名**复用缓存。旧实现命中 _ST_MODEL 就直接返回，
+    #    服务预热过模型 A、索引却由 B 构建时，会用 A 的向量空间去查 B 的索引
+    #    （同维时无任何报错，排序静默失真）。
+    if preferred and preferred in _ST_MODELS:
+        _ST_MODEL = _ST_MODELS[preferred]
+        _ST_MODEL_NAME = preferred
+        return _ST_MODEL
+    if _ST_MODEL is not None and (not preferred or _ST_MODEL_NAME == preferred):
         return _ST_MODEL
     # 必须在导入 sentence_transformers / huggingface_hub 之前配置端点
     _configure_hf_endpoint()
@@ -179,13 +184,14 @@ def _get_st_model(preferred=None):
 
     for model_name, label in candidates:
         try:
-            print(f"  加载模型: {label} ...")
+            print(f"  加载模型: {label} ...", file=sys.stderr)
             _ST_MODEL = SentenceTransformer(model_name)
             _ST_MODEL_NAME = model_name
-            print(f"  模型已加载: {label}")
+            _ST_MODELS[model_name] = _ST_MODEL
+            print(f"  模型已加载: {label}", file=sys.stderr)
             return _ST_MODEL
         except Exception as e:
-            print(f"  [!] 模型 {label} 加载失败: {e}")
+            print(f"  [!] 模型 {label} 加载失败: {e}", file=sys.stderr)
     return None
 
 
@@ -220,12 +226,21 @@ def _encode_texts(texts, batch_size=64, show_progress=True,
     if backend == "st":
         model = _get_st_model(preferred=st_model_name)
         if model is None:
+            # 索引明确记录了构建模型 ⇒ 不得用别的后端冒充（静默降级已被报告点名）
+            if st_model_name:
+                raise RuntimeError(
+                    f"嵌入索引由模型 {st_model_name!r} 构建，但该模型当前不可用；"
+                    "拒绝改用其他模型/后端，请安装该模型或重建索引")
             if _try_import_sklearn():
                 print("  [!] sentence-transformers 模型不可用，降级到 TF-IDF + SVD")
                 backend = "tfidf"
             else:
                 raise RuntimeError("sentence-transformers 模型加载失败，且无 TF-IDF 降级方案")
         else:
+            if st_model_name and _ST_MODEL_NAME != st_model_name:
+                raise RuntimeError(
+                    f"嵌入索引由模型 {st_model_name!r} 构建，当前实际加载的是 "
+                    f"{_ST_MODEL_NAME!r}；同维也不得混用，请安装构建模型或重建索引")
             embeddings = []
             total = len(texts)
             for i in range(0, total, batch_size):
@@ -350,15 +365,21 @@ def _page_searchable_text(fields):
 
 
 def _scan_all_pages():
-    """扫描全部页面，返回 {name: {fields, text}}。"""
+    """扫描全部页面，返回 {name: {fields, text}}。
+
+    🆕 2026-10-22：含 `projects/*/sources/*.md`（项目文献卡）。
+    同名时 wiki 页优先——与 `kb_build_index.scan_pages` 保持同一规则。
+    """
     pages = {}
-    for path in K.iter_page_files():
+    for path in K.iter_page_files(include_projects=True):
         if K.is_excluded(path):
             continue
         raw = K.read_text(path)
         fm_raw, body = K.split_frontmatter(raw)
         fm = K.parse_frontmatter(fm_raw)
         name = os.path.splitext(os.path.basename(path))[0]
+        if name in pages and K.is_project_page(path):
+            continue
         fields = K.build_fields(name, fm, body)
         text = _page_searchable_text(fields)
         pages[name] = {"fields": fields, "text": text}
@@ -388,12 +409,15 @@ def build_embeddings(show_progress=True):
     else:
         actual_backend, actual_model = "tfidf", None
 
-    # 保存
+    # 保存：矩阵、映射、内容哈希必须来自同一次扫描
     os.makedirs(K.INDEX_DIR, exist_ok=True)
-    np.save(EMBED_PATH, embeddings)
+    with open(EMBED_PATH + ".tmp", "wb") as f:
+        np.save(f, embeddings)
+    os.replace(EMBED_PATH + ".tmp", EMBED_PATH)
     embed_map = {name: i for i, name in enumerate(names)}
-    with open(EMBED_MAP_PATH, "w", encoding="utf-8") as f:
-        json.dump(embed_map, f, ensure_ascii=False)
+    K.write_json_atomic(EMBED_MAP_PATH, embed_map, ensure_ascii=False)
+    K.write_json_atomic(EMBED_HASH_PATH,
+                        {n: K.content_hash(pages[n]["fields"]) for n in names})
     _write_backend_marker(actual_backend, model=actual_model,
                           dim=int(embeddings.shape[1]), pages=len(names))
 
@@ -463,9 +487,13 @@ def add_embeddings(page_rel_paths, show_progress=True):
             embeddings = np.vstack([embeddings, new_embeds[i:i+1]])
 
     # 保存
-    np.save(EMBED_PATH, embeddings)
-    with open(EMBED_MAP_PATH, "w", encoding="utf-8") as f:
-        json.dump(embed_map, f, ensure_ascii=False)
+    with open(EMBED_PATH + ".tmp", "wb") as f:
+        np.save(f, embeddings)
+    os.replace(EMBED_PATH + ".tmp", EMBED_PATH)
+    K.write_json_atomic(EMBED_MAP_PATH, embed_map, ensure_ascii=False)
+    K.write_json_atomic(EMBED_HASH_PATH,
+                        {n: K.content_hash(all_pages[n]["fields"])
+                         for n in embed_map if n in all_pages})
 
     print(f"[OK] 嵌入索引增量更新: {len(names_to_update)} 页")
     return True
@@ -492,7 +520,11 @@ def _load_meta():
 
 
 def _current_page_names():
-    """当前 wiki 下全部页面名（不含 .index 等）。"""
+    """当前参与检索的页面名 = wiki 页 + 项目卡（不含 .index 等）。
+
+    🆕 2026-10-22：项目卡已进嵌入索引；若此处只数 wiki 页，50 张卡会被判成
+    「幽灵条目」，freshness 永远 FAIL —— 校验器口径必须与索引口径一致。
+    """
     names = set()
     for d in K.PAGE_DIRS:
         full = os.path.join(K.WIKI, d)
@@ -501,6 +533,7 @@ def _current_page_names():
         for f in os.listdir(full):
             if f.endswith(".md"):
                 names.add(f[:-3])
+    names.update(K.project_page_paths().keys())
     return names
 
 
@@ -518,8 +551,40 @@ def diff_embed_coverage(indexed, current):
     return missing, stale, not missing and not stale
 
 
+def diff_embed_hashes(indexed, current):
+    """找出未记录哈希或同名内容已变化的页面。"""
+    changed = [n for n, h in current.items() if indexed.get(n) != h]
+    return sorted(changed), not changed
+
+
+def pages_newer_than(meta_path, page_paths):
+    """返回 mtime 晚于 meta_path 的页面名。
+
+    🔴 为什么需要这一层（2026-10-24 补）
+    ------------------------------------
+    旧实现把 `embed_hashes.json` 与 **`meta_full.json` 里记录的哈希**比较。
+    但 `meta_full.json` 本身是派生数据：改了页面却**没跑 `kb_build_index.py`** 时，
+    两边都还是旧值，freshness 判「新鲜」，语义检索继续返回旧向量且不报警。
+    这里用文件 mtime 做一道**廉价的前置门禁**：只要有页面比 meta_full 新，
+    就说明 meta（进而嵌入）已陈旧。内容级哈希比较仍保留在下一层。
+    纯函数（路径入参）以便 selftest 用临时文件反算。
+    """
+    try:
+        meta_mtime = os.path.getmtime(meta_path)
+    except OSError:
+        return None
+    newer = []
+    for p in page_paths:
+        try:
+            if os.path.getmtime(p) > meta_mtime:
+                newer.append(os.path.splitext(os.path.basename(p))[0])
+        except OSError:
+            continue
+    return sorted(set(newer))
+
+
 def check_index_freshness(embed_map, verbose=True):
-    """校验嵌入索引覆盖的页面集合与当前 wiki 页面集合是否一致。
+    """校验嵌入索引覆盖的页面集合、同名内容哈希是否与当前库一致。
 
     🔴 为什么必须有这个函数
     ----------------------
@@ -536,19 +601,42 @@ def check_index_freshness(embed_map, verbose=True):
     current = _current_page_names()
     indexed = set(embed_map.keys())
     missing, stale, ok = diff_embed_coverage(indexed, current)
+    changed = []
+    newer = []
+    if ok:
+        try:
+            with open(EMBED_HASH_PATH, encoding="utf-8") as f:
+                indexed_hashes = json.load(f)
+            with open(K.FULL_PATH, encoding="utf-8") as f:
+                full_pages = json.load(f).get("pages", {})
+            current_hashes = {n: full_pages[n]["hash"] for n in current
+                              if n in full_pages and full_pages[n].get("hash")}
+            changed, hash_ok = diff_embed_hashes(indexed_hashes, current_hashes)
+            changed = sorted(set(changed) | (current - set(current_hashes)))
+            # 页面文件比 meta_full 新 ⇒ meta（以及嵌入）已陈旧；见 pages_newer_than
+            newer = pages_newer_than(
+                K.FULL_PATH, list(K.iter_page_files(include_projects=True))) or []
+            changed = sorted(set(changed) | set(newer))
+            ok = hash_ok and len(current_hashes) == len(current)
+            ok = ok and not newer
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            changed = sorted(current)
+            ok = False
     if verbose and not ok:
-        print(f"[!] 嵌入索引与当前页面集合**不一致**：", file=sys.stderr)
+        print(f"[!] 嵌入索引与当前页面集合或内容**不一致**：", file=sys.stderr)
         print(f"      当前页面 {len(current)}  |  已嵌入 {len(indexed)}", file=sys.stderr)
-        print(f"      缺失 {len(missing)} 页（这些页面在语义检索下永远召回不到）",
+        print(f"      缺失 {len(missing)} 页｜同名内容变化/无哈希 {len(changed)} 页",
               file=sys.stderr)
-        for m in missing[:8]:
+        if newer:
+            print(f"      其中 {len(newer)} 页的文件 mtime 晚于 meta_full.json"
+                  f"（改页后未重建索引）", file=sys.stderr)
+        for m in (missing + changed)[:8]:
             print(f"        - {m}", file=sys.stderr)
-        if len(missing) > 8:
-            print(f"        ...（其余 {len(missing) - 8} 页）", file=sys.stderr)
         if stale:
             print(f"      幽灵条目 {len(stale)} 页（索引里有、库里已无）", file=sys.stderr)
-        print("      ⇒ 修复：python tools/kb_semantic_search.py --build", file=sys.stderr)
-    return missing, stale, ok
+        print("      ⇒ 修复：python tools/kb.py index build && "
+              "python tools/kb.py index embed", file=sys.stderr)
+    return sorted(set(missing + changed)), stale, ok
 
 
 def _meta_of(meta, name):
@@ -714,6 +802,37 @@ def selftest():
     print(f"  [{'ok' if good else 'FAIL'}] 正例 可迭代类型无关 -> ok={good}")
     ok = ok and good
 
+    changed, good = diff_embed_hashes({"A": "1"}, {"A": "1"})
+    cond = good and not changed
+    print(f"  [{'ok' if cond else 'FAIL'}] 同名同内容哈希判新鲜")
+    ok = ok and cond
+    changed, good = diff_embed_hashes({"A": "1"}, {"A": "2"})
+    cond = not good and changed == ["A"]
+    print(f"  [{'ok' if cond else 'FAIL'}] 同名内容修改必须判不新鲜")
+    ok = ok and cond
+
+    # 页面文件晚于 meta_full ⇒ 必须判 **陈旧**（否则「改页未重建」静默返回旧向量）
+    import tempfile
+    import time as _time
+    with K.temp_dir(prefix="kb_semantic_") as _td:
+        _mp = _os.path.join(_td, "meta_full.json")
+        _old = _os.path.join(_td, "old.md")
+        _new = _os.path.join(_td, "new.md")
+        for _p in (_mp, _old, _new):
+            with open(_p, "w", encoding="utf-8") as _f:
+                _f.write("x")
+        _now = _time.time()
+        _os.utime(_mp, (_now, _now))
+        _os.utime(_old, (_now - 10, _now - 10))
+        _os.utime(_new, (_now + 10, _now + 10))
+        _got = pages_newer_than(_mp, [_old, _new])
+        cond = _got == ["new"]
+        print(f"  [{'ok' if cond else 'FAIL'}] 🔴 页面晚于 meta_full 必须判陈旧 -> {_got}")
+        ok = ok and cond
+        cond = pages_newer_than(_os.path.join(_td, "missing.json"), [_old]) is None
+        print(f"  [{'ok' if cond else 'FAIL'}] 反例 meta 缺失返回 None（不猜）")
+        ok = ok and cond
+
     # 正例：真实索引可读且覆盖自洽（用真实数据反算一次）
     p = "wiki/.index/embed_map.json"
     if _os.path.exists(p):
@@ -770,15 +889,34 @@ def main():
     # 语义检索
     if args.query:
         results = semantic_search(args.query, top_k=args.k)
+        # 空结果有两种：真的没有正分命中 vs 索引缺失/过期。后者必须非零退出，
+        # 否则自动化会把「索引没建」当成「库里没有」。
+        if not results:
+            _emb, _emap = _load_embeddings()
+            if _emb is None or _emap is None:
+                return 3
+            _m, _s, _fresh = check_index_freshness(_emap, verbose=False)
+            if not _fresh:
+                return 3
         meta = _load_meta()
         _print_results(args.query, results, meta, args.json, mode="语义")
         return 0
 
-    # 混合检索
+    # 混合检索：兼容入口同样强制精排，不把 RRF 当作 reranker
     if args.hybrid:
-        results = hybrid_search(args.hybrid, top_k=args.k)
-        meta = _load_meta()
-        _print_results(args.hybrid, results, meta, args.json, mode="混合")
+        import kb_rag
+        try:
+            data = kb_rag.retrieve(args.hybrid, k=args.k, mode="hybrid")
+        except kb_rag.RetrievalUnavailable as exc:
+            print(f"[!] {exc}", file=sys.stderr)
+            return 3
+        if args.json:
+            print(K.json_dumps(data, ensure_ascii=False, indent=1))
+        else:
+            print(f'[混合+精排] 查询: "{args.hybrid}"   命中 {data["count"]} 条\n')
+            for item in data["results"]:
+                print(f"{item['rank']:>2}. [{item['type']}] {item['name']}   "
+                      f"{item['score']:.4f}")
         return 0
 
     ap.print_help()

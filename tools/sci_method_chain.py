@@ -19,7 +19,7 @@
   python tools/sci_method_chain.py --plan --filter "锌 电解液" --limit 24
   python tools/sci_method_chain.py --merge projects/sci-assistant/knowledge/io_jobs
   python tools/sci_method_chain.py --build
-  python tools/sci_method_chain.py --report projects/sci-assistant/protocols/锌-电解液
+  python tools/sci_method_chain.py --report projects/sci-assistant/protocols/方案A
   python tools/sci_method_chain.py --selftest
 """
 
@@ -257,26 +257,63 @@ def merge_io(merge_dir, methods=None, out_path=None):
 GENERIC_TERMS = {"电解液", "电解质", "溶剂", "共溶剂", "电池", "材料", "样品", "配方",
                  "数据", "结构", "结果", "性能", "实验", "体系", "基础", "候选", "溶液",
                  "电化学", "添加剂", "界面"}
+# 盐 / 溶剂 / 单位这类词几乎每篇电解液文章都出现：共享它们**不构成同一介质**。
+# 2026-10-21 实测：74 个方法建链时，仅因为都含 "LiFSI" 就凭空生出 26 条「术语共享」边，
+# 例如「三描述符溶剂筛选 → 阳极活化(ACVP)」。故把这些词排除在配对依据之外。
+COMMON_CHEM = {
+    # 锂/钠/锌盐与阴离子
+    "lifsi", "lipf", "lipf6", "lino3", "lino", "litfsi", "lifp", "tfsi", "fsi",
+    "otf", "kotf", "napf", "napf6", "naotf", "nafsi", "znso", "znso4", "zso",
+    "koh", "h2so4", "licl", "libr", "libf", "liso", "nanos",
+    # 溶剂（通用品名，不是某篇论文的专属介质）
+    "dme", "dmc", "dec", "emc", "ea", "ec", "pc", "fec", "vc", "tte", "hfe",
+    "thf", "dol", "dgl", "degdme", "dmso", "dmf", "nmp", "an",
+    # 单位 / 量词 / 泛词
+    "vol", "wt", "mol", "mah", "mm", "nm", "um", "kv", "khz", "mhz", "c",
+    "ma", "cm", "rpm", "g", "ml", "mg", "s", "h",
+}
 ALLOWED_TRANSITIONS = {("计算", "合成"), ("计算", "测试"), ("合成", "表征"),
                        ("合成", "测试"), ("表征", "计算"), ("表征", "测试"),
                        ("测试", "计算")}
 
 
 def _tokens(s):
-    """英文/型号 token（≥3 字符）+ 中文 3-gram；后者用于避免「电解液」这类空壳词命中。"""
-    s = norm_ws(s)
+    """只保留**型号型**英文标识：≥4 字符或含数字，且不在 COMMON_CHEM 里。
+
+    2026-10-21 改：原来是「英文 token + 中文 3-gram」，74 个方法时出现大量假匹配
+    （共享「数据集」「正极材料」「vol」也算术语共享）。现在只认具体型号/代号
+    （MTFP / NEDL / KMnPBA / THP-CN / BE-0.4Cy 这类），宁可少边也不要假边。
+    代价：纯中文的化合物名不再触发术语边，这类关系会落到「类别级（弱）」里。
+    """
     out = set()
-    for m in re.finditer(r"[A-Za-z][A-Za-z0-9\-]{2,}", s):
-        out.add(m.group(0).lower())
-    for run in re.findall(r"[\u4e00-\u9fff]{3,}", s):
-        for i in range(len(run) - 2):
-            out.add(run[i:i + 3])
-    return out - GENERIC_TERMS
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9\-]{2,}", norm_ws(s)):
+        t = m.group(0).lower()
+        if t in COMMON_CHEM or t in GENERIC_TERMS:
+            continue
+        if len(t) >= 4 or re.search(r"\d", t):
+            out.add(t)
+    return out
+
+
+def _same_artifact(a, b):
+    """两个产物名**字面相同/包含**时也算术语共享（不受 COMMON_CHEM 影响）。
+
+    之所以不只靠 token：像「基准电解液 BE（1.0 M LiPF₆ in EC:DEC）」这种名字里
+    全是通用盐/溶剂，token 全被排除，但**完全同名就是同一个介质**。
+    为防误伤，要求较短者 ≥6 字符，且包含时长者不超过短者的 1/0.6 倍。
+    """
+    x, y = norm_ws(a), norm_ws(b)
+    if len(x) < 6 or len(y) < 6:
+        return False
+    if x == y:
+        return True
+    short, long_ = (x, y) if len(x) <= len(y) else (y, x)
+    return short in long_ and len(short) >= 0.6 * len(long_)
 
 
 def term_overlap(a, b):
-    """术语配对：共享一个**非空壳** token（型号/化学式/中文 3-gram）。"""
-    return bool(_tokens(a) & _tokens(b))
+    """术语配对：共享具体型号，或两个产物名字面相同/包含。"""
+    return bool(_tokens(a) & _tokens(b)) or _same_artifact(a, b)
 
 
 def build_chains(io_doc=None, methods=None, include_typed=True, max_typed=24):
@@ -351,13 +388,21 @@ def build_chains(io_doc=None, methods=None, include_typed=True, max_typed=24):
         return out
 
     uni_strong = _dedupe(strong)
-    uni_weak = _balanced(_dedupe(weak), int(max_typed)) if include_typed else []
+    weak_pool = _dedupe(weak)
+    uni_weak = _balanced(weak_pool, int(max_typed)) if include_typed else []
     uniq = uni_strong + uni_weak
+    eligible = [m for m in methods
+                if m.get("tier") == "source" and m.get("category") in
+                ("合成", "表征", "测试", "计算")]
     doc = {"generated_at": datetime.date.today().isoformat(),
            "methods_with_io": len(io),
+           "coverage": {"l2_methods": len(eligible),
+                        "with_io": len(io),
+                        "share": round(len(io) / len(eligible), 3) if eligible else 0.0},
            "edges": uniq,
            "stats": {"edges": len(uniq),
                      "term_edges": len(uni_strong),
+                     "weak_pool": len(weak_pool),
                      "category_edges": sum(1 for e in uniq
                                            if e["evidence_level"] == "category"),
                      "same_card": sum(1 for e in uniq if e["same_card"]),
@@ -371,18 +416,36 @@ def build_chains(io_doc=None, methods=None, include_typed=True, max_typed=24):
 
 # ---------------------------------------------------------------- 报告
 
-def render_report(doc, methods=None):
+def render_report(doc, methods=None, filter_terms=None):
     by_id = {m.get("method_id"): m for m in (methods or [])}
+    cov = doc.get("coverage") or {}
+    cov_line = (f" ｜ 覆盖率 {cov.get('with_io')}/{cov.get('l2_methods')}"
+                f"（{cov.get('share', 0) * 100:.0f}% 的 L2 方法有 IO）"
+                if cov else "")
+    # 方向过滤：chains.json 是**全库**的，每个方向只该看自己那批方法的边
+    scope_line = ""
+    all_edges = doc.get("edges") or []
+    edges = all_edges
+    if filter_terms:
+        ids = {m.get("method_id") for m in select_methods(filter_terms, 999, methods)}
+        edges = [e for e in all_edges if e.get("from") in ids and e.get("to") in ids]
+        scope_line = (f" ｜ 本方向「{filter_terms}」{len(edges)} 条 / 全库 {len(all_edges)} 条")
+    st = doc["stats"]
+    same_level = st["edges"] - st.get("term_edges", 0) - st.get("category_edges", 0)
     L = ["# 方法链（产出 → 输入）", "",
          f"> 生成于 {datetime.date.today().isoformat()} ｜ 带 IO 的方法 {doc.get('methods_with_io')} 条"
-         f" ｜ 边 {doc['stats']['edges']} 条（术语共享 {doc['stats'].get('term_edges', 0)}"
-         f" / 类别级 {doc['stats'].get('category_edges', 0)}）",
+         f" ｜ 边 {st['edges']} 条（术语共享 {st.get('term_edges', 0)}"
+         f" / 类别级 {st.get('category_edges', 0)} / 同卡 {same_level}）" + cov_line + scope_line,
          "> ⚠️ 依赖关系是**推断**，不是作者明示的因果或先后；每条边都附两侧原文引文，使用前请核对。",
-         "> 「术语共享」边：产出物与输入物共享型号/化学式/中文词；"
-         "「类别级」边：只按方法类别与产物类型衔接，**不保证同一材料体系**，跨论文使用时需自行适配。", ""]
-    edges = doc.get("edges") or []
+         "> 「术语共享」边：产出物与输入物共享**具体型号/代号**（MTFP、NEDL、SRCE 这类），"
+         "或产物名字面相同；盐/溶剂/单位这类通用词**不算**共享。",
+         "> 「类别级」边：只按方法类别与产物类型衔接，**不保证同一材料体系**，跨论文使用时需自行适配。"
+         + (f"弱边候选 {doc['stats']['weak_pool']} 条，按「来源≤2 / 目标≤1」均衡只取前 "
+            f"{doc['stats'].get('category_edges', 0)} 条。" if doc['stats'].get("weak_pool") else ""),
+         ""]
     if not edges:
-        L.append("（没有可呈现的链：先跑 `--plan` / 子 agent 提取 / `--merge`）")
+        L.append("（没有可呈现的链：先跑 `--plan` / 子 agent 提取 / `--merge`"
+                 + ("；或本方向的方法还没有 IO" if filter_terms else "") + "）")
         return "\n".join(L) + "\n"
     L += ["## 链一览", "", "| # | 产出方法 | → | 输入方法 | 介质 | 证据类型 |",
           "|---|---|---|---|---|---|"]
@@ -420,20 +483,20 @@ def _selftest():
         body = norm_ws("先用水热法合成 LiFePO4 正极材料。随后用 XRD 表征其物相。")
         methods = [
             {"method_id": "source:A", "name_zh": "水热合成", "category": "合成",
-             "page_path": "wiki/sources/A.md"},
+             "tier": "source", "page_path": "wiki/sources/A.md"},
             {"method_id": "source:B", "name_zh": "XRD 物相分析", "category": "表征",
-             "page_path": "wiki/sources/B.md"},
+             "tier": "source", "page_path": "wiki/sources/B.md"},
         ]
         rec_a = {"method_id": "source:A",
-                 "produces": [{"artifact": "正极材料", "kind": "材料",
+                 "produces": [{"artifact": "LiFePO4 正极材料", "kind": "材料",
                                "quote": "水热法合成 LiFePO4 正极材料"}],
                  "requires": [{"artifact": "前驱体", "kind": "材料",
                                "quote": "先用水热法合成"}], "note": ""}
         rec_b = {"method_id": "source:B",
                  "produces": [{"artifact": "物相结果", "kind": "表征结果",
                                "quote": "用 XRD 表征其物相"}],
-                 "requires": [{"artifact": "正极材料", "kind": "材料",
-                               "quote": "正极材料"}], "note": ""}
+                 "requires": [{"artifact": "LiFePO4 正极材料", "kind": "材料",
+                               "quote": "LiFePO4 正极材料"}], "note": ""}
         clean, st = validate_io(rec_a, body, {"source:A", "source:B"})
         chk("校验：合法 quote 通过",
             clean is not None and len(clean["produces"]) == 1 and len(clean["requires"]) == 1,
@@ -461,6 +524,13 @@ def _selftest():
         chk("渲染：含引文与来源卡", "引文：" in md and "[[sources/" in md)
         chk("渲染：写明是推断、并区分术语共享/类别级",
             "推断" in md and "术语共享" in md and "类别级" in md)
+        # 方向过滤：全库 links 是 1 条，只含一端的方向应为 0 条并给出提示
+        md_two = render_report(doc, methods, filter_terms="水热 XRD")
+        md_one = render_report(doc, methods, filter_terms="水热")
+        chk("渲染：--filter 命中两端时保留该边",
+            md_two.count("\n### ") == 1 and "全库 1 条" in md_two, md_two[:80])
+        chk("渲染：--filter 只命中一端时过滤掉该边并提示",
+            md_one.count("\n### ") == 0 and "还没有 IO" in md_one, md_one[:120])
 
         # 反例：kind 不同不成边
         rec_c = {"method_id": "source:A", "produces": [{"artifact": "电解液配方",
@@ -470,6 +540,31 @@ def _selftest():
         doc2 = build_chains({"methods": {"source:A": rec_c, "source:B": clean}},
                             methods=methods)
         chk("建链：kind 不同不成边", doc2["stats"]["edges"] == 0)
+
+        # 反例：只共享「盐/溶剂名」不算术语共享（2026-10-21 用 74 个方法实测出的假边来源）
+        rec_salt_a = {"method_id": "source:A",
+                      "produces": [{"artifact": "1 M LiFSI 电解液（DME）", "kind": "配方",
+                                    "quote": "水热法合成 LiFePO4 正极材料"}],
+                      "requires": [], "note": ""}
+        rec_salt_b = {"method_id": "source:B",
+                      "produces": [],
+                      "requires": [{"artifact": "LiFSI/DME 高浓电解液", "kind": "配方",
+                                    "quote": "用 XRD 表征其物相"}], "note": ""}
+        doc3 = build_chains({"methods": {"source:A": rec_salt_a, "source:B": rec_salt_b}},
+                            methods=methods)
+        chk("建链：共享 LiFSI 不算术语共享（降级为类别级弱边）",
+            doc3["stats"]["edges"] == 1 and doc3["stats"]["term_edges"] == 0,
+            f"edges={doc3['stats']['edges']} term={doc3['stats']['term_edges']}")
+        # 正例对照：同一对若共享具体型号（MTFP），仍应是 term 边
+        rec_des_a = dict(rec_salt_a, produces=[{"artifact": "MTFP 电解液（1 M LiPF6）",
+                                                "kind": "配方",
+                                                "quote": "水热法合成 LiFePO4 正极材料"}])
+        rec_des_b = dict(rec_salt_b, requires=[{"artifact": "MTFP 电解液配方", "kind": "配方",
+                                                "quote": "用 XRD 表征其物相"}])
+        doc4 = build_chains({"methods": {"source:A": rec_des_a, "source:B": rec_des_b}},
+                            methods=methods)
+        chk("建链：共享具体型号（MTFP）仍判术语共享",
+            doc4["stats"]["term_edges"] == 1, str(doc4["stats"]))
 
         # 计划：增量提取（跳过已有 IO）、批次编号起点、清单另存
         # 反例保护：若不传 skip_existing，两个方法都会被排进计划
@@ -575,10 +670,12 @@ def main(argv=None):
         out_dir = args.report if os.path.isabs(args.report) else os.path.join(K.VAULT, args.report)
         os.makedirs(out_dir, exist_ok=True)
         target = os.path.join(out_dir, "chains.md")
-        text = render_report(doc, load_methods())
+        text = render_report(doc, load_methods(), filter_terms=args.filter)
         with open(target, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-        print(f"[ok] 报告：{os.path.relpath(target, K.VAULT)}")
+        n = text.count("\n### ")
+        print(f"[ok] 报告：{os.path.relpath(target, K.VAULT)}"
+              f"（{n} 条边" + (f"；方向「{args.filter}」" if args.filter else "") + "）")
         return 0
 
     ap.print_help()

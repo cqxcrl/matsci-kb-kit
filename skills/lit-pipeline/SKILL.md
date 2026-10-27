@@ -17,7 +17,8 @@ whenToUse: "当会话工作目录在 <库外路径> 内，且任务涉及文献�
 ## 库根与入口
 
 - 库根：`<你的库根>`；所有命令在此目录执行。
-- 引擎：`tools/lit_*.py`（发现/取全文/提取/建卡/收编/批量/收尾/体检）。
+- 引擎：`tools/lit_*.py`（发现/取全文/提取/建卡/二次加工/收编/批量/收尾/体检）。
+- 调用入口：可用 `python tools/kb.py lit <operation> ...`；全部参数用 `python tools/kb.py tools --json` 查询。
 - 配置唯一来源：`tools/lit_config.yaml`（刊白名单与 tier、路径、去重源、`automation.directions`）。
 - 与 skill `lit-watch` 的关系：那边讲怎么跑；本文件讲本库的**具体取值与红线**。
 
@@ -67,9 +68,9 @@ python tools/kb_toolcheck.py          # 实跑全部工具（分母以输出为�
 
 | 命令 | 耗时 | 说明 |
 |---|---|---|
-| `kb_build_index.py` | 秒级 | **必跑**，否则新页不进 BM25 |
-| `kb_semantic_search.py --add <页>` | 增量 | 语义索引（全量 `--build` 约 110s） |
-| `kb_corpus.py --build` | ~66s | raw 全文分块索引 |
+| `kb.py index build` | 秒级 | **必跑**，否则新页不进 BM25 |
+| `kb.py index embed [页...]` | 增量/全量 | 语义索引与同名内容哈希 |
+| `kb.py index corpus` | 约 1 分钟 | raw 全文分块、真实行号/字符区间与文件哈希 |
 | `kb_dois.py` | 冷 ~1.1s / 热 ~0.6s | 去重清单（有 mtime 缓存；`--full` 强制全量） |
 | `lit_catalogue.py` | 冷 ~6s / 热 ~0.6s | 去重目录（同上；缩水 >5% 会**拒绝覆盖**并退 4） |
 | `qc_base_check.py` | 快 | 五个 `.base` 选中集合重算 + 漂移守门 |
@@ -86,6 +87,23 @@ python tools/kb_toolcheck.py          # 实跑全部工具（分母以输出为�
 
 门禁报 **2** 时**不许当成功**：工具**不替你补链**（会凭空造出错误关联），
 只把缺口写进 `runs/gate-<时间戳>.json`。补链是人的活。
+
+## 证据化二次加工（2026-10-24）
+
+`lit_ingest` 只建骨架；`lit_enrich` 负责把外部 LLM 的结构化提案校验后写入 wiki source，不绑定模型厂商：
+
+```bash
+python tools/kb.py lit enrich request --page sources/X.md --json > request.json
+# 外部 LLM 按 request.output_contract 生成 proposal.json
+python tools/kb.py lit enrich apply --proposal proposal.json --json          # 默认干跑
+python tools/kb.py lit enrich apply --proposal proposal.json --apply --json # 备份后写页
+```
+
+硬约束：每条 claim 必须带 `evidence.path/line_start/line_end/quote`；证据只能是库内已存在 Markdown，
+行号为 1-based 闭区间，quote 必须在指定行内逐字存在。路径穿越、错行、错 quote、空 summary、无证据 claim
+都会整体拒绝且不写页。写入采用备份 + 校验写盘 + 幂等标记段，保留其他 frontmatter 和正文。
+`source_reliability` 只提升为「已做带原文定位的 LLM 二次加工；仍须人工复核」，**不等于人工精读完成**。
+本轮不批量改写既有页面；二次加工后仍需人工审阅，再运行 `kb.py index build/index embed` 和 `kb.py doctor`。
 
 ## 已知坑（都踩过，写在代码注释里）
 

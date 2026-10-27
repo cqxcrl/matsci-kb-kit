@@ -11,25 +11,33 @@
 ⇒ **做对应工作前先加载对应技能，不要凭本文件的摘要硬做。**
 
 `lit-pipeline` 文献流水线本地约定 ｜ `lit-watch` 文献发现→下载→建卡全链 ｜
-`kb-query` 库内检索与作答 ｜ `kb-lint` 健康检查与补链
+`lit-browser-fetch` 浏览器兜底下载（自动取全文失败后补正文与 SI） ｜
+`kb-query` 库内检索与作答 ｜ `kb-lint` 健康检查与补链 ｜ `kb-onboard` 建库访谈
 
-🔴 **技能真源在 `.dsh/skills/`**；技能仅在**项目根**被发现。
+🔴 **技能真源在 `.dsh/skills/`**；`scripts/kb_init.py` 会同时复制一份进 `.claude/skills/`
+（Claude Code 只从后者发现项目技能）。技能仅在**项目根**被发现。
 
 ---
 
 ## 目录结构
 
-**顶层 5 个目录**：
+**顶层 5 个目录**（页数 / 文件数一律以工具实算为准，本文件不写死数字）：
 
 | 目录 | 层 | 说明 |
 |---|---|---|
-| `wiki/` | 知识层 | `concepts/` `entities/` `sources/` `topics/` `outputs/` ＋ 根下**元文件** `index.md` `tags.md` `log*.md` ＋ `.index/`（派生数据，可重建） |
-| `raw/` | 资料层 | `pdf/` `text/`(全文提取 md) `clippings/`(剪藏) `assets/`(正文图) `notes/`(运行产物) |
-| `tools/` | 工具层 | `kb_*.py` 检索层 ｜ `lit_*.py` **文献获取层** |
-| `projects/` | 工程层 | 可选：与知识层分离的写作/工程 |
-| `_archive/` | 归档层 | **只移不删** |
+| `wiki/` | 知识层 | `concepts/` `entities/` `sources/` `topics/` `outputs/` `experiments/`（实验方案，`type: experiment`）＋ 根下**元文件** `index.md` `tags.md` `log*.md` ＋ `.index/`（派生数据，可重建）。页数见 `python tools/kb_stats.py` |
+| `raw/` | 资料层 | `pdf/` `text/`(全文提取 md) `clippings/`(剪藏) `assets/`(正文图) `notes/`(运行产物)。`pdf/` 与 `text/` 可按学科分子目录 |
+| `tools/` | 工具层 | `kb.py` **统一入口**（`ask/search/route/corpus/resolve/stats/doctor/index/serve/lit/qc/sci/lint/toolcheck/tools/selftest`）｜ `kb_*.py` 检索层（含 `kb_rag.py` 传统 RAG、`kb_agentic.py` Agentic RAG、`kb_serve.py` 常驻服务、`kb_manifest.py` 静态工具清单）｜ `qc_*.py` 质检层 ｜ `lit_*.py` **文献获取层**（含 `lit_enrich.py` 证据化二次加工、`lit_si.py` 补充材料判定/获取、`lit_browser_fetch.py` 浏览器兜底） |
+| `projects/` | 工程层 | 可选：与知识层分离的写作 / 工程（综述稿、科研辅助等）。项目卡可进检索层，但与 wiki 统计口径不同 |
+| `_archive/` | 归档层 | **只移不删**；建议分组 `restructure/` `lit-watch/` `qc/` `retired/`(含隔离区 `quarantine/`) `scratchpad/` |
+
+> 🆕 **不计入知识层的两个目录**：`_scratch/`（gitignored 工作区，存备份 / 任务草稿 / 绘图中间件）
+> 与 `.dsh/`（项目技能真源）。
+> ⚠️ `_scratch/` 下若有**在用备份**，不可当临时垃圾整目录清理。
 
 ⚠️ 根下 `*.base` 是 Obsidian 核心插件 Bases，**不是** Dataview（两者语法不同，勿混）。
+
+> **工具链全部用 `__file__` 派生库根**：库文件夹改名、整体搬迁都不需要改任何脚本。
 
 ## 页面规范
 
@@ -45,7 +53,7 @@
 ---
 created: YYYY-MM-DD
 updated: YYYY-MM-DD        # 每次实质性编辑时更新
-type: entity | concept | source | topic | output
+type: entity | concept | source | topic | output | experiment
 tags: [tag1, tag2]
 aliases: [别名1, 别名2]     # 便于 wikilink 引用
 summary: "一句话摘要"        # 用于 index.md
@@ -71,7 +79,7 @@ source_url: "https://doi.org/…"   # 🆕 2026-10-06：**每个 source 页必�
 #   取值优先级：① 真实 DOI → `https://doi.org/<DOI>`；② arXiv 预印本 →
 #   `https://arxiv.org/abs/<id>`；③ 微信公众号/其他 → 官网原文 URL。
 #   ⚠️ 只接受 **frontmatter `doi:` 字段**或 raw 原文中定位到的 DOI，**不得用页面正文里
-#   被引文献的 DOI**（会把链接指到别的论文）。
+#   被引文献的 DOI**（会把链接指到别的论文）。新增 source 页须同步回填，缺失会被 lint 拦下。
 authors_source: "…"   # 仅当 authors 值**库内不可回溯**时写，声明其实际出处
 #   触发条件：raw 回链中检索不到作者/单位信息栏（publisher HTML 剥空等）。
 #   ⚠️ 此时**不得**把已正确但无出处的作者值抹掉——应保留并加此字段声明不可追溯。
@@ -112,6 +120,9 @@ authors_source: "…"   # 仅当 authors 值**库内不可回溯**时写，声�
      （**带 `[[ ]]`，含子目录，不能只写文件名**）。这是摄入统计的唯一依据，漏写即被误判「未摄入」。
    - **必须写 `source_url`**：可点击原文链接（`https://doi.org/<DOI>` / arXiv）。取值只认
      frontmatter `doi:` 或 raw 原文 DOI，**不得用正文里被引文献的 DOI**。`lit_ingest.py` 已自动带。
+   - `lit_ingest` 骨架须再做**证据化二次加工**：`kb.py lit enrich request --page sources/X.md` 生成请求，
+     外部 LLM 提交 proposal，`apply` 默认干跑、确认后 `--apply`。每条 claim 必须有指定行内逐字 quote；
+     机器加工后仍须人工复核，不能冒充精读。
 4. **更新实体/概念页面**（无则建、冲突标 `> ⚠️ 矛盾：`、改则 `updated`）。
    **新建/大改 concept、topic 页后重算 `evidence_base`**：`python tools/qc_evidence_base.py --apply`
 5. **作者字段门禁（必做）**：写 `authors`/`corresponding_author`/`institution` 前先确认
@@ -120,9 +131,11 @@ authors_source: "…"   # 仅当 authors 值**库内不可回溯**时写，声�
    跑 `qc_author_gate.py` 复查、`qc_author_gate_apply.py --apply` 补声明。
    AI 分析报告类来源页 → 一律走 Crossref / OpenAlex 反查。
 6. **强制补链（不可省略）**：每个**新建**页面出链 ≥2、**且**入站 ≥1（在既有页补 `[[新页面]]`）。
-   先 `kb_search.py "<主题>" -k 8` 找互链对象。孤立页是检索质量头号杀手。
-7. **更新 `index.md`** → 8. **刷新索引** `kb_build_index.py`（增量秒级；语义加 `--embed`）
+   先 `kb.py search "<主题>" -k 8` 找互链对象。孤立页是检索质量头号杀手。
+7. **更新 `index.md`** → 8. **刷新索引** `kb.py index build`，并按影响面跑 `index embed` / `index corpus`
    → 9. **追加 `log_ops.md`**（`## [日期] ingest | 资料标题`）
+   → 10. **向用户汇报时，把本次新建/大改的卡片与页面用 wikilink 列成可点击清单**
+   （如 `[[sources/2026-xxx.md]]`、`[[concepts/yyy.md]]`）——**只给路径或纯文本标题＝未完成**。
 
 #### 🆕 更正流程：更正任何数字/表述前必做「全库同源检索」
 
@@ -137,26 +150,29 @@ authors_source: "…"   # 仅当 authors 值**库内不可回溯**时写，声�
 
 触发：用户提问。
 
-**检索层优先**（BM25 中文 + 别名扩展 + 语义 + 混合），**不要**先读 `index.md` 全表：
+**统一入口 `kb.py`，不要先读 `index.md` 全表**：
 
-1. **`python tools/kb_route.py "<查询>"`**（**首选**，分层取证 L1/L2/L3 不混排）；
-   需要时 `kb_search.py "<关键词>" -k 10`（`--json` / `--type` / `--semantic` / `--hybrid`）
-2. **阅读**排名前 3-8 的候选页全文（`Read`），顺 wikilink 追一层
-3. **综合回答**，附 `[[页面名]]` 引用
-4. 有长期价值 → 询问是否存 `wiki/outputs/`
+1. **简单事实**用 `python tools/kb.py ask "<查询>" --strategy simple --json`；
+   **比较/机制/争议/多子问题/证据核验**用 `--strategy agentic`，不确定用 `auto`。
+2. 传统 hybrid 为 **BM25 + 向量 → RRF → 本地 CrossEncoder → Top-K**；精排失败必须显式报错，不得静默降级。
+   也可显式 `kb.py search "<关键词>" --mode hybrid -k 10 --json`。
+3. Agentic 返回有界步骤、分层去重证据、gaps 与 `synthesis_request`，由调用方模型综合，不内置外部 LLM。
+4. **阅读**关键候选与 L2/L3 原文定位，**综合回答**附 `[[页面名]]` 和必要的原文行号。
+5. 有长期价值 → 询问是否存 `wiki/outputs/`。
 
-> 仅「全貌浏览」时才读 `wiki/index.md`。进阶协议见 §Agentic RAG 检索协议。
+> 仅「全貌浏览」时才读 `wiki/index.md`。进阶协议见技能 `kb-query`。
 
 ### 检索层工具（tools/）
 
-各脚本用法用 `--help` 或 `--stats` 查看；命令与参数以脚本自身为准，此处不赘列。
+全部工具与参数用 `python tools/kb.py tools --json` 静态生成；该命令不导入或执行被扫描脚本。
+旧 `kb_search.py` / `kb_route.py` / `kb_semantic_search.py` 等是薄兼容层，新调用优先 `kb.py`。
 
-**🔴 首选入口：`kb_route.py`（分层上下文包）**——一次调用拿到带引用的分层证据：
+**🔴 兼容分层证据包**：
 
 ```bash
-python tools/kb_route.py "固态电解质 界面 稳定性"          # L1 综合 / L2 文献卡 / L3 原文
-python tools/kb_route.py "<查询>" --budget 5,5,8 --json    # 机器可读
-python tools/kb_route.py "<查询>" --layer 1                # 只要综合层
+python tools/kb.py route "固态电解质 界面 稳定性" --budget 5,5,8
+python tools/kb.py route "<查询>" --layer 1
+python tools/kb.py corpus "<原文字段>" -k 8 --json
 ```
 
 分层**不是**为了好看：L1 是「本工具链的当前综合」，L3 是「某篇论文某一段的字面表述」，
@@ -167,12 +183,45 @@ python tools/kb_route.py "<查询>" --layer 1                # 只要综合层
 **完整工具表与选型规则见技能 `kb-query`（检索层）与 `kb-lint`（质检层）。**
 此处只留三条**不可由 `--help` 推导**的要点：
 
-- 🔴 检索首选 `kb_route.py`（分层取证，L1/L2/L3 不混排）；查询类问题**不要**先读 `index.md` 全表。
+- 🔴 检索首选 `kb.py ask/search`；需要旧分层包时用 `kb.py route`，查询类问题**不要**先读 `index.md` 全表。
 - 🔴 断言「库内无 X」**必跑** `python tools/kb_where.py "X"`（跨四目录、**逐目录报命中数**；见 §已知陷阱 的「四目录完备检索」）。
+- 🆕 **项目卡已进检索层**（2026-10-22）：`projects/*/sources/*.md` 会被 `kb_search` / `kb_route` / `kb_graph` / 语义索引命中。
+  ⚠️ **统计口径已分裂，勿混用**：`kb_lint.py` 的页面扫描仍**只数 wiki 页**（`iter_page_files` 默认 `include_projects=False`）；
+  而 `kb_stats.py` 读 `meta_full.json`，**已把项目卡计入**（2026-10-24：1099 页＝wiki 934 ＋ 项目卡 165，其中 source 842）。
+  新建卡后跑一次 `kb_build_index.py`（全量扫描会带上；`--add` 需给库根相对路径）。
+- 🆕 **`kb.py tools --json | python …` 在 Windows 下会 `JSONDecodeError`**：不是输出不合法，
+  而是管道另一端按 GBK 解码 UTF-8。改为**重定向到文件 ＋ `python -X utf8` 读取**；
+  **不要**为此改 `kb.py` 的编码。
 - 各脚本用法以 `python tools/<脚本>.py --help` 或 `--stats` 为准，本文不赘列。
 
 **文献获取层（`lit_*.py`）**：五阶段流水线与去重、期刊分级细节见技能 `lit-pipeline`。
 配置唯一来源 `tools/lit_config.yaml`（路径一律相对库根）。
+
+##### 🔴 SI（补充材料）随主文下载 —— 强制，不按 tier（2026-10-22 定规）
+
+**下载任何一篇文献时都必须先判「它有没有 SI」**；**研究论文有 SI 的一律随主文取回，
+取不到必须进手动下载清单**；综述/评论若确无 SI 则不下。工具：`tools/lit_si.py`。
+
+1. **判存在（判据只能是原文）**：`python tools/lit_si.py scan "<PDF>"`
+   —— 逐页扫 `supporting/supplementary information|data|materials`、
+   `Electronic supplementary information`、`Supplementary material for this article`、
+   `SupportingFile: <文件名>`，并**二次核验 `Fig. S#` / `Table S#` 引用**。
+   有声明**或**有 S-编号引用 ⇒ 有 SI；两者皆无 ⇒ `not_applicable`。
+2. **先自动取**：`python tools/lit_si.py fetch "<PDF>" --apply`。
+   可直接推直链的**只有三家**：Nature/Springer（`static-content.springer.com/.../MediaObjects/...`，
+   年份取卡片 `year:`，DOI 里的 `026` 是截断值）、Elsevier（`ars.els-cdn.com/...-mmc1.docx`，
+   PII 走 Crossref；**不过 Cloudflare**）、Wiley（文件名从 PDF 的 `SupportingFile:` 读，
+   拼 `action/downloadSupplement?doi=…&file=…`）。RSC/ACS/Science/IOP 对脚本 403/302 ⇒ 进清单。
+3. **失败必须进清单**：`lit_fetch` 会把「有 SI 但没取到」写进手动下载清单的
+   **📎 SI 待手动下载**小节（带 DOI、SI 专题页、Wiley 文件级直链）。**不得静默跳过。**
+   🔴 **小节里每一条都必须带可点击链接**，只写标题不算（见 §通用规则·始终做）。
+4. **写进卡**：`present`（已取）/ `missing`（有 SI 未取，**必须在清单里**）/
+   `not_applicable`（**核查后**判定无 SI，不是"没查"）。
+
+⚠️ **不准用机读字段代替原文判断**：Crossref `relation` 对实测 18 个 DOI **全为空**；
+Europe PMC `hasSuppl` 对 `inEPMC=N` 的文章**一律返回 `N`**——实测 4 篇白纸黑字的 SI
+被判成"没有"。**判据只能是原文。**
+⚠️ **按「有没有 SI」判，不按「是不是综述」判**：综述也可能有 SI（Chem. Soc. Rev. 2026 即为一例）。
 
 ##### 🆕 期刊分级 / 去重源 / 自动收尾（2026-10-06）
 
@@ -192,10 +241,29 @@ python tools/kb_route.py "<查询>" --layer 1                # 只要综合层
 （实测 BM25 冷启动 820ms→常驻 177ms；语义 30s→231ms；混合 56s→480ms）。
 
 ```bash
-python tools/kb_serve.py --port 8791 --warm     # 启动（放后台）
-python tools/kb_serve.py --status | --stop
-python tools/kb.py --doctor                     # 环境与索引自检
+python tools/kb.py serve start --warm            # 启动（放后台）
+python tools/kb.py serve status                  # 或 serve stop
+python tools/kb.py doctor --check-reranker       # 索引新鲜度 + 真实精排加载
 ```
+
+接口（全部 GET + JSON；`/graph` 于 2026-10-21 加入）：
+
+| 端点 | 用途 |
+|---|---|
+| `/health` `/stats` | 服务/索引状态（含 `graph_loaded`） |
+| `/search?q=&k=10&mode=bm25\|semantic\|hybrid` | 检索（含 type 过滤） |
+| `/ask?q=&strategy=auto\|simple\|agentic` | 自动选择传统 RAG 或 Agentic RAG（返回 `kb.rag.v1` / `kb.agentic.v1`） |
+| `/resolve?q=` | 别名解析 |
+| `/route?q=&budget=5,5,8&no_corpus=1` | **分层上下文包**（L1 综合 / L2 文献卡 / L3 原文，不混排；`no_corpus=1` 跳过 L3） |
+| `/corpus?q=&k=8` | raw 全文分块检索 |
+| `/graph?node=<页名>&hops=1` | 知识图谱邻域（`direction=out\|in\|both`、`type=`、`limit=`；`truncated` 明示截断） |
+| `/graph?path=A,B` | 最短**有向**路径（沿出链） |
+| `/graph?hubs=1&top=20` | 入度最高枢纽页（**条数用 `top`**，不是 `limit`） |
+| `/graph?bridges=1&top=20` | 割点=图谱骨架页 |
+| `/graph?stats=1` | 节点/边/连通块/孤立页计数 |
+
+> `/graph` 的邻域与枢纽结果已与 `kb_graph.py` CLI 文本输出逐条对齐（2026-10-21 实测 156/156 邻居一致）。
+> 2026-10-24 起 BM25/meta 索引签名变化会自动重载索引并清空图缓存；`&reload=1` 仍可用于强制重载。
 
 必记的三条指令（不可由 `--help` 推导）：
 
@@ -219,15 +287,15 @@ python tools/kb.py --doctor                     # 环境与索引自检
 > 后果是 frontmatter **静默解析不出来**——本工具链代价最高的一类失效（详见 §已知陷阱）。
 
 > ⚠️ **索引是派生数据，不是知识**（`wiki/.index/` 可随时重建）。修改/新建页面后跑一次 `kb_build_index.py` 即可（增量，秒级）。
-> 改了页面后若用到语义/原文检索，还需 `kb_semantic_search.py --build` 与 `kb_corpus.py --build`；
-> `kb.py --doctor` 会报告三者是否新鲜。
+> 改了页面后若用到语义/原文检索，还需 `kb.py index embed` 与 `kb.py index corpus`；
+> `kb.py doctor` 会检查页面集合、同名内容哈希与语料文件哈希，`--check-reranker` 验证真实模型加载。
 
 ### 数据库视图（`*.base`）
 
 五个 Obsidian **Bases** 文件（核心插件，**非 Dataview**）——frontmatter 的**下游消费者**，
 字段缺失或 YAML 写坏，页面会**从视图中静默消失**且 Obsidian 不报错。
 
-- **规模**：见各 `.base` 视图自身。
+- **现规模**：各 `.base` 当前选中数**一律以 `python tools/qc_base_check.py` 为准（本文件不写死数字）**。
 - 🔴 **改任何 `.base` 后必跑** `python tools/qc_base_check.py`——重算选中集合 + 漂移检测
   （`.base` 是**视图**不是数据，无法「重建」；视图级过滤器被误改会**静默收窄**，
   曾致总览视图大幅收窄且无任何报错）。该工具已挂进 `lit_ingest` 收尾链，建卡后自动跑。
@@ -286,6 +354,11 @@ python tools/kb.py --doctor                     # 环境与索引自检
 
 ### 始终做
 - ✅ 创建页面时自动更新 `index.md`
+- ✅ **完成 ingest 后，把本次新建/大改的卡片与页面以 wikilink（`[[sources/…]]`、`[[concepts/…]]`）列成可点击清单**——纯路径/纯文本标题不算完成
+- ✅ **凡是要用户「手动下载 / 手动去取」的条目，必须附可点击链接**（DOI ／ PDF 直链 ／ SI 页面或文件级链接）。
+  手动下载清单、文献清单的「待下载」行、任务书里的欠账表，**一律适用**——
+  **只给标题、或只给裸 DOI 文本 = 未完成**。连 DOI 都没有时，给按标题的可点击检索链接并注明原因。
+  代码侧已有守卫：`lit_fetch` 写清单后**逐条复算**是否含 `](http`，缺链打印 `[warn]`。
 - ✅ 每次操作后追加 `log_ops.md`（格式：`## [日期] <操作> | <描述>`）
 - ✅ 如有方法论洞察，同步追加 `log_insights.md`
 - ✅ 修改页面时更新 `updated` 字段
@@ -354,7 +427,7 @@ python tools/kb.py --doctor                     # 环境与索引自检
 
 ## 已知陷阱
 
-> 📖 **完整事故史（七起校验器事故、六类坏链接、写盘「一次写坏 124 页」事件、跨类方法论）
+> 📖 **完整事故史（八起校验器事故、六类坏链接、写盘「一次写坏 124 页」事件、跨类方法论）
 
 - 🔴 **「元数据静默丢失」是本工具链头号失效**——页面能正常打开、正文可读，**人工浏览完全看不出**，
   但元数据在索引层整个消失。三条纪律（**读、写两侧都适用**）：
@@ -365,7 +438,7 @@ python tools/kb.py --doctor                     # 环境与索引自检
      `corresponding_author` / `institution` / `published`；否则 YAML 把冒号后当新键 ⇒
      **整页元数据丢失**（曾 **49 页**）。写完跑 `yaml.safe_load` 或 `kb_lint.py --quick`。
   3. **闭合 `---` 后必须有换行**；**写盘后复算**：写 N 页要能读出 N 页。
-- **换行符 CRLF/LF 混合**（非统一）⇒ **不要对换行做假设**，
+- **换行符 CRLF/LF 混合**（非统一，且比例随批次变化——**不要引用固定计数**）⇒ **不要对换行做假设**，
   读文件务必二进制读取后显式 `decode("utf-8")` 并归一化。
 - **链接一律带 `[[ ]]`；`sources:` 的 raw 回链要写完整相对路径**
   （`"[[raw/<子目录>/file.md]]"`，**不能只写文件名**——raw 分布在多子目录）。
@@ -378,8 +451,9 @@ python tools/kb.py --doctor                     # 环境与索引自检
 
 > **凡是"用正则/字符串计数做判定"的校验器，必须能对已知答案的样本反算一次。**
 
-本工具链已有 **七次**同类事故——**计数器本身出错，却被读成内容质量问题**。
-七个案例的完整症状/根因、以及四条可迁移方法论（「已声明≠已生效」「规范写的是 sample 不是 census」
+本工具链已有 **八次**同类事故——**计数器本身出错，却被读成内容质量问题**。
+八个案例的完整症状/根因（含 2026-10-23 新登记的第 8 条：路径里的成对括号被 `[^)]+` 截断，
+断图链 104→89）、以及四条可迁移方法论（「已声明≠已生效」「规范写的是 sample 不是 census」
 「有字符串≠功能正常」「写出了缺省值也要验证它在起作用」）见
 
 **改动任何 lint/校验脚本后**：
@@ -402,13 +476,13 @@ python tools/kb.py --doctor                     # 环境与索引自检
 
 ## Agentic RAG 检索协议
 
-> 2026-10-04 起，下面这些策略**大都有工具支撑**，不再只是"要 Agent 自觉执行"的人工协议。
-> 首选做法：**先跑 `python tools/kb_route.py "<问题>" --json`**，一次拿到分层的、
-> 带引用与证据强度的上下文包；再按需展开。
+> 2026-10-24 起，复杂问题首选 `python tools/kb.py ask "<问题>" --strategy agentic --json`：
+> 有界规划、分层检索、图扩展、证据去重与 gaps 均由工具执行；最终综合由调用方模型完成。
+> 简单事实用 `--strategy simple`，走 BM25/向量/RRF/本地精排/Top-K。
 
 ### 🔴 第一原则：先分层，再排序
 
-`kb_route.py` 把检索**分三层返回**（**不混排**）：**L1** concept/entity/topic（本工具链的**当前综合**，
+`kb_agentic.py` / `kb_route.py` 把证据**分三层返回**（**不混排**）：**L1** concept/entity/topic（本工具链的**当前综合**，
 二手概括）｜ **L2** source（**单篇论文的主张** + `source_reliability`）｜ **L3** raw 全文块
 （**原文字面表述**，可回指 `文件:行号`）。
 
@@ -437,10 +511,27 @@ python tools/kb.py --doctor                     # 环境与索引自检
 
 ---
 
+## 🔎 已知边界台账（建议你自己维护一份）
+
+源库在每轮诊断后都会留下这样一节，**只登记「核验后仍然存在、且本轮不打算处理」的边界**，
+免得下一轮把它们当新发现重查一遍。随包发布的这一份已把源库的私有状态摘掉，
+只留下方法——请在你自己的库里建一份同结构的：
+
+- **每条边界写清「为什么不处理」**：收益低于误伤风险、受某条纪律约束、需专门一轮……
+  没有理由的边界等于没登记，下一轮照样会被翻出来重查。
+- **数字一律现场重算，不抄旧结论**：台账里的计数会随每日 ingest 失效。
+  写「以命令输出为准，勿引用旧数」，比写一个必然过期的数字诚实。
+- **不要把状态字段改好看**：例如 `si_status` 从 `missing` 改成 `present` 充数——
+  `present` 的含义是「库内确有该实体文件」，改字段不改事实只是把欠账藏起来。
+- **典型条目类型**：重复卡未归档（受「不删除已有页面」纪律约束）、tag 变体并存
+  （合并须同步改 `.base` 过滤与检索别名）、`sources:` 语义漂移（逐条改会牵动论证链）、
+  统计口径分裂（`kb_stats` 含项目卡而 `kb_lint` 只扫 wiki 页——两个数字都对，问题不同）。
+
+---
 ## 日志与更新协议
 
 > 📖 **日志分离表、索引重建强制规则、版本快照流程见
-> 现行两条硬约束：**每次 `batch_close` 后必跑 `kb_build_index.py`**；
+> 现行两条硬约束：**每次 `batch_close` 后必跑 `kb.py index build`**，并按影响面刷新 embed/corpus；
 > 每次操作后**追加 `log_ops.md`**（格式 `## [日期] <操作> | <描述>`）。
 
 ---

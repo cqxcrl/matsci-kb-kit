@@ -48,15 +48,12 @@ import argparse
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import kb_lib as K
+K.console_encoding()
 
 # 🔴 导入时就切 stdout 为 UTF-8（而不是等 `__main__`）：
 #    本脚本会被 lit_ingest.refresh_dedup / lit_doctor 以**子进程**调用并 capture stdout，
 #    子进程若继承 GBK 代码页，页名里的中文/「·」会抛 UnicodeEncodeError 并中断收尾链；
 #    而 import 本模块的调用方（lit_ingest 的同进程用法）同样需要这道保护。
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
 
 # 缓存格式版本：结构一变就 +1，旧缓存自动作废（宁可全量重扫，不可读错结构）
 CACHE_VERSION = 1
@@ -452,7 +449,7 @@ def selftest():
         return out
 
     before = _snap()
-    tmpv = tempfile.mkdtemp(prefix="kb_dois_selftest_")
+    tmpv = K.make_temp_dir(prefix="kb_dois_selftest_")
     try:
         fake = {"paths": {"doi_index": os.path.join(tmpv, "x", "dois.json"),
                           "catalogue": os.path.join(tmpv, "y", "cat.json"),

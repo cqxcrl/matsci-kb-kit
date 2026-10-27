@@ -19,8 +19,8 @@
    并要求命中绝对数 ≥ min_hits；否则每个子方向都会被报成缺口。
 
 用法：
-  python tools/sci_gap_scan.py --topic 电解液设计
-  python tools/sci_gap_scan.py --topic 电解液设计 --json --no-write
+  python tools/sci_gap_scan.py --topic 研究方向A
+  python tools/sci_gap_scan.py --topic 研究方向A --json --no-write
   python tools/sci_gap_scan.py --selftest
 """
 

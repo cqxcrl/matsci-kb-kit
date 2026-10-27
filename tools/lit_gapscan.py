@@ -61,15 +61,11 @@ from collections import defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import kb_lib as K
+K.console_encoding()
 
 # 🔴 import 期就装好 stdout/stderr 的编码守卫（Windows 控制台默认 GBK，中文/emoji 会
 #    UnicodeEncodeError 把整条命令打断）。旧版只在 `__main__` 里装 ⇒ **被 import 时没有守卫**。
 #    与 lit_discover / lit_fetch 保持一致，统一放模块级。
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                            # noqa: BLE001
-    pass
 
 SIGNALS = {
     "single-source": "该结论只有单一一手源支撑，未获独立复现",

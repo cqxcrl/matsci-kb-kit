@@ -1,8 +1,10 @@
 # Sci-Assistant 决策层
 
-> **v0 全量完成 2026-10-21** ｜ 12 个工具 ｜ 3 大核心能力（C1 切入点 / C2 方案 / C3 统筹）
+> 13 个 `sci_*` 工具 ｜ 3 大核心能力（C1 切入点 / C2 方案 / C3 统筹）+ 1 条贯穿三层的链路溯源
 
 Sci-Assistant 是基于知识库的**科研课题辅助系统**——从切入点发现、实验方案设计到进展追踪，形成"知识→决策→行动→反馈"的闭环。
+
+它不生产知识，只**把知识层已有的证据组织成决策**：任何推荐、参数、判断都必须能回指一张 source 卡或原文段落，否则标"库内无证据"。
 
 ---
 
@@ -10,9 +12,12 @@ Sci-Assistant 是基于知识库的**科研课题辅助系统**——从切入�
 
 | # | 能力 | 场景 | 工具 |
 |---|---|---|---|
-| **C1** | **切入点发现** | 已有大方向（如"电解液设计"），找未被充分探索的细分点 | `sci_landscape.py` `sci_gap_scan.py` `sci_topic_rec.py` |
+| **C1** | **切入点发现** | 已有大方向，找未被充分探索的细分点 | `sci_landscape.py` `sci_gap_scan.py` `sci_topic_rec.py` |
 | **C2** | **实验方案推荐** | 确定切入点后，设计实验路线 | `sci_method_extract.py` `sci_protocol_gen.py` `sci_lab_match.py` `sci_method_chain.py` |
 | **C3** | **课题进展统筹** | 实验推进中，记录、分析、调整 | `sci_progress.py` `sci_data_analysis.py` `sci_ecsa_qc.py` `sci_review.py` |
+| **贯穿** | **链路溯源** | C1→C2→C3 三层产物之间的主键一致性与沿革 | `sci_links.py` |
+
+辅助：`sci_reagent_import.py`（试剂入库，服务 C2 的实验室匹配）。
 
 ---
 
@@ -26,6 +31,13 @@ Sci-Assistant 是基于知识库的**科研课题辅助系统**——从切入�
 | `sci_gap_scan.py` | 科学内容空白扫描：6 个信号（comp-no-expt / synth-no-char / single-lab-claim / temporal-gap / method-orphan / cross-domain-gap） |
 | `sci_topic_rec.py` | 切入点推荐：可行性 = 0.45×空白 + 0.35×文献充分度 + 0.20×方向相关度 |
 
+```bash
+python tools/sci_landscape.py  --direction "<你的方向>"            # 景观：分面 + 子方向
+python tools/sci_gap_scan.py   --topic "<你的方向>"                # 空白信号
+python tools/sci_topic_rec.py  --topic "<你的方向>" --top 3        # 切入点排名
+python tools/sci_topic_rec.py  --refine "<你的方向>" --interested 1,3 --apply
+```
+
 ### C2 实验方案
 
 | 工具 | 功能 |
@@ -34,6 +46,14 @@ Sci-Assistant 是基于知识库的**科研课题辅助系统**——从切入�
 | `sci_protocol_gen.py` | 方案生成：策略层（方法对比）→ 操作层（参数/步骤/设备，逐条带 quote）→ 判断层（优势/条件/局限） |
 | `sci_lab_match.py` | 实验室匹配：设备/表征/计算/试剂四类需求 vs 实验室档案（available/partial/missing/unregistered/purchased） |
 | `sci_method_chain.py` | 方法链：构建方法间依赖关系（术语共享边 + 类别级弱边） |
+| `sci_reagent_import.py` | 试剂入库：从 Excel 提取试剂清单（隐私保护：不导出价格/客户/照片） |
+
+```bash
+python tools/sci_method_extract.py --from sources --auto --topic "<你的方向>" --out-dir _scratch/l2
+python tools/sci_protocol_gen.py   --topic "<你的方向>"          # 策略层 → 操作层 → 判断层
+python tools/sci_lab_match.py      --protocol <protocols/你的方案>
+python tools/sci_method_chain.py   --report <protocols/你的方案>
+```
 
 ### C3 进展统筹
 
@@ -43,7 +63,44 @@ Sci-Assistant 是基于知识库的**科研课题辅助系统**——从切入�
 | `sci_data_analysis.py` | 数据分析：CHI/DIGISIM/CSV 解析 + 统计/导出 + 出图（matplotlib/Origin 双后端） |
 | `sci_ecsa_qc.py` | ECSA 五道门：G1–G5 门禁（扫速≥3 / 统一 e0 / Cs 元数据 / R² 分级 / 回原始 CV 对账） |
 | `sci_review.py` | 复盘建议：失败日志 → KB 证据 → 建议（逐条 quote 校验） |
-| `sci_reagent_import.py` | 试剂入库：从 Excel 提取试剂清单（隐私保护：不导出价格/客户/照片） |
+
+```bash
+python tools/sci_progress.py new "<课题名>" --direction "<你的方向>" --entry "<子方向>"
+python tools/sci_progress.py log <slug> --text "…"
+python tools/sci_data_analysis.py --input <数据文件> --plot
+python tools/sci_ecsa_qc.py --result <ecsa_result.json>          # G1–G5 硬门
+python tools/sci_review.py --project "<课题名>" --data <ecsa_result.json> --build
+```
+
+### 链路溯源（`sci_links.py`）
+
+C1/C2/C3 三层各自落盘，久了会**各说各话**：切入点被改名、方案换了主键、课题还指着旧快照。
+`sci_links.py` 是只读的对账器——统一主键口径 `<topics 目录名>#<sub_direction>`，并给出三层快照。
+
+```bash
+python tools/sci_links.py --status                       # 三层主键一致性总览
+python tools/sci_links.py --adopt "<方向>"                # 某切入点被哪些方案/课题采纳
+python tools/sci_links.py --trace "<课题 slug>"           # 课题沿革 C1→C2→C3
+python tools/sci_links.py --snapshot "<方向>#<子方向>"     # 打印该切入点的快照 JSON
+```
+
+---
+
+## 落盘约定
+
+所有 `sci_*` 的读写落点都由一份配置给出，工具内只留兜底默认值：
+
+```
+projects/sci-assistant/
+├── config/sci_assistant_config.yaml   # 唯一配置源（目录、阈值、期刊别名）
+├── config/journal_aliases.yaml        # 期刊名归一白名单
+├── topics/<方向>/landscape.json       # C1 产物
+├── topics/<方向>/entry_points.json    # C1 产物（切入点主键）
+├── protocols/<方案>/…                 # C2 产物
+└── progress/<课题 slug>/project.yaml  # C3 产物
+```
+
+改目录只需改配置；工具用 `__file__` 派生库根，不写绝对路径。
 
 ---
 
@@ -53,31 +110,7 @@ Sci-Assistant 是基于知识库的**科研课题辅助系统**——从切入�
 2. **事实型输出**：不生成"优势/适用条件"等判断（方法库无此字段），判断层单独走 LLM + quote 校验
 3. **写前备份**：覆盖固定落点文件前自动备份到 `_scratch/backup/`
 4. **数字不写死**：阈值、路径从配置文件读
-5. **自检纪律**：所有工具带 `--selftest`（含正例与反例夹具）
-
----
-
-## 实测案例
-
-### 电解液设计方向（C1）
-
-- **候选集**：BM25 前 200 张 source 卡
-- **子方向**：10 个（SEI 界面 44 / 锂金属 33 / AI 电解质 33 / 锌负极 33 …）
-- **空白信号**：9 个（comp 2 / single 3 / cross 3 / orphan 1）
-- **切入点**：5 个（2 high：AI 电解质设计 0.552 / 机器学习势函数 0.519）
-
-### 锌电解液方案（C2）
-
-- **3 个候选**：AHTech 高通量平台（测试，引文 44 条）/ MLMD 壳外共溶剂筛选（计算，31）/ MACE 单齿乙酸电解液（合成，27）
-- **参数/材料用量**：逐条带 quote，0 无引文
-- **判断层**：32 条判断，quote 校验 32/32
-- **方法链**：5 条（MLMD→LFP/LMFP、MLMD→HBN …）
-
-### ECSA 重算与复盘（C3）
-
-- **失效案例**：原 CSV R²=1.1e-16、ECSA=3.2e-15 cm²（机器零）
-- **重算**：用原始 5/7/10 mV/s 重算，Cdl 3.05–5.87 mF cm⁻²、ECSA 50.9–97.9 cm²
-- **复盘**：5 条建议、6 条证据、0 条校验失败
+5. **自检纪律**：所有工具带 `--selftest`（含正例与反例夹具）；`kb_toolcheck.py` 会实跑它们
 
 ---
 
@@ -106,26 +139,22 @@ Sci-Assistant **复用**知识库的检索层（`kb_search` / `kb_route` / `kb_g
 
 ---
 
-## 工具健康
-
-`kb_toolcheck.py` 实跑：**78 工具全部 PASS**（kb_* 19 + lit_* 14 + qc_* 3 + sci_* 12 + journals.yaml 1）。
-
-所有 12 个 `sci_*.py` 工具自检通过，总计 **178 项 selftest**（landscape 25 + gap_scan 23 + topic_rec 13 + method_extract 27 + protocol_gen 16 + lab_match 16 + progress 13 + data_analysis 25 + ecsa_qc 7 + review 7 + method_chain 9 + reagent_import 16）。
-
----
-
 ## 已知边界
 
-1. **C1 候选集非全库普查**：BM25 前 200 张卡，不是全库 665 张 source
-2. **C2 方法库无"优势/局限"字段**：策略层只做事实排列，判断层单独走 LLM
-3. **C2 试剂库存需用户补**：`lab_profile.yaml` 的 reagents 从入库表提取 84 条，但当前余量仍需口述补充
+1. **C1 候选集非全库普查**：默认取 BM25 前 N 张 source 卡（N 由配置给出），不是全库普查；
+   库越大越要留意召回截断
+2. **C2 方法库无"优势/局限"字段**：策略层只做事实排列，判断层单独走 LLM + quote 校验
+3. **C2 试剂库存需用户补**：`lab_profile.yaml` 的 reagents 可从入库表提取，但当前余量仍需人工补充
 4. **C3 归因是"可能原因"**：复盘建议不是因果，证据不足即丢弃
 5. **方法链依赖是推断**：不是作者明示的依赖关系，跨论文链需人工适配
+6. **`sci_ecsa_qc.py` 是电化学专用**：G1–G5 门禁针对 ECSA/CV 计算；其它体系请用
+   `sci_data_analysis.py` 的通用统计通道
 
 ---
 
-## 参考文献
+## 自检
 
-- 工作计划：`projects/sci-assistant/docs/工作计划.md`（v0.17，727 行）
-- 开工指导书：`projects/sci-assistant/docs/开工指导书.md`（v0.15）
-- 诊断意见：`projects/sci-assistant/docs/Sci-Assistant 诊断意见1.md`
+```bash
+python tools/kb_toolcheck.py          # 实跑全部工具的 --selftest / --help + 写盘防呆
+python tools/sci_links.py --selftest  # 单个工具
+```

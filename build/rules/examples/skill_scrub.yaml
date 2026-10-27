@@ -1,0 +1,44 @@
+# 示例：技能文件的**正则**替换表。复制成 private/skill_scrub.yaml 后填你自己的专名。
+#
+# 为什么这一层用正则而不是字面量：
+#   技能（skills/*/SKILL.md 及其 references）是**人写的散文**，同一个专名会以多种形态
+#   出现——带盘符的绝对路径、正斜杠变体、裸库名、历史旧库名。字面量替换得逐形态列一遍，
+#   漏一个就泄漏；正则一条覆盖全部形态。
+#
+# 🔴 顺序敏感：具体在前、兜底在后。最后一条把任何残留的「盘符:\路径」整体吃掉。
+# 🔴 YAML 单引号标量里反斜杠按**字面量**处理，所以 '\\' 就是正则里的两个反斜杠
+#    （匹配一个字面反斜杠）。含引号的模式用块标量 |- 写，避免转义地狱。
+
+rules:
+  # 库根的各种写法（反斜杠 / 正斜杠）
+  - pattern: 'D:\\我的知识库名'
+    replace: '<你的库根>'
+  - pattern: 'D:/我的知识库名'
+    replace: '<你的库根>'
+
+  # agent 配置目录
+  - pattern: 'D:\\\.agent'
+    replace: '<你的 .agent>'
+  - pattern: 'C:\\Users\\某用户名\\\.agent'
+    replace: '<你的 .agent>'
+
+  # 运行产物目录
+  - pattern: 'D:\\agent-results'
+    replace: '<库内运行产物目录>'
+  - pattern: 'D:/agent-results'
+    replace: '<库内运行产物目录>'
+
+  # 裸库名 / 工程目录名
+  - pattern: '我的知识库名'
+    replace: '本工具链'
+  - pattern: 'my-review-project'
+    replace: '综述工程'
+
+  # 本机文献目录名（这类最容易被散文顺手写出来）
+  - pattern: '我的某方向文献夹'
+    replace: '你的文献目录'
+
+  # 兜底：任何残留的「盘符:\…」或「盘符:/…」绝对路径
+  - pattern: |-
+      [A-Za-z]:[\\/][^\s'"]*
+    replace: '<库外路径>'

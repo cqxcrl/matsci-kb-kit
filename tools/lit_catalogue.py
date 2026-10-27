@@ -47,14 +47,11 @@ import fitz  # PyMuPDF
 # 知识库共享库（同目录）——库根由 __file__ 推导
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kb_lib as K
+K.console_encoding()
 
 # 🔴 导入时即切 stdout 为 UTF-8：本脚本被 lit_ingest --apply / lit_doctor 以**子进程**
 #    调用并 capture stdout，子进程若继承 GBK 代码页，目录名里的「&」「·」或中文
 #    会在 print 时抛 UnicodeEncodeError，把整条入库收尾链打断。
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
 
 # 去重目录候选（配置优先 + 历史落点）的唯一实现放在 kb_dois.py：
 # 候选清单曾散在 kb_dois / kb_baseline / lit_discover 三处，路径一迁移就各自陈旧。
@@ -194,7 +191,31 @@ def dedup_sources():
         for sid, p, sc, _ex in out:
             print(f"         · {sid} ({sc}) = {p}")
         print("       修 lit_config.yaml 的 dedup_sources 段即可消除本告警。")
+    # 🆕 2026-10-22：综述工程参考文献落点（projects/*/references）**自动**入去重集，
+    #    与 kb_where 的「检索范围动态化」（坑 3）同一逻辑：新工程不必手改配置即被覆盖。
+    #    用户约定：综述任务的参考文献放 `projects/<slug>/references/`（PDF + 提取 md 混放）。
+    #    scope='kb' 扫 *.md 首页 DOI + *.pdf；excludes 传空——KB_DEFAULT_EXCLUDES 的
+    #    排除前缀（raw/notes、raw/clippings）相对**源 root** 判定，对项目 references
+    #    无意义，该目录也不存在"产物污染"问题。
+    for _sid, _p, _sc in review_ref_sources():
+        out.append((_sid, _p, _sc, ()))
     return out
+
+
+def review_ref_sources():
+    """projects/*/references 去重源（目录存在且含 PDF/md 才纳入）。"""
+    found = []
+    proj = os.path.join(K.VAULT, "projects")
+    if not os.path.isdir(proj):
+        return found
+    for slug in sorted(os.listdir(proj)):
+        refs = os.path.join(proj, slug, "references")
+        if not os.path.isdir(refs):
+            continue
+        if not any(f.endswith((".pdf", ".md")) for f in os.listdir(refs)):
+            continue
+        found.append((f"proj_{slug}_refs", refs, "kb"))
+    return found
 
 
 def norm_rel_exclude(p):
@@ -275,6 +296,21 @@ def total_key(doi, title):
         return "doi:" + doi
     tk = norm_title_key(title)
     return ("title:" + tk) if tk else None
+
+
+def is_si_pdf(path):
+    """补充材料不参与“这篇论文我已有了”的判定。
+
+    SI 首页的 DOI 是**主文 DOI**；若把 `raw/pdf/si/<stem>.si.pdf` 计入目录，
+    只拿到 SI、正文没下到的论文会被去重系统误判成“已在库”，从此不再尝试正文。
+    （2026-10-26：ACS 浏览器兜底把 3 份 SI 当正文下载后，若刷新目录即会踩到。）
+    """
+    name = os.path.basename(path).lower()
+    if ".si." in name:
+        return True
+    parent = os.path.dirname(os.path.abspath(path))
+    return (os.path.basename(parent).lower() == "si"
+            and os.path.basename(os.path.dirname(parent)).lower() == "pdf")
 
 
 def extract_pdf_doi(path):
@@ -597,6 +633,8 @@ def build_catalogue(cache=None, force_rescan=False):
                     if not fn.lower().endswith(".pdf"):
                         continue
                     p = os.path.join(dp, fn)
+                    if is_si_pdf(p):
+                        continue
                     doi = pdf_first_doi(p, cache, stats, force_rescan)
                     key = total_key(doi, None if doi else name_to_title_key(fn))
                     if key:
@@ -609,6 +647,8 @@ def build_catalogue(cache=None, force_rescan=False):
                     if not fn.lower().endswith(".pdf"):
                         continue
                     p = os.path.join(dp, fn)
+                    if is_si_pdf(p):
+                        continue
                     doi = pdf_first_doi(p, cache, stats, force_rescan)
                     key = total_key(doi, None if doi else name_to_title_key(fn))
                     if key:
@@ -845,6 +885,11 @@ def run_selftest():
         total_key("10.1002/adma.202500412", "T1") ==
         total_key("10.1002/adma.202500412", "另一个标题"))
     chk("total_key 无完整 DOI 时退回标题键", total_key("", "T1") == "title:t1")
+    chk("SI 文件（.si.pdf）不计入目录",
+        is_si_pdf("KB/raw/pdf/si/a.si.pdf"))
+    chk("SI 目录名即可识别", is_si_pdf("KB/raw/pdf/si/a.pdf"))
+    chk("正文 PDF 不误判", not is_si_pdf("KB/raw/pdf/a.pdf"))
+    chk("Silylation 不误判为 SI", not is_si_pdf("KB/raw/pdf/Silylation chemistry.pdf"))
 
     import tempfile
     import unittest.mock as mock
@@ -868,7 +913,7 @@ def run_selftest():
         return out
 
     before = _snap()
-    tmpv = tempfile.mkdtemp(prefix="lit_catalogue_selftest_")
+    tmpv = K.make_temp_dir(prefix="lit_catalogue_selftest_")
     try:
         # ---- 2) 去重源：配置权威（夹具 --- 不读真实配置）----
         fake = {"paths": {"raw_dir": os.path.join(tmpv, "raw"),
@@ -922,6 +967,29 @@ def run_selftest():
                 mock.patch.object(K, "load_lit_config", side_effect=lambda *a, **k: fake_ex2):
             s0 = dedup_sources()[0]
             chk("自定义 exclude 覆盖默认", s0[3] == ("notes/lit-watch",), f"-> {s0[3]}")
+
+        # ---- projects/*/references 动态去重源（2026-10-22 起：综述文献落项目 references）----
+        # 正例：含 PDF 的 references 自动纳入；反例：空 references / 无 references 的工程不纳入。
+        os.makedirs(os.path.join(tmpv, "projects", "projA", "references"), exist_ok=True)
+        with open(os.path.join(tmpv, "projects", "projA", "references", "x.pdf"),
+                  "w", encoding="utf-8") as _f:
+            _f.write("stub")
+        os.makedirs(os.path.join(tmpv, "projects", "projB", "references"), exist_ok=True)
+        os.makedirs(os.path.join(tmpv, "projects", "projC"), exist_ok=True)
+        with mock.patch.object(K, "VAULT", tmpv), \
+                mock.patch.object(K, "load_lit_config", side_effect=lambda *a, **k: fake):
+            srcs2 = dedup_sources()
+            ids2 = [s[0] for s in srcs2]
+            chk("projects/*/references 含文献时自动入去重集",
+                "proj_projA_refs" in ids2, f"-> {ids2}")
+            chk("空 references 目录不纳入",
+                not any("projB" in str(s[0]) for s in srcs2), f"-> {ids2}")
+            chk("无 references 的工程不纳入",
+                not any("projC" in str(s[0]) for s in srcs2), f"-> {ids2}")
+            rr = [s for s in srcs2 if s[0] == "proj_projA_refs"]
+            chk("动态源 scope=kb 且 excludes 为空",
+                len(rr) == 1 and rr[0][2] == "kb" and rr[0][3] == (),
+                f"-> {rr}")
 
         # ---- 剪枝纯函数（正反例）----
         base = os.path.join(tmpv, "raw")

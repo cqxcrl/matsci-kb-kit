@@ -10,15 +10,15 @@
     progress.md                 自动生成的进展摘要
 
 用法：
-  python tools/sci_progress.py new "LFP 再生" --direction 电解液设计 --entry "AI 电解质设计"
+  python tools/sci_progress.py new "课题B" --direction 研究方向A --entry "子方向 A"
   python tools/sci_progress.py list
-  python tools/sci_progress.py show lfp-再生
-  python tools/sci_progress.py log lfp-再生 --title "首轮筛选" --body "..." --result partial
-  python tools/sci_progress.py milestone lfp-再生 --add "完成首轮筛选"
-  python tools/sci_progress.py milestone lfp-再生 --done 1
-  python tools/sci_progress.py status lfp-再生 running
-  python tools/sci_progress.py link lfp-再生 --protocol "protocols/锌-电解液/strategy.md"
-  python tools/sci_progress.py summary lfp-再生
+  python tools/sci_progress.py show proj-b
+  python tools/sci_progress.py log proj-b --title "首轮筛选" --body "..." --result partial
+  python tools/sci_progress.py milestone proj-b --add "完成首轮筛选"
+  python tools/sci_progress.py milestone proj-b --done 1
+  python tools/sci_progress.py status proj-b running
+  python tools/sci_progress.py link proj-b --protocol "protocols/方案A/strategy.md"
+  python tools/sci_progress.py summary proj-b
   python tools/sci_progress.py --selftest
 
 🔴 写盘纪律：project.yaml 用 yaml.safe_dump 写、写完 yaml.safe_load 复算；
@@ -36,6 +36,7 @@ TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS_DIR)
 
 import kb_lib as K  # noqa: E402
+import sci_links as L  # noqa: E402  课题主键（纯函数，不反向依赖本文件）
 K.console_encoding()
 
 CONFIG_REL = "projects/sci-assistant/config/sci_assistant_config.yaml"
@@ -111,7 +112,12 @@ def _today():
 
 # ---------------------------------------------------------------- 课题操作
 
-def new_project(cfg, title, direction="", entry="", goal="", slug=None, status="planned"):
+def new_project(cfg, title, direction="", entry="", goal="", slug=None, status="planned",
+                entry_ref=None):
+    """新建课题。`entry_ref`（`方向#子方向`）会落成**快照**，见 §五.1 课题主键。
+
+    快照而不是活引用：C1 重跑后 `entry_points.json` 会变，而「当初为什么选它」必须保住。
+    """
     slug = slug or slugify(title)
     p = project_path(cfg, slug)
     if os.path.isfile(p):
@@ -129,6 +135,13 @@ def new_project(cfg, title, direction="", entry="", goal="", slug=None, status="
         "milestones": [],
         "experiments": [],
     }
+    if entry_ref:
+        topic, sub = L.parse_entry_id(entry_ref)
+        data["entry_point_ref"] = L.snapshot_entry(topic, sub_direction=sub, cfg=cfg)
+        if not entry:                       # 自由文本字段补成子方向名（不覆盖用户显式值）
+            data["entry_point"] = sub
+        if not direction:
+            data["direction"] = topic
     save_project(cfg, slug, data)
     os.makedirs(os.path.join(project_dir(cfg, slug), "log"), exist_ok=True)
     return data
@@ -162,6 +175,30 @@ def link_protocol(cfg, slug, ref):
         refs.append(ref)
     save_project(cfg, slug, data)
     return refs
+
+
+def set_entry_ref(cfg, slug, entry_ref):
+    """给**已有**课题补绑切入点主键（快照）→ (新快照, 旧快照)。
+
+    `new --entry-ref` 只能用于新建；历史课题要补链就用这条（写前备份、写后复算）。
+    🔴 主键必须来自用户的真实选择——不得凭印象补一个（那是伪造出处）。
+    """
+    data = load_project(cfg, slug)
+    topic, sub = L.parse_entry_id(entry_ref)
+    snap = L.snapshot_entry(topic, sub_direction=sub, cfg=cfg)
+    old = data.get("entry_point_ref")
+    data["entry_point_ref"] = snap
+    if not data.get("direction"):
+        data["direction"] = topic
+    if not data.get("entry_point"):
+        data["entry_point"] = sub
+    p = project_path(cfg, slug)
+    bak = K.backup_file(p, keep_rel=True) if hasattr(K, "backup_file") else None
+    save_project(cfg, slug, data)
+    back = (load_project(cfg, slug) or {}).get("entry_point_ref") or {}
+    if back.get("id") != snap["id"]:
+        raise SystemExit("[!] project.yaml 写盘复算失败：entry_point_ref 没落盘")
+    return snap, old, bak
 
 
 def set_status(cfg, slug, status):
@@ -238,7 +275,7 @@ def list_projects(cfg):
 
 # ---------------------------------------------------------------- 摘要
 
-def render_summary(data):
+def render_summary(data, extra=None):
     exps = data.get("experiments") or []
     ms = data.get("milestones") or []
     done = sum(1 for m in ms if m.get("done"))
@@ -284,6 +321,8 @@ def render_summary(data):
     else:
         L.append("（还没有实验记录）")
     L.append("")
+    if extra:
+        L.extend(extra)
     L.append("## 下一步")
     L.append("")
     pending = [m for m in ms if not m.get("done")]
@@ -296,12 +335,382 @@ def render_summary(data):
     return "\n".join(L)
 
 
-def write_summary(cfg, slug):
+def render_lineage(t):
+    """紧凑版课题沿革（C1→C2→C3）。完整版用 `python tools/sci_links.py --trace <slug>`。"""
+    r = t.get("resolve") or {}
+    ref = t.get("entry_point_ref") or {}
+    L_ = ["## 课题沿革（C1→C2→C3）", ""]
+    if not ref:
+        L_.append("- 切入点：**未关联**"
+                  + ("（历史产物：`entry_point` 是自由文本，字段引入前创建）"
+                     if t.get("legacy_entry_point") else ""))
+        L_.append("- 补链：用生成入口重跑一次并带主键——"
+                  "`sci_protocol_gen.py --goal <目标> --entry \"方向#子方向\"`、"
+                  "`sci_progress.py new ... --entry-ref \"方向#子方向\"`。"
+                  "**不要按印象手填主键**（那是伪造出处）。")
+    else:
+        state = L.STATE_ZH.get(r.get("state"), r.get("state"))
+        line = (f"- 切入点：`{ref.get('id')}` ｜ {state} ｜ "
+                f"选定当时 {ref.get('feasibility_score_at_selection')}"
+                f"（名次 {ref.get('rank_at_selection')}）")
+        live = r.get("live") or {}
+        if live:
+            drift = r.get("score_drift")
+            line += f" ｜ 现值 {live.get('feasibility_score')}"
+            if drift not in (None, 0):
+                line += f"（**漂移 {drift:+g}**）"
+        L_.append(line)
+        if ref.get("rationale"):
+            L_.append(f"- 当时理由：{ref['rationale']}")
+        alts = ref.get("alternatives") or []
+        if alts:
+            L_.append("- 当时落选：" + "；".join(
+                f"{a.get('sub_direction')}（{a.get('feasibility_score')}，"
+                f"{a.get('signal') or '—'}）" for a in alts))
+        L_.append(f"- 快照时间：{ref.get('captured_at') or '—'}（C1 重跑不改本块）")
+    protos = [p for p in (t.get("protocols") or [])]
+    others = [o for o in (t.get("other_refs") or [])]
+    if protos or others:
+        bits = [f"`{p['ref']}`" for p in protos] + [f"`{o['ref']}`" for o in others]
+        L_.append("- 方案产物：" + "；".join(bits))
+    else:
+        L_.append("- 方案产物：（未关联）")
+    if t.get("siblings"):
+        L_.append("- 同一切入点的其他采纳：" +
+                  "、".join(f"{s['kind']}:{s['id']}" for s in t["siblings"]))
+    L_.append("")
+    return L_
+
+
+def write_summary(cfg, slug, timeline=False, literature=False, days=30, k=8,
+                  search_fn=None):
     data = load_project(cfg, slug)
-    md = render_summary(data)
+    trace = L.trace(slug, cfg)
+    extra, payload = [*render_lineage(trace)], {"lineage": trace}
+    if timeline:
+        tl = build_timeline(data)
+        payload["timeline"] = tl
+        png = plot_timeline(tl, project_dir(cfg, slug), slug)
+        tl["png"] = os.path.relpath(png, project_dir(cfg, slug)).replace("\\", "/") if png else ""
+        tj = os.path.join(project_dir(cfg, slug), "timeline.json")
+        K.write_text_verified(tj, json.dumps(tl, ensure_ascii=False, indent=2) + "\n")
+        extra.extend(render_timeline_section(tl))
+    if literature:
+        lit = build_literature(data, days=days, k=k, search_fn=search_fn)
+        payload["literature"] = lit
+        extra.extend(render_literature_section(lit))
+    md = render_summary(data, extra=extra)
     p = os.path.join(project_dir(cfg, slug), "progress.md")
     K.write_text_verified(p, md + "\n")
-    return p, md
+    return p, md, payload
+
+
+# ---------------------------------------------------------------- N3 时间线
+#
+# 🔴 时间线是对 project.yaml 里既有记录的**重排**，不产生新事实：
+#    日志日期、里程碑完成日期都原样取用；日期解析失败就计入 skipped，不猜一个日期。
+
+def _as_date(v):
+    if isinstance(v, datetime.date):
+        return v
+    s = str(v or "").strip()[:10]
+    if not s:
+        return None
+    try:
+        return datetime.date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def build_timeline(data):
+    events, skipped = [], 0
+    created = _as_date(data.get("created"))
+    if created:
+        events.append({"date": created.isoformat(), "kind": "start",
+                       "label": "课题创建", "status": data.get("status")})
+    for e in data.get("experiments") or []:
+        d = _as_date(e.get("date"))
+        if not d:
+            skipped += 1
+            continue
+        events.append({"date": d.isoformat(), "kind": "experiment",
+                       "label": f"{e.get('exp_id')} {e.get('title')}",
+                       "exp_id": e.get("exp_id"), "title": e.get("title"),
+                       "result": e.get("result") or "unknown",
+                       "file": e.get("file")})
+    for m in data.get("milestones") or []:
+        done = bool(m.get("done"))
+        d = _as_date(m.get("done_date") if done else m.get("added"))
+        if not d:
+            skipped += 1
+            continue
+        events.append({"date": d.isoformat(), "kind": "milestone",
+                       "label": f"#{m.get('id')} {m.get('title')}",
+                       "milestone_id": m.get("id"), "done": done})
+    events.sort(key=lambda x: (x["date"], {"start": 0, "milestone": 1,
+                                           "experiment": 2}[x["kind"]]))
+    counts = {}
+    for ev in events:
+        counts[ev["kind"]] = counts.get(ev["kind"], 0) + 1
+    return {"generated_at": _today(), "slug": data.get("slug"),
+            "title": data.get("title"), "events": events,
+            "counts": counts, "skipped_no_date": skipped,
+            "span": [events[0]["date"], events[-1]["date"]] if events else []}
+
+
+def render_timeline_section(tl):
+    L = ["## 时间线", ""]
+    if not tl.get("events"):
+        L.append("（无可排布的记录：日志与里程碑都缺日期，或课题刚建立。）")
+        L.append("")
+        return L
+    L.append(f"> 共 {len(tl['events'])} 个节点（"
+             + "、".join(f"{k} {v}" for k, v in sorted(tl["counts"].items())) + "）；"
+             f"跨 {tl['span'][0]} → {tl['span'][1]}"
+             + (f"；{tl['skipped_no_date']} 条记录缺日期已跳过" if tl.get("skipped_no_date") else "")
+             + "。")
+    L.append("")
+    L.append("| 日期 | 类型 | 内容 |")
+    L.append("|---|---|---|")
+    kind_zh = {"start": "起点", "milestone": "里程碑", "experiment": "实验"}
+    for ev in tl["events"]:
+        tag = kind_zh.get(ev["kind"], ev["kind"])
+        if ev["kind"] == "experiment":
+            tag += f"（{RESULT_ZH.get(ev.get('result'), ev.get('result'))}）"
+        elif ev["kind"] == "milestone":
+            tag += "（✅）" if ev.get("done") else "（⬜）"
+        L.append(f"| {ev['date']} | {tag} | {ev['label']} |")
+    L.append("")
+    if tl.get("png"):
+        L.append(f"![时间线]({tl['png']})")
+        L.append("")
+    return L
+
+
+def timeline_xlim(tl):
+    """时间线横轴范围：两端各留 ≥7 天余量。
+
+    🔴 必须显式设 xlim：全部事件在同一天时 matplotlib 的 autoscale 会给出跨数年的
+    横轴（实测 2 节点同日 → 2025-01 到 2028-07），图看起来像坏了。
+    """
+    xs = [d for d in (_as_date(ev["date"]) for ev in tl.get("events") or []) if d]
+    if not xs:
+        return None
+    lo, hi = min(xs), max(xs)
+    pad = max(datetime.timedelta(days=7), (hi - lo) * 0.1)
+    return lo - pad, hi + pad
+
+
+def plot_timeline(tl, out_dir, slug):
+    """画时间线 → out_dir/timeline.png；无事件时返回 None（不生成空图）。
+
+    🔴 图内文字只用 ASCII：中文字形依赖系统字体，缺字体时 matplotlib 会画成方框，
+    一张全是方框的"可视化"比没有更糟。中文信息放在 markdown 表格里。
+    """
+    if not tl.get("events"):
+        return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.dates as mdates
+        import matplotlib.pyplot as plt
+    except Exception as e:                                # noqa: BLE001
+        print(f"[warn] matplotlib 不可用，跳过时间线图：{e}")
+        return None
+    rows = {"start": 0, "milestone": 1, "experiment": 2}
+    colors = {"success": "#2e7d32", "partial": "#f9a825",
+              "failed": "#c62828", "unknown": "#607d8b"}
+    fig, ax = plt.subplots(figsize=(11, 3.6), dpi=150)
+    for ev in tl["events"]:
+        y = rows.get(ev["kind"], 3)
+        if ev["kind"] == "experiment":
+            c = colors.get(ev.get("result"), colors["unknown"])
+            ax.scatter([_as_date(ev["date"])], [y], s=70, color=c, zorder=3)
+        elif ev["kind"] == "milestone":
+            ax.scatter([_as_date(ev["date"])], [y], s=110, marker="D",
+                       facecolors=("#1565c0" if ev.get("done") else "white"),
+                       edgecolors="#1565c0", zorder=3)
+        else:
+            ax.scatter([_as_date(ev["date"])], [y], s=90, marker="*",
+                       color="#37474f", zorder=3)
+    for y, label in ((0, "start"), (1, "milestone"), (2, "experiment")):
+        ax.axhline(y, color="#e0e0e0", lw=1, zorder=1)
+        ax.text(1.005, y, label, transform=ax.get_yaxis_transform(),
+                va="center", fontsize=8, color="#616161")
+    ax.set_yticks([])
+    ax.set_ylim(-0.6, 2.6)
+    lim = timeline_xlim(tl)
+    if lim:
+        ax.set_xlim(lim[0], lim[1])
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    fig.autofmt_xdate(rotation=30, ha="right")
+    ax.set_title(f"Project timeline ({len(tl['events'])} nodes)", fontsize=10)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.grid(axis="x", ls=":", color="#eeeeee", zorder=0)
+    fig.tight_layout()
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, "timeline.png")
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+# ---------------------------------------------------------------- N4 文献联动
+#
+# 🔴 检索函数可注入：默认 `local_source_scan` 是**库内卡片扫描**（关键词子串 +
+#    created 时间窗），不依赖 kb_serve 与索引文件；检索失败/取不到就如实报「未取到」，
+#    绝不编造文献条目。
+
+LIT_STOP = {"设计", "研究", "分析", "方法", "系统", "技术", "材料", "计算", "实验"}
+
+
+def project_keywords(data):
+    """课题方向 → 关键词：整串 + 分词（≥3 字，去通用词）。"""
+    raw = [str(data.get("direction") or ""), str(data.get("entry_point") or "")]
+    words, seen = [], set()
+    for w in raw:
+        w = w.strip()
+        if w and w not in seen:
+            seen.add(w)
+            words.append(w)
+        try:
+            toks = K.tokenize(w)
+        except Exception:                                 # noqa: BLE001
+            toks = []
+        for t in toks:
+            t = str(t).strip()
+            if len(t) >= 3 and t not in LIT_STOP and t not in seen:
+                seen.add(t)
+                words.append(t)
+    return words
+
+
+def local_source_scan(keywords, days=30, k=8, sources_dir=None, today=None):
+    """库内 source 卡扫描：frontmatter created 时间窗 → 关键词加权排序。
+
+    排序用**轻量 tf-idf**（在本批卡片上现算 df），不是 `kb_search` 的 BM25：
+    目的只是把「近 N 天入库的卡」按与该课题的相关度排个序，避免退化成
+    「按入库日期倒序前 k 张」——那样命中的全是当天入库的无关卡。
+
+    返回 {"hits": [...], "meta": {...}}；`meta` 必须带扫描口径与计数，
+    否则读者无法判断"0 条"是没文献还是没扫到。
+    """
+    import math
+    import yaml
+    d = sources_dir or os.path.join(K.VAULT, "wiki/sources")
+    today = today or datetime.date.today()
+    cutoff = today - datetime.timedelta(days=int(days))
+    kws = [w for w in (keywords or []) if w]
+    meta = {"criterion": "source 卡 frontmatter created 时间窗 + 关键词 tf-idf（非 BM25）",
+            "keywords": kws, "window_days": int(days), "cutoff": cutoff.isoformat(),
+            "scanned": 0, "in_window": 0, "matched": 0, "no_date": 0, "dir": ""}
+    if not os.path.isdir(d):
+        meta["error"] = f"source 卡目录不存在：{d}"
+        return {"hits": [], "meta": meta}
+    try:
+        meta["dir"] = os.path.relpath(d, K.VAULT)
+    except ValueError:
+        meta["dir"] = d
+    # 第一遍：读卡、时间窗过滤、统计词频
+    cards = []
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".md"):
+            continue
+        meta["scanned"] += 1
+        txt = K.read_text(os.path.join(d, fn))
+        fm = {}
+        if txt.startswith("---"):
+            end = txt.find("\n---", 4)
+            if end > 0:
+                try:
+                    fm = yaml.safe_load(txt[4:end]) or {}
+                except Exception:                          # noqa: BLE001
+                    fm = {}
+        created = _as_date(fm.get("created"))
+        if not created:
+            meta["no_date"] += 1
+            continue
+        if created < cutoff:
+            continue
+        meta["in_window"] += 1
+        tf = {w: txt.count(w) for w in kws}
+        cards.append({"name": fn[:-3], "created": created, "year": fm.get("year"),
+                      "journal": fm.get("journal") or "", "tf": tf,
+                      "summary": str(fm.get("summary") or "").strip()})
+    # 第二遍：df → idf → 打分
+    n = len(cards) or 1
+    idf = {}
+    for w in kws:
+        df = sum(1 for c in cards if c["tf"].get(w))
+        idf[w] = round(math.log((n + 1) / (df + 1)) + 1, 4)
+    hits = []
+    for c in cards:
+        present = [w for w in kws if c["tf"].get(w)]
+        if not present:
+            continue
+        score = sum(idf[w] * (1 + math.log(1 + c["tf"][w])) for w in present)
+        hits.append({"name": c["name"], "year": c["year"],
+                     "created": c["created"].isoformat(),
+                     "journal": c["journal"], "summary": c["summary"][:160],
+                     "keywords": present, "score": round(score, 3)})
+    hits.sort(key=lambda h: (h["score"], h["created"]), reverse=True)
+    meta["matched"] = len(hits)
+    meta["idf"] = idf
+    return {"hits": hits[:int(k)], "meta": meta}
+
+
+def build_literature(data, days=30, k=8, search_fn=None):
+    """课题方向 → 近期相关文献。检索失败必须如实降级，不得编造。"""
+    kws = project_keywords(data)
+    fn = search_fn or local_source_scan
+    try:
+        res = fn(kws, days=days, k=k) or {}
+    except Exception as e:                                # noqa: BLE001
+        return {"error": f"检索失败：{type(e).__name__}: {e}", "hits": [],
+                "meta": {"keywords": kws, "window_days": int(days)}}
+    if not isinstance(res, dict):
+        return {"error": "检索函数返回格式不正确（期望 dict）", "hits": [],
+                "meta": {"keywords": kws}}
+    out = {"hits": res.get("hits") or [], "meta": res.get("meta") or {}}
+    if res.get("meta", {}).get("error"):
+        out["error"] = res["meta"]["error"]
+    return out
+
+
+def render_literature_section(lit):
+    L = ["## 近期相关文献", ""]
+    meta = lit.get("meta") or {}
+    kws = meta.get("keywords") or []
+    L.append(f"> 口径：{meta.get('criterion') or '库内 source 卡扫描'}；"
+             f"关键词「{'、'.join(kws) if kws else '—'}」；"
+             f"时间窗近 {meta.get('window_days', '—')} 天"
+             f"（cutoff {meta.get('cutoff', '—')}）；"
+             f"扫描 {meta.get('scanned', 0)} 张卡 / 窗口内 {meta.get('in_window', 0)} 张 / "
+             f"关键词命中 {meta.get('matched', 0)} 张"
+             + (f"，缺 created 跳过 {meta['no_date']} 张" if meta.get("no_date") else "")
+             + "。")
+    L.append("")
+    hits = lit.get("hits") or []
+    if lit.get("error"):
+        L.append(f"**未取到相关文献**：{lit['error']}")
+        L.append("")
+        L.append("（检索失败时本工具不输出任何文献条目——不猜、不补。）")
+        L.append("")
+        return L
+    if not hits:
+        L.append("**未取到相关文献**：该时间窗内没有同时满足关键词与时间窗的 source 卡。")
+        L.append("")
+        L.append("这不等于「该方向没有新论文」，只等于**库内近窗口无匹配卡片**；"
+                 "需要覆盖最新进展时先跑 `/lit-watch` 定向补充，再重跑本命令。")
+        L.append("")
+        return L
+    for h in hits:
+        L.append(f"- [[sources/{h['name']}]]（{h.get('year') or '—'}，入库 {h.get('created')}）"
+                 + (f"　〔命中：{'、'.join(h.get('keywords') or [])}〕" if h.get("keywords") else "")
+                 + (f" — {h['summary']}" if h.get("summary") else ""))
+    L.append("")
+    return L
 
 
 # ---------------------------------------------------------------- 自检
@@ -317,9 +726,25 @@ def _selftest():
 
     tmp = K.make_temp_dir(prefix="sci_progress_")
     try:
-        cfg = {"sci": {"progress_dir": os.path.join(tmp, "progress")}}
-        d = new_project(cfg, "测试课题", direction="电解液设计",
-                        entry="AI 电解质设计", goal="验证 X")
+        cfg = {"sci": {"progress_dir": os.path.join(tmp, "progress"),
+                       "topics_dir": os.path.join(tmp, "topics"),
+                       "protocols_dir": os.path.join(tmp, "protocols")}}
+        # C1 夹具：主键关联要能读到切入点产物（不依赖真实知识库）
+        tdir = os.path.join(tmp, "topics", "研究方向A")
+        os.makedirs(tdir, exist_ok=True)
+        with open(os.path.join(tdir, "entry_points.json"), "w", encoding="utf-8") as f:
+            json.dump({"topic_id": "研究方向A", "direction": "研究方向A",
+                       "generated_at": "2026-10-01",
+                       "entry_points": [
+                           {"rank": 1, "sub_direction": "子方向A",
+                            "signal": "single-lab-claim", "feasibility_score": 0.552,
+                            "feasibility": "high", "rationale": "独立验证是空白"},
+                           {"rank": 2, "sub_direction": "机器学习势函数",
+                            "signal": "comp-no-expt", "feasibility_score": 0.519,
+                            "feasibility": "high", "rationale": "另一条"},
+                       ]}, f, ensure_ascii=False)
+        d = new_project(cfg, "测试课题", direction="研究方向A",
+                        entry="子方向 A", goal="验证 X")
         chk("新建：project.yaml 生成且字段正确",
             d["slug"] == "测试课题" and d["status"] == "planned" and
             os.path.isfile(project_path(cfg, d["slug"])))
@@ -353,20 +778,156 @@ def _selftest():
         chk("状态：可切换为 running",
             load_project(cfg, d["slug"])["status"] == "running")
 
-        link_protocol(cfg, d["slug"], "protocols/锌-电解液/strategy.md")
+        link_protocol(cfg, d["slug"], "protocols/方案A/strategy.md")
         chk("方案关联：去重写入",
             load_project(cfg, d["slug"])["protocol_refs"] ==
-            ["protocols/锌-电解液/strategy.md"])
+            ["protocols/方案A/strategy.md"])
 
-        p, md = write_summary(cfg, d["slug"])
+        p, md, _payload = write_summary(cfg, d["slug"])
         chk("摘要：含里程碑进度与实验表",
             "1/2" in md and "E002" in md and "失败" in md)
         chk("摘要：含下一步待办", "- [ ] 第二个里程碑" in md)
+        chk("摘要：未加 --timeline/--literature 时不插入额外小节",
+            "## 时间线" not in md and "## 近期相关文献" not in md)
+
+        # ---------------- N3 时间线 ----------------
+        tl = build_timeline(load_project(cfg, d["slug"]))
+        chk("时间线：含起点/实验/里程碑三类节点",
+            {e["kind"] for e in tl["events"]} == {"start", "experiment", "milestone"})
+        dates = [e["date"] for e in tl["events"]]
+        chk("时间线：节点按日期升序", dates == sorted(dates))
+        chk("时间线：实验节点保留 result 与 exp_id",
+            any(e["kind"] == "experiment" and e.get("result") == "failed"
+                and e.get("exp_id") == "E002" for e in tl["events"]))
+        chk("时间线：span 与 counts 一致",
+            tl["span"][0] == dates[0] and tl["span"][1] == dates[-1] and
+            sum(tl["counts"].values()) == len(tl["events"]))
+        bad = {"title": "x", "slug": "x", "created": "2026-10-01",
+               "experiments": [{"exp_id": "E001", "title": "t", "date": "not-a-date",
+                                "result": "success"}],
+               "milestones": [{"id": 1, "title": "m", "done": True, "done_date": ""}]}
+        tl_bad = build_timeline(bad)
+        chk("时间线：无效日期计入 skipped 而不是猜一个日期",
+            tl_bad["skipped_no_date"] == 2 and
+            [e["kind"] for e in tl_bad["events"]] == ["start"])
+        tl_empty = build_timeline({"title": "e", "slug": "e"})
+        chk("时间线：空课题不崩且不生成图事件",
+            tl_empty["events"] == [] and plot_timeline(tl_empty, tmp, "e") is None)
+        sec = render_timeline_section(tl)
+        chk("时间线：渲染含日期表", any("| 日期 | 类型 | 内容 |" in x for x in sec))
+        png = plot_timeline(tl, project_dir(cfg, d["slug"]), d["slug"])
+        chk("时间线：matplotlib 出图成功且非空",
+            bool(png) and os.path.isfile(png) and os.path.getsize(png) > 1000)
+        tl_png = dict(tl, png="timeline.png")
+        chk("时间线：有图时渲染带图片引用",
+            any(x.startswith("![时间线]") for x in render_timeline_section(tl_png)))
+        lim = timeline_xlim(tl)
+        chk("时间线：横轴范围留余量但不跨年（同日多节点也不炸）",
+            lim is not None and 0 < (lim[1] - lim[0]).days <= 60,
+            str(lim))
+        same_day = {"events": [{"date": "2026-10-20", "kind": "start"},
+                               {"date": "2026-10-20", "kind": "experiment"}]}
+        lim2 = timeline_xlim(same_day)
+        chk("时间线：全部事件同日 ⇒ 横轴 14 天（不是自动缩放到数年）",
+            lim2 is not None and (lim2[1] - lim2[0]).days == 14, str(lim2))
+
+        # ---------------- N4 文献联动 ----------------
+        src_dir = os.path.join(tmp, "sources")
+        os.makedirs(src_dir, exist_ok=True)
+        import yaml as _yaml
+        today = datetime.date.today()
+        fresh = (today - datetime.timedelta(days=10)).isoformat()
+        old = (today - datetime.timedelta(days=400)).isoformat()
+        for nm, created, summ in (("新鲜-研究方向A-A", fresh, "研究方向A 相关"),
+                                  ("陈旧-研究方向A-B", old, "研究方向A 旧文"),
+                                  ("无关-催化-C", fresh, "完全无关")):
+            with open(os.path.join(src_dir, nm + ".md"), "w", encoding="utf-8") as f:
+                f.write("---\n" + _yaml.safe_dump(
+                    {"type": "source", "created": created, "year": created[:4],
+                     "summary": summ}, allow_unicode=True, sort_keys=False) + "---\n\n"
+                    + summ + "\n")
+        scan = local_source_scan(["研究方向A"], days=30, k=8, sources_dir=src_dir)
+        names = [h["name"] for h in scan["hits"]]
+        chk("文献：时间窗过滤生效（陈旧卡不入列）",
+            "新鲜-研究方向A-A" in names and "陈旧-研究方向A-B" not in names)
+        chk("文献：关键词过滤生效（无关卡不入列）", "无关-催化-C" not in names)
+        chk("文献：meta 带扫描口径与计数",
+            scan["meta"]["scanned"] == 3 and scan["meta"]["matched"] == 1 and
+            "关键词" in scan["meta"]["criterion"])
+        data_lit = dict(load_project(cfg, d["slug"]), direction="研究方向A")
+        lit_ok = build_literature(data_lit, days=30, k=8,
+                                  search_fn=lambda kws, days, k: scan)
+        sec_lit = render_literature_section(lit_ok)
+        chk("文献：命中时渲染带 wikilink 的条目",
+            any("[[sources/新鲜-研究方向A-A]]" in x for x in sec_lit))
+
+        def _boom(kws, days, k):
+            raise RuntimeError("索引不可用")
+
+        lit_err = build_literature(data_lit, search_fn=_boom)
+        sec_err = render_literature_section(lit_err)
+        chk("文献：检索失败如实报未取到且不输出任何条目",
+            "未取到" in "".join(sec_err) and
+            not any("[[sources/" in x for x in sec_err))
+        lit_none = build_literature(dict(data_lit, direction=""),
+                                    search_fn=lambda kws, days, k: {"hits": [], "meta": {}})
+        chk("文献：0 命中时给出可执行下一步而非编造",
+            "lit-watch" in "".join(render_literature_section(lit_none)))
+        p2, md2, payload2 = write_summary(cfg, d["slug"], timeline=True,
+                                         literature=True, days=30, k=8,
+                                         search_fn=lambda kws, days, k: scan)
+        chk("摘要：加开关后写入时间线与文献小节且产出 timeline.json",
+            "## 时间线" in md2 and "## 近期相关文献" in md2 and
+            os.path.isfile(os.path.join(project_dir(cfg, d["slug"]), "timeline.json")) and
+            payload2.get("timeline") and payload2.get("literature"))
 
         lst = list_projects(cfg)
         chk("列表：统计实验数与里程碑完成数",
             len(lst) == 1 and lst[0]["experiments"] == 3 and
             lst[0]["milestones_done"] == 1)
+
+        # ---------------- 课题主键（§五.1）：C1 切入点绑定 ----------------
+        md_line = "\n".join(render_lineage(L.trace(d["slug"], cfg)))
+        chk("主键：未绑定时沿革明说「未关联」并给补链入口",
+            "未关联" in md_line and "--entry-ref" in md_line)
+        d2 = new_project(cfg, "带主键的课题", goal="g",
+                         entry_ref="研究方向A#子方向A", slug="with-ref")
+        ref = (load_project(cfg, "with-ref") or {}).get("entry_point_ref") or {}
+        chk("主键：new --entry-ref 落成快照（id/当时分数/备选齐全）",
+            ref.get("id") == "研究方向A#子方向A" and
+            ref.get("feasibility_score_at_selection") == 0.552 and
+            [a["sub_direction"] for a in (ref.get("alternatives") or [])] == ["机器学习势函数"])
+        chk("主键：自由文本 entry_point 自动补成子方向名",
+            load_project(cfg, "with-ref")["entry_point"] == "子方向A" and
+            load_project(cfg, "with-ref")["direction"] == "研究方向A")
+        md_ref = "\n".join(render_lineage(L.trace("with-ref", cfg)))
+        chk("主键：沿革渲染出主键、当时分数与当时落选",
+            "研究方向A#子方向A" in md_ref and "0.552" in md_ref and
+            "机器学习势函数" in md_ref)
+        chk("主键：解析状态为已关联",
+            L.trace("with-ref", cfg)["resolve"]["state"] == "ok")
+        try:
+            new_project(cfg, "坏主键", entry_ref="没有井号", slug="bad-ref")
+            chk("主键：格式错误的主键被拒", False)
+        except ValueError:
+            chk("主键：格式错误的主键被拒", True)
+        p3, md3, payload3 = write_summary(cfg, "with-ref")
+        chk("主键：进展摘要里出现「课题沿革」小节",
+            "## 课题沿革（C1→C2→C3）" in md3 and
+            bool((payload3.get("lineage") or {}).get("entry_point_ref")))
+        # 给**已有**课题补链（历史产物没有 --entry-ref 的场合）
+        snap2, old2, _bak = set_entry_ref(cfg, d["slug"], "研究方向A#机器学习势函数")
+        chk("主键：可给已有课题补绑（旧值报 None）",
+            snap2["id"] == "研究方向A#机器学习势函数" and old2 is None and
+            (load_project(cfg, d["slug"])["entry_point_ref"]["id"] ==
+             "研究方向A#机器学习势函数"))
+        snap3, old3, _bak3 = set_entry_ref(cfg, d["slug"], "研究方向A#子方向A")
+        chk("主键：重复补绑会替换旧引用并把旧值报出来",
+            snap3["id"] == "研究方向A#子方向A" and
+            (old3 or {}).get("id") == "研究方向A#机器学习势函数")
+        chk("主键：补链后写盘复算通过（yaml 可解析且 id 一致）",
+            (lambda x: x.get("id") == "研究方向A#子方向A")(_read_yaml(
+                project_path(cfg, d["slug"])).get("entry_point_ref") or {}))
     finally:
         K.remove_temp_dir(tmp)
 
@@ -392,6 +953,8 @@ def main(argv=None):
     p_new.add_argument("--entry", default="")
     p_new.add_argument("--goal", default="")
     p_new.add_argument("--slug", default=None)
+    p_new.add_argument("--entry-ref", default="", metavar="方向#子方向",
+                       help="课题主键：绑定 C1 切入点（写入快照，C1 重跑不改）")
 
     sub.add_parser("list", help="列出课题")
     p_show = sub.add_parser("show", help="查看课题")
@@ -416,13 +979,23 @@ def main(argv=None):
     p_st.add_argument("slug")
     p_st.add_argument("status", choices=STATUSES)
 
-    p_lk = sub.add_parser("link", help="关联方案")
+    p_lk = sub.add_parser("link", help="关联方案 / 补绑切入点主键")
     p_lk.add_argument("slug")
-    p_lk.add_argument("--protocol", required=True)
+    p_lk.add_argument("--protocol", default="", help="方案产物路径（相对库根或 sci 根）")
+    p_lk.add_argument("--entry-ref", default="", metavar="方向#子方向",
+                      help="§五.1：给已有课题补绑 C1 切入点（写快照；必须来自真实选择）")
 
     p_sm = sub.add_parser("summary", help="生成进展摘要")
     p_sm.add_argument("slug")
     p_sm.add_argument("--json", action="store_true")
+    p_sm.add_argument("--timeline", action="store_true",
+                      help="N3：生成 timeline.json + timeline.png（时间线）")
+    p_sm.add_argument("--literature", action="store_true",
+                      help="N4：追加「近期相关文献」小节（库内 source 卡扫描）")
+    p_sm.add_argument("--days", type=int, default=30,
+                      help="配合 --literature：时间窗天数（默认 30）")
+    p_sm.add_argument("--k", type=int, default=8,
+                      help="配合 --literature：最多列几条（默认 8）")
 
     ap.add_argument("--selftest", action="store_true")
     # --selftest 放在顶层时，subparsers 可能先抢；两者都支持
@@ -436,8 +1009,12 @@ def main(argv=None):
     cfg = load_config()
     if args.cmd == "new":
         d = new_project(cfg, args.title, args.direction, args.entry,
-                        args.goal, args.slug)
+                        args.goal, args.slug, entry_ref=(args.entry_ref or None))
         print(f"[ok] 新建课题：{d['slug']}（{d['status']}）")
+        if d.get("entry_point_ref"):
+            r = d["entry_point_ref"]
+            print(f"     切入点快照：{r['id']}（当时 {r.get('feasibility_score_at_selection')}，"
+                  f"备选 {len(r.get('alternatives') or [])} 条）")
         return 0
     if args.cmd == "list":
         rows = list_projects(cfg)
@@ -449,7 +1026,7 @@ def main(argv=None):
         return 0
     if args.cmd == "show":
         d = load_project(cfg, args.slug)
-        print(render_summary(d))
+        print(render_summary(d, extra=render_lineage(L.trace(args.slug, cfg))))
         return 0
     if args.cmd == "log":
         body = args.body
@@ -477,14 +1054,43 @@ def main(argv=None):
         print(f"[ok] 状态 → {args.status}")
         return 0
     if args.cmd == "link":
-        refs = link_protocol(cfg, args.slug, args.protocol)
-        print(f"[ok] 已关联（{len(refs)} 条）")
+        did = False
+        if args.protocol:
+            refs = link_protocol(cfg, args.slug, args.protocol)
+            print(f"[ok] 方案关联（{len(refs)} 条）")
+            did = True
+        if args.entry_ref:
+            snap, old, bak = set_entry_ref(cfg, args.slug, args.entry_ref)
+            old_id = (old or {}).get("id") or "无"
+            print(f"[ok] 切入点绑定：{snap['id']}"
+                  f"（当时 {snap.get('feasibility_score_at_selection')}，"
+                  f"备选 {len(snap.get('alternatives') or [])} 条；原：{old_id}）")
+            if bak:
+                print(f"     备份：{os.path.relpath(str(bak), K.VAULT) if os.path.isabs(str(bak)) else bak}")
+            did = True
+        if not did:
+            print("[!] 需要 --protocol 或 --entry-ref（至少给一个）")
+            return 1
         return 0
     if args.cmd == "summary":
-        p, md = write_summary(cfg, args.slug)
+        p, md, payload = write_summary(cfg, args.slug, timeline=args.timeline,
+                                       literature=args.literature,
+                                       days=args.days, k=args.k)
         if args.json:
-            print(json.dumps(load_project(cfg, args.slug), ensure_ascii=False, indent=2))
+            out = load_project(cfg, args.slug)
+            out.update(payload)
+            print(json.dumps(out, ensure_ascii=False, indent=2))
         print(f"[ok] 摘要：{os.path.relpath(p, K.VAULT)}")
+        if args.timeline:
+            tl = payload.get("timeline") or {}
+            print(f"     时间线：{len(tl.get('events') or [])} 个节点"
+                  + (f"，图 {tl['png']}" if tl.get("png") else "（无事件，未生成图）")
+                  + (f"，{tl.get('skipped_no_date')} 条缺日期已跳过"
+                     if tl.get("skipped_no_date") else ""))
+        if args.literature:
+            lit = payload.get("literature") or {}
+            print(f"     文献：命中 {len(lit.get('hits') or [])} 条"
+                  + (f"（未取到：{lit['error']}）" if lit.get("error") else ""))
         return 0
     ap.print_help()
     return 1

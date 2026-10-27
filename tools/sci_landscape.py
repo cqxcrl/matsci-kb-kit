@@ -19,9 +19,9 @@
     映射不到 -> unranked；arXiv -> preprint；公众号/微信 -> non-journal。**不凭空给档**。
 
 用法：
-  python tools/sci_landscape.py --direction "电解液设计"
-  python tools/sci_landscape.py --direction "电解液设计" --top-k 300 --json
-  python tools/sci_landscape.py --direction "电解液设计" --no-write --json
+  python tools/sci_landscape.py --direction "研究方向A"
+  python tools/sci_landscape.py --direction "研究方向A" --top-k 300 --json
+  python tools/sci_landscape.py --direction "研究方向A" --no-write --json
   python tools/sci_landscape.py --selftest
 
 输出：projects/sci-assistant/topics/<slug>/landscape.json（--out 可覆盖）
@@ -467,7 +467,7 @@ def add_subdirections(data, records, cfg, k_override=None, seed=0):
 
     concept_map = _concept_outlinks([r["name"] for r in records])
     anchor = ((data.get("signal") or {}).get("direction_anchor") or {})
-    # 方向本身不列为子方向（如查「电解液设计」时，concept 页「电解液设计」是方向而非细分）
+    # 方向本身不列为子方向（如查「研究方向A」时，concept 页「研究方向A」是方向而非细分）
     groups, ginfo = concept_groups(records, concept_map, min_size, max_k,
                                    max_share=max_share,
                                    exclude=[anchor["page"]] if anchor.get("page") else None)
@@ -584,7 +584,7 @@ def build(direction, top_k=None, cfg=None, cluster=False, k_override=None):
     l1_hits = collections.Counter(str(x.get("type") or "?") for x in l1)
 
     # 方向锚定：该方向在库内是否有**同名/别名**的 concept/topic 页。
-    # 这比 BM25 绝对分可靠——实测「量子纠缠催化反应堆」得 12.9、「电解液设计」只得 2.8，
+    # 这比 BM25 绝对分可靠——实测「量子纠缠催化反应堆」得 12.9、「研究方向A」只得 2.8，
     # 分数不可跨查询比较（CLAUDE.md：BM25 无分数下限）。
     anchor = None
     for alias, canon in KS.resolve_aliases(direction, meta.get("alias_map", {})):
@@ -828,7 +828,7 @@ def _selftest():
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="领域景观分析：方向 -> 分面聚合 -> landscape.json（Phase 1a）")
-    ap.add_argument("--direction", help="研究方向，如 \"电解液设计\"")
+    ap.add_argument("--direction", help="研究方向，如 \"研究方向A\"")
     ap.add_argument("--top-k", type=int, default=None, help="候选 source 卡上限（默认取配置 200）")
     ap.add_argument("--out", default=None, help="输出路径（默认 topics/<slug>/landscape.json）")
     ap.add_argument("--json", action="store_true", help="把结果 JSON 打印到 stdout")

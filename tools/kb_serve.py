@@ -42,6 +42,12 @@ CLI 模式下语义检索 **30.2 s/次**、混合检索 **56.0 s/次**。
     /search?q=...&k=10&type=concept,entity&mode=bm25|semantic|hybrid
     /resolve?q=...
     /stats
+    /graph?node=<页名>&hops=1&direction=both|out|in&type=concept,topic&limit=200
+    /graph?path=<A>,<B>          最短有向路径
+    /graph?hubs=1&top=20         入度最高（枢纽页；条数用 top，邻域才用 limit）
+    /graph?bridges=1&top=20      割点（骨架页）
+    /graph?stats=1               节点/边/连通块计数
+    /graph?...&reload=1          索引重建后强制重载图
 """
 
 import os
@@ -63,16 +69,26 @@ DEFAULT_PORT = 8791
 _START = time.time()
 _LOCK = threading.Lock()          # 模型推理串行化（torch 在小机器上并发不划算）
 _STATE = {"meta": None, "bm": None, "sem": None, "warm": False,
-          "warm_error": None, "queries": 0}
+          "warm_error": None, "queries": 0, "graph": None, "index_signature": None}
+
+
+def _index_signature():
+    paths = (K.META_PATH, K.BM25_PATH, K.META_FM_PATH, K.FULL_PATH)
+    return tuple((p, os.path.getmtime(p), os.path.getsize(p)) if os.path.exists(p)
+                 else (p, None, None) for p in paths)
 
 
 # ---------------------------------------------------------------- 惰性加载
 
 def get_index():
-    if _STATE["meta"] is None or _STATE["bm"] is None:
+    signature = _index_signature()
+    if (_STATE["meta"] is None or _STATE["bm"] is None
+            or signature != _STATE["index_signature"]):
         import kb_search as KS
         meta, bm = KS.load_index()
         _STATE["meta"], _STATE["bm"] = meta, bm
+        _STATE["index_signature"] = signature
+        _STATE["graph"] = None
     return _STATE["meta"], _STATE["bm"]
 
 
@@ -95,50 +111,37 @@ def warm_semantic():
 
 # ---------------------------------------------------------------- 检索逻辑
 
-def do_search(q, k=10, type_filter="", mode="bm25", as_json=True):
-    import kb_search as KS
-    meta, bm = get_index()
-    types = [t.strip() for t in (type_filter or "").split(",") if t.strip()]
-
-    def keep(name, ptype):
-        return (not types) or (ptype in types)
-
-    results = []
-    if mode in ("semantic", "hybrid"):
-        SEM = get_semantic()
-        with _LOCK:
-            if mode == "semantic":
-                raw = SEM.semantic_search(q, top_k=k * 3)
-            else:
-                raw = SEM.hybrid_search(q, top_k=k * 3)
-        for name, score in raw:
-            s, u, tags, al, t = KS.meta_of(meta, name)
-            if keep(name, t):
-                results.append((name, score, s, u, tags, al, t))
-        results = results[:k]
-    else:
-        alias_hits = KS.resolve_aliases(q, meta.get("alias_map", {}))
-        strong = [(a, c) for a, c in alias_hits if len(a) >= 3] or alias_hits[:1]
-        canon = [c for _, c in strong]
-        qt = K.tokenize(q)
-        for c in canon:
-            qt.extend(K.tokenize(c))
-        for a, c in alias_hits:
-            if c not in canon:
-                qt.extend(K.tokenize(c))
-        with _LOCK:
-            ranked = KS.bm25_score(qt, bm, canon, query_raw=q)
-        for name, score in ranked:
-            s, u, tags, al, t = KS.meta_of(meta, name)
-            if keep(name, t):
-                results.append((name, score, s, u, tags, al, t))
-        results = results[:k]
-
-    out = [{"name": n, "type": t, "score": round(sc, 4), "summary": s,
-            "updated": u, "tags": tags, "aliases": al, "path": KS.page_path(n, t)}
-           for n, sc, s, u, tags, al, t in results]
+def do_search(q, k=10, type_filter="", mode="hybrid", candidate_k=0, rerank_k=0,
+              reranker_model="", allow_download=False):
+    import kb_rag
+    get_index()
+    with _LOCK:
+        data = kb_rag.retrieve(
+            q, k=k, mode=mode,
+            type_filter=[x.strip() for x in (type_filter or "").split(",") if x.strip()],
+            candidate_k=candidate_k, rerank_k=rerank_k,
+            reranker_model=reranker_model or None, allow_download=allow_download)
     _STATE["queries"] += 1
-    return {"mode": mode, "query": q, "count": len(out), "results": out}
+    return data
+
+
+def do_ask(q, strategy="auto", mode="hybrid", k=10, candidate_k=0, rerank_k=0,
+           max_steps=6, budget=None, no_graph=False, reranker_model="",
+           allow_download=False):
+    import kb_agentic
+    import kb_rag
+    decision = kb_agentic.classify_query(q)
+    selected = decision["strategy"] if strategy == "auto" else strategy
+    if selected == "simple":
+        data = do_search(q, k=k, mode=mode, candidate_k=candidate_k, rerank_k=rerank_k,
+                         reranker_model=reranker_model, allow_download=allow_download)
+        data["classification"] = decision
+        return data
+    with _LOCK:
+        data = kb_agentic.run(q, max_steps=max_steps, budget=budget,
+                              graph_expansion=not no_graph)
+    _STATE["queries"] += 1
+    return data
 
 
 def do_resolve(q):
@@ -165,6 +168,157 @@ def do_route(q, budget=None, layers=(1, 2, 3)):
     return pkg
 
 
+def get_graph(reload=False):
+    """惰性加载知识图谱（pages, out_adj, in_adj）；meta_full.json 缺失时返回 None。
+
+    🔴 2026-10-24：图缓存也必须跟随索引签名失效。旧实现只在 `get_index()` 里清图，
+    若服务运行期间只访问 `/graph`，重建索引后仍会长期返回旧图。
+    """
+    import kb_graph as G
+    signature = _index_signature()
+    if (reload or _STATE["graph"] is None
+            or signature != _STATE["index_signature"]):
+        if not os.path.exists(G.FULL):
+            _STATE["graph"] = None
+            _STATE["index_signature"] = signature
+            return None
+        _STATE["graph"] = G.load_graph()
+        _STATE["index_signature"] = signature
+    return _STATE["graph"]
+
+
+def _clean_node(name):
+    n = str(name or "").strip().replace("\\", "/").split("/")[-1]
+    return n[:-3] if n.endswith(".md") else n
+
+
+def _path_depth_limited(out_adj, src, depth):
+    """BFS 到 depth 层后，若截断层仍有未访问的出邻居 ⇒ 可能存在更长路径。
+
+    独立成函数是为了能用合成小图正反测（见 selftest）——直接测 do_graph
+    要靠真实图谱恰好凑出「距离 > depth」的点对，脆且不可控。
+    """
+    reached, frontier = {src}, [src]
+    for _ in range(max(1, int(depth))):
+        nxt = []
+        for n in frontier:
+            for nb in sorted(out_adj.get(n, ())):
+                if nb not in reached:
+                    reached.add(nb)
+                    nxt.append(nb)
+        frontier = nxt
+        if not frontier:
+            break
+    return any(nb not in reached for n in frontier for nb in out_adj.get(n, ()))
+
+
+def do_graph(node=None, hops=1, direction="both", types=None, limit=200, top=None,
+             path=None, hubs=False, bridges=False, stats=False, reload=False,
+             depth=6):
+    """知识图谱查询（只读）。
+
+    mode：stats → 计数；hubs → 枢纽；bridges → 骨架页；path → 有向路径；否则邻域子图。
+    ⚠️ 返回的子图是**有上限**的（默认 200 节点），被截断时 truncated=true ——
+       不静默截断，否则调用方会以为图就这么大。
+    """
+    import kb_graph as G
+    loaded = get_graph(reload=reload)
+    if loaded is None:
+        return {"ok": False, "error": "缺少 meta_full.json，先跑 kb_build_index.py"}
+    pages, out_adj, in_adj = loaded
+    names = set(pages)
+    deg = {n: (len(out_adj.get(n, ())), len(in_adj.get(n, ()))) for n in names}
+
+    if stats:
+        adj_nodes = {n for n in names if out_adj.get(n) or in_adj.get(n)}
+        comp = G.components(out_adj, in_adj, sorted(names))
+        return {"ok": True, "mode": "stats", "nodes": len(names),
+                "with_edges": len(adj_nodes),
+                "edges": sum(len(v) for v in out_adj.values()),
+                "components": len(comp),
+                "isolated": len(names) - len(adj_nodes)}
+
+    n_top = int(top or limit)
+    if hubs:
+        ranked = sorted(names, key=lambda n: (-deg[n][1], n))[:n_top]
+        return {"ok": True, "mode": "hubs", "count": len(ranked),
+                "nodes": [{"name": n, "type": (pages.get(n) or {}).get("type"),
+                           "in": deg[n][1], "out": deg[n][0]} for n in ranked]}
+
+    if bridges:
+        pts = sorted(G.articulation_points(out_adj, in_adj, sorted(names)),
+                     key=lambda n: (-deg[n][1], n))
+        shown = pts[:n_top]
+        return {"ok": True, "mode": "bridges", "count": len(pts),
+                "nodes": [{"name": n, "type": (pages.get(n) or {}).get("type"),
+                           "in": deg[n][1], "out": deg[n][0]} for n in shown]}
+
+    if path:
+        parts = [p for p in str(path).replace(",", " ").split() if p]
+        if len(parts) != 2:
+            return {"ok": False, "error": "path 需要两个页名：path=A,B"}
+        a, b = _clean_node(parts[0]), _clean_node(parts[1])
+        for n in (a, b):
+            if n not in names:
+                return {"ok": False, "error": f"unknown node: {n}"}
+        depth_i = max(1, min(int(depth), 50))
+        seq = G.bfs_path(out_adj, a, b, max_depth=depth_i)
+        if not seq:
+            # 🔴 「不可达」与「超出跳数上限」是两件事：bfs_path 在 max_depth 处硬截断，
+            #    若截断层的节点仍有未访问的出邻居，就可能存在更长路径。不区分会让调用方
+            #    把「图太深」误读成「根本无路」。（2026-10-24 修复）
+            depth_limited = _path_depth_limited(out_adj, a, depth_i)
+            return {"ok": True, "mode": "path", "path": None, "length": 0,
+                    "max_depth": depth_i, "depth_limited": depth_limited,
+                    "note": ("超出跳数上限，可能存在更长路径（用 &depth= 放宽）"
+                             if depth_limited else "沿出链不可达（试试反向或换起点）")}
+        return {"ok": True, "mode": "path", "path": seq, "length": len(seq) - 1,
+                "max_depth": depth_i,
+                "nodes": [{"name": n, "type": (pages.get(n) or {}).get("type")}
+                          for n in seq],
+                "edges": [{"source": seq[i], "target": seq[i + 1]}
+                          for i in range(len(seq) - 1)]}
+
+    src = _clean_node(node)
+    if not src:
+        return {"ok": False, "error": "missing node"}
+    if src not in names:
+        return {"ok": False, "error": f"unknown node: {src}",
+                "hint": "用 /search 或 /resolve 先确认页名"}
+    typeset = {x.strip() for x in (types or "").split(",") if x.strip()}
+    hops_i = max(1, min(int(hops), 10))
+    levels = G.neighbors(out_adj, in_adj, src, hops=hops_i, direction=direction,
+                         type_filter=typeset or None, pages=pages, cap=int(limit))
+    keep = {src}
+    for h in sorted(levels):
+        keep |= set(levels[h])
+    limit_i = max(1, int(limit))
+    # 🔴 源节点**必须**保留：按字母排序截断会把 `quality-check-*` 这类
+    #    src 排在后面的节点挤掉，响应却仍标 "node": src（2026-10-24 修复）。
+    capped = [src] + [n for n in sorted(keep) if n != src][: max(0, limit_i - 1)]
+    keep = set(capped)
+    truncated = len(keep) < 1 + sum(len(v) for v in levels.values())
+    nodes = [{"name": n, "type": (pages.get(n) or {}).get("type"),
+              "hop": 0 if n == src else next((h for h in sorted(levels) if n in levels[h]), None),
+              "in": deg[n][1], "out": deg[n][0]} for n in sorted(keep)]
+    edges = []
+    for n in keep:
+        for tgt in sorted(out_adj.get(n, ())):
+            if tgt in keep:
+                edges.append({"source": n, "target": tgt, "direction": "out"})
+        if direction in ("in", "both"):
+            for s in sorted(in_adj.get(n, ())):
+                if s in keep and not (s in out_adj and n in out_adj.get(s, ())):
+                    edges.append({"source": s, "target": n, "direction": "in"})
+    edge_cap = 4 * limit_i
+    edge_total = len(edges)
+    return {"ok": True, "mode": "neighborhood", "node": src, "hops": hops_i,
+            "direction": direction, "truncated": truncated,
+            "count": len(nodes), "edge_count": edge_total,
+            "edges_truncated": edge_total > edge_cap,
+            "nodes": nodes, "edges": edges[:edge_cap]}
+
+
 def do_health():
     meta, bm = get_index()
     sem_info = {}
@@ -172,6 +326,12 @@ def do_health():
         SEM = get_semantic()
         sem_info["embed_index"] = os.path.exists(SEM.EMBED_PATH)
         sem_info["warm"] = _STATE["warm"]
+        _em, embed_map = SEM._load_embeddings()
+        if embed_map is not None:
+            missing, stale, fresh = SEM.check_index_freshness(embed_map, verbose=False)
+            sem_info["fresh"] = fresh
+            sem_info["missing"] = len(missing)
+            sem_info["stale"] = len(stale)
         if _STATE["warm_error"]:
             sem_info["warm_error"] = _STATE["warm_error"]
     except Exception as e:                       # noqa: BLE001
@@ -195,6 +355,7 @@ def do_health():
         "bm25_version": bm.get("_version", 1),
         "bm25_postings": sum(len(v) for v in (bm.get("postings") or {}).values()),
         "queries_served": _STATE["queries"],
+        "graph_loaded": _STATE["graph"] is not None,
         "semantic": sem_info,
     }
 
@@ -208,7 +369,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, obj, code=200):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        body = K.json_dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -242,15 +403,57 @@ class Handler(BaseHTTPRequestHandler):
                 q = qs.get("q", [""])[0]
                 if not q.strip():
                     return self._send({"error": "missing q"}, 400)
+                # 🔴 索引缺失时 kb_corpus.search() 返回 []，HTTP 层会把它渲染成
+                #    `count: 0` 的 200 成功——调用方无从区分「库里没这段文字」与
+                #    「语料索引没建」。这里显式报 503 并给修复命令。（2026-10-24 修复）
+                import kb_corpus as C
+                if C.load_corpus() is None:
+                    return self._send({
+                        "error": "corpus 索引缺失", "hint": "python tools/kb.py index corpus"}, 503)
                 return self._send(do_corpus(q, k=int(qs.get("k", ["8"])[0])))
             if path == "/route":
                 q = qs.get("q", [""])[0]
                 if not q.strip():
                     return self._send({"error": "missing q"}, 400)
-                # 解析走 kb_lib 的单一实现（此前 HTTP 查询串与 CLI 各有一套拷贝）。
-                layers = K.parse_layers(qs.get("layer", [""])[0])
+                layer_arg = qs.get("layer", [""])[0]
+                layers = K.parse_layers(layer_arg)
+                # 与本地回退同口径：未显式指定 layer 时，no_corpus 裁掉 L3
+                if not layer_arg and qs.get("no_corpus", ["0"])[0] == "1":
+                    layers = (1, 2)
                 budget = K.parse_budget(qs.get("budget", [""])[0])
                 return self._send(do_route(q, budget=budget, layers=layers))
+            if path == "/ask":
+                q = qs.get("q", [""])[0]
+                if not q.strip():
+                    return self._send({"error": "missing q"}, 400)
+                return self._send(do_ask(
+                    q,
+                    strategy=qs.get("strategy", ["auto"])[0],
+                    mode=qs.get("mode", ["hybrid"])[0],
+                    k=int(qs.get("k", ["10"])[0]),
+                    candidate_k=int(qs.get("candidate_k", ["0"])[0]),
+                    rerank_k=int(qs.get("rerank_k", ["0"])[0]),
+                    max_steps=int(qs.get("max_steps", ["6"])[0]),
+                    budget=K.parse_budget(qs.get("budget", [""])[0]),
+                    no_graph=qs.get("no_graph", ["0"])[0] == "1",
+                    reranker_model=qs.get("reranker_model", [""])[0],
+                    allow_download=qs.get("allow_download", ["0"])[0] == "1",
+                ))
+            if path == "/graph":
+                return self._send(do_graph(
+                    node=qs.get("node", [""])[0],
+                    hops=int(qs.get("hops", ["1"])[0]),
+                    direction=qs.get("direction", ["both"])[0],
+                    types=qs.get("type", [""])[0],
+                    limit=int(qs.get("limit", ["200"])[0]),
+                    top=int(qs.get("top", ["0"])[0] or 0) or None,
+                    path=qs.get("path", [""])[0],
+                    hubs=qs.get("hubs", [""])[0] not in ("", "0"),
+                    bridges=qs.get("bridges", [""])[0] not in ("", "0"),
+                    stats=qs.get("stats", [""])[0] not in ("", "0"),
+                    reload=qs.get("reload", [""])[0] not in ("", "0"),
+                    depth=int(qs.get("depth", ["6"])[0]),
+                ))
             if path == "/search":
                 q = qs.get("q", [""])[0]
                 if not q.strip():
@@ -259,13 +462,27 @@ class Handler(BaseHTTPRequestHandler):
                     q,
                     k=int(qs.get("k", ["10"])[0]),
                     type_filter=qs.get("type", [""])[0],
-                    mode=qs.get("mode", ["bm25"])[0],
+                    mode=qs.get("mode", ["hybrid"])[0],
+                    candidate_k=int(qs.get("candidate_k", ["0"])[0]),
+                    rerank_k=int(qs.get("rerank_k", ["0"])[0]),
+                    reranker_model=qs.get("reranker_model", [""])[0],
+                    allow_download=qs.get("allow_download", ["0"])[0] == "1",
                 ))
             return self._send({"error": "unknown endpoint",
                                "endpoints": ["/health", "/stats", "/resolve",
-                                             "/search", "/corpus", "/route"]}, 404)
-        except Exception as e:                   # noqa: BLE001
-            return self._send({"error": f"{type(e).__name__}: {e}"}, 500)
+                                             "/search", "/ask", "/corpus", "/route",
+                                             "/graph"]}, 404)
+        except (Exception, SystemExit) as e:    # noqa: BLE001
+            import kb_rag
+            # kb_search.load_index() 在索引缺失时 sys.exit(2) ⇒ SystemExit 不是
+            # Exception；不接住会让 handler 线程直接终止、客户端收到断线而不是 503。
+            if isinstance(e, SystemExit):
+                code = 503
+            else:
+                code = 503 if isinstance(e, kb_rag.RetrievalUnavailable) else 500
+                if isinstance(e, ValueError):
+                    code = 400
+            return self._send({"error": f"{type(e).__name__}: {e}"}, code)
 
 
 # ---------------------------------------------------------------- 客户端
@@ -302,7 +519,7 @@ def main():
         return selftest()
     if args.status:
         h = ping(args.port)
-        print(json.dumps(h, ensure_ascii=False, indent=1) if h
+        print(K.json_dumps(h, ensure_ascii=False, indent=1) if h
               else f"[--] 服务未运行（{server_url(args.port)}）")
         return 0 if h else 1
     if args.stop:
@@ -338,6 +555,7 @@ def main():
           f"/search?q=&k=10&mode=bm25|semantic|hybrid")
     print(f"           /corpus?q=&k=8        raw 全文分块检索")
     print(f"           /route?q=&budget=5,5,8  分层上下文包（L1综合/L2文献卡/L3原文）")
+    print(f"           /graph?node=<页名>&hops=1 知识图谱邻域；&path=A,B /&hubs=1 /&bridges=1 /&stats=1")
     if args.warm:
         threading.Thread(target=warm_semantic, daemon=True).start()
         print("     [warm] 语义模型后台预热中…（首次语义查询无需再等 21 秒）")
@@ -356,7 +574,7 @@ def selftest():
     print(f"  索引: {meta.get('count')} 页, bm25 v{bm.get('_version', 1)}")
     if bm.get("_version") != 2:
         print("  [!] 索引不是 v2（缺 postings），语义/混合以外的路径仍可用")
-    r = do_search("固态电解质界面", k=3)
+    r = do_search("固态电解质界面", k=3, mode="bm25")
     print(f"  BM25 检索返回 {r['count']} 条")
     # 「必须召回」只对**有内容**的库成立；空库 0 命中是正确行为，不是故障。
     if meta.get("count", 0) > 0:
@@ -369,13 +587,59 @@ def selftest():
         print(f"    [{'ok' if ex else 'FAIL'}] {item['name'][:28]} -> {p}")
         ok = ok and ex
     print(f"  /resolve: {do_resolve('SSE')['alias_hits'][:2]}")
+
+    # N2：/graph —— 统计 / 邻域 / 路径 / 枢纽 / 骨架（全部纯函数，不依赖 HTTP 端口）
+    gs = do_graph(stats=True)
+    print(f"  /graph stats: 节点 {gs.get('nodes')} 边 {gs.get('edges')} "
+          f"连通块 {gs.get('components')} 孤立 {gs.get('isolated')}")
+    # 「节点数 > 0」只对**有内容**的库成立；空库 0 节点是正确行为，不是故障。
+    # 🔴 与上面 BM25 那条同一口径：漏了这个守卫，kb_init 出来的空库跑 --selftest 必红，
+    #    而「空库也必须能启动」是本工具链的明写不变量（CI 的空库冒烟就卡在这里）。
+    if meta.get("count", 0) > 0:
+        ok = ok and bool(gs.get("ok")) and (gs.get("nodes") or 0) > 0
+    else:
+        ok = ok and bool(gs.get("ok")) and (gs.get("nodes") or 0) == 0
+        print("  [skip] 空库：图里本就无节点（stats 路径已跑通）")
+
+    pages, out_adj, in_adj = get_graph()
+    src = next((n for n in sorted(pages) if out_adj.get(n)), None)
+    if src:
+        g = do_graph(node=src, hops=1, limit=60)
+        names_in = {x["name"] for x in g.get("nodes") or []}
+        bad_edge = [e for e in g.get("edges") or []
+                    if e["source"] not in names_in or e["target"] not in names_in]
+        print(f"  /graph 邻域 {src[:24]}：{g.get('count')} 节点 / "
+              f"{g.get('edge_count')} 边 ｜ 悬空边 {len(bad_edge)}")
+        ok = ok and g.get("ok") and src in names_in and not bad_edge
+        tgt = sorted(out_adj.get(src, ()))[0]
+        p = do_graph(path=f"{src},{tgt}")
+        ok = ok and (p.get("path") or [])[:1] == [src] and p.get("length") == 1
+        print(f"  /graph path {src[:16]}→{tgt[:16]}：{p.get('path')}")
+    else:
+        print("  [skip] 图里没有带出链的页（空库）")
+
+    hu = do_graph(hubs=True, limit=5)
+    ins = [n["in"] for n in hu.get("nodes") or []]
+    ok = ok and bool(hu.get("ok")) and ins == sorted(ins, reverse=True)
+    print(f"  /graph hubs: {[n['name'][:14] for n in (hu.get('nodes') or [])]}")
+    br = do_graph(bridges=True, limit=5)
+    ok = ok and bool(br.get("ok")) and (br.get("count") or 0) <= (gs.get("nodes") or 0)
+    print(f"  /graph bridges: {[n['name'][:16] for n in (br.get('nodes') or [])]}")
+    unknown = do_graph(node="绝不存在的页面-xyz")
+    ok = ok and unknown.get("ok") is False and "unknown node" in (unknown.get("error") or "")
+    print(f"  /graph 未知页：{unknown.get('error')}")
+
+    # 路径深度语义（合成小图，正例+反例）：A→B→C
+    chain = {"A": {"B"}, "B": {"C"}, "C": set()}
+    d_limited = _path_depth_limited(chain, "A", 1)      # 截断层 B 仍有未访问的 C
+    d_arrived = _path_depth_limited(chain, "A", 2)      # 已走完，无未访问出邻居
+    d_leaf = _path_depth_limited(chain, "C", 3)         # 叶子节点
+    ok = ok and d_limited and not d_arrived and not d_leaf
+    print(f"  /graph path 深度语义：depth=1 {d_limited} / depth=2 {d_arrived} / 叶子 {d_leaf}")
     print("=== selftest", "PASS ===" if ok else "FAIL ===")
     return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    K.console_encoding()
     sys.exit(main())

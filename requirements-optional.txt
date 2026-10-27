@@ -1,7 +1,37 @@
-# 可选依赖（缺省时优雅降级）
-# 语义检索首选：
+# 可选依赖 —— 全部「缺了就优雅降级」，不装也能跑完整条 BM25 流水线。
+# 装法：pip install -r requirements-optional.txt
+# 逐个说明「不装会失去什么」，按需取舍。
+
+# ── 检索层 ────────────────────────────────────────────────────────
+# kb_rag / kb_semantic_search / kb_serve 的向量召回与 CrossEncoder 精排。
+# 🔴 不装则 `kb.py search`（默认 --mode hybrid）与 `kb.py ask` 会直接
+#    报 RetrievalUnavailable 并退出码 3 —— 这是刻意的，绝不静默降级成 BM25。
+#    没装时请显式用 `--mode bm25`。
+# 首次精排会下载 BAAI/bge-reranker-base；默认只读本地模型，需 --allow-download 才联网。
 sentence-transformers
-# 语义检索降级（无 sentence-transformers 时用 TF-IDF/SVD）：
+
+# sentence-transformers 缺失时的语义检索降级路径（TF-IDF / 截断 SVD），
+# 以及 sci_landscape 的子方向聚类。
 scikit-learn
-# kb_cite --copy 剪贴板：
+
+# ── 文献流水线 ────────────────────────────────────────────────────
+# lit_browser_fetch：真实浏览器 + 类人鼠标，兜底抓 lit_fetch 拿不到的正文与 SI。
+# 装完还需 `python -m playwright install chromium`。不装则该工具直接报缺依赖退出。
+playwright
+# lit_browser_fetch 过 Cloudflare 的 ACS 路径：导出 cookies 后走 curl_cffi 的 TLS 指纹。
+curl_cffi
+
+# ── Sci-Assistant 决策层 ─────────────────────────────────────────
+# sci_data_analysis / sci_progress 的出图后端。
+# 不装则跳过绘图并打 [warn]，统计与导出照常（也可改用 Origin 后端）。
+matplotlib
+
+# sci_data_analysis 读 .xlsx。不装则降级为 zip+XML 流式解析（不引入 pandas）。
+openpyxl
+
+# qc_base_check 的 YAML 往返保序写。不装则回退 PyYAML（核心依赖，已在 requirements.txt）。
+ruamel.yaml
+
+# ── 其它 ──────────────────────────────────────────────────────────
+# kb_cite --copy 复制到剪贴板。不装则只打印到 stdout。
 pyperclip

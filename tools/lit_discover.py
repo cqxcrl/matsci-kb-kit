@@ -35,15 +35,11 @@ import urllib.request, urllib.parse
 
 # 🔴 不再用 `sys.stdout = io.TextIOWrapper(sys.stdout.buffer, ...)`：宿主若把 stdout
 #    换成没有 .buffer 的对象（测试台/嵌入环境），这一行在 **import 期**就 AttributeError。
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                            # noqa: BLE001
-    pass
 
 # 知识库共享库（同目录）——库根由 __file__ 推导，**不写绝对路径**
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kb_lib as K
+K.console_encoding()
 
 # ⚠️ 这里曾有本文件自建的 CONFIG_DEFAULTS（含 raw_dir/…/mailto/api_key 等 13 处字面路径），
 #    与 kb_lib.LIT_CONFIG_DEFAULTS 重复且已漂移。**整表已删除**：
@@ -372,22 +368,34 @@ def map_issn_to_source(config):
     return ids
 
 
-def keyword_sets(query):
-    """把方向关键词拆成 必含词(所有run都用) 与非必须加分词。简单处理：父层已做方向锁定，
-    这里只做去噪——候选必须命中 query 至少一个词(空格分隔为 OR)。
+def _query_terms(query):
+    """把方向 query 拆成**扁平词元列表**（供复筛关键词匹配），并**剥掉 `~` 分组标记**。
 
-    `~a|b|c` 这种 OR 词组（`build_search_expr` 支持）在这里**展开为 a/b/c 三个词**：
-    旧实现把整串 `~a|b|c` 当**一个词**去匹配正文，永远匹配不到 ⇒ 相关度恒为 0
-    ⇒ 所有候选被阈值滤掉（与"检索 0 命中"看似同形，实为复筛失真）。
+    与 `build_search_expr` 共用同一套标记认知，两种分组写法都展开为其中每个词：
+      · `~a b~`   新语法（组内空格 OR）→ a, b
+      · `~a|b|c`  旧语法（组内竖线 OR）→ a, b, c
+      · `~solo~`  单词组             → solo
+    裸词（无 `~`）原样保留。
+
+    🔴 2026-10-16 修复：旧 `keyword_sets` 只认 `~a|b|c`（竖线），遇到新语法 `~a b~` 会把
+    首尾 `~` **粘进词里**（`~machine`/`foundation~`）⇒ 锚点词永远匹配不到 ⇒ 仅靠锚点词命中的
+    候选相关度归零被整段滤掉（AI 组 `machine`、材料组 `materials` 双双失效）。
     """
-    toks = [t for t in query.replace("，", " ").replace(",", " ").split() if t]
+    # 漏空格的相邻组 `~a b~~c d~` 先规范化成 `~ ~`（与 build_search_expr 一致）。
+    q = re.sub(r"~{2,}", "~ ~", query or "").replace("，", " ").replace(",", " ")
     out = []
-    for t in toks:
-        if (t.startswith("~") or t.endswith("~")) and "|" in t:
-            out.extend(p for p in t.strip("~").split("|") if p)
-        else:
-            out.append(t)
+    for t in q.split():
+        body = t.strip("~")
+        out.extend(w for w in re.split(r"[|\s]+", body) if w)
     return out
+
+
+def keyword_sets(query):
+    """把方向关键词拆成扁平词元（候选命中至少一个词即算相关，空格/竖线皆 OR）。
+
+    父层已做方向锁定，这里只做去噪。`~…~` 分组标记会被剥掉——详见 `_query_terms`。
+    """
+    return _query_terms(query)
 
 
 # 关键词命中用「整词边界」而不是子串（2026-10-10）。
@@ -692,7 +700,39 @@ def _throttle():
         _LAST_REQ[0] = time.time()
 
 
+def openalex_api_key(cfg=None):
+    """取 OpenAlex API key（`datasource.api_key`），无则返回空串。
+
+    🔴 为什么需要：2026-10 起 OpenAlex 对 **cursor 翻页** 做了硬限制——
+    `cursor=` 翻到第二页起若无 key 直接返回
+    `401 {"error":"API key required for cursor paging"}`。
+    后果：每片只能取回**第一页**（per_page 条），命中 >per_page 的分片被静默截断
+    （旧版误报为 rc=3「分片检索失败」）。填了 key 后翻页恢复正常。
+
+    取值优先级：环境变量 `OPENALEX_API_KEY`（便于临时/CI）→ 配置 `datasource.api_key`。
+    **key 属敏感信息，绝不写进日志/URL 打印**（见 _get 里的脱敏）。
+    """
+    env = (os.environ.get("OPENALEX_API_KEY") or "").strip()
+    if env:
+        return env
+    if cfg is None:
+        try:
+            cfg = K.load_lit_config()
+        except Exception:                        # noqa: BLE001
+            cfg = {}
+    return str(((cfg.get("datasource") or {}).get("api_key") or "")).strip()
+
+
+def _redact(url):
+    """把 URL 里的 api_key 值替换为 ***，用于任何打印/异常信息（防 key 泄漏进日志）。"""
+    return re.sub(r"([?&]api_key=)[^&]*", r"\1***", url)
+
+
 def _get(url, timeout=30, retries=3, cfg=None):
+    # 注：api_key 用查询参数注入（OpenAlex 文档写法）；未配置则原样。
+    key = openalex_api_key(cfg)
+    if key:
+        url = url + ("&" if "?" in url else "?") + "api_key=" + urllib.parse.quote(key, safe="")
     req = urllib.request.Request(url, headers={"User-Agent": http_user_agent(cfg)})
     for att in range(retries + 1):
         _throttle()
@@ -705,6 +745,17 @@ def _get(url, timeout=30, retries=3, cfg=None):
             # 429 要指数退避（OpenAlex 限流），其它错误短等即可
             wait = (4 ** att) if e.code == 429 else 1.5
             print(f"[warn] HTTP {e.code}，{wait}s 后重试 ({att+1}/{retries})", file=sys.stderr)
+            if e.code == 401 and "cursor" in url:
+                # 🔴 提示必须**先**推环境变量：lit_config.yaml 已被 git 跟踪，
+                #    引导用户把明文 key 写进去 = key 随下次提交永久留在库历史
+                #    （与 lit_config.yaml 里同一 diff 新增的安全警告自相矛盾）。
+                print("[hint] OpenAlex 自 2026-10 起要求 cursor 翻页带 API key；"
+                      "未配置时每片只能取回首屏。请**优先**用环境变量提供免费 key"
+                      "（openalex.org/settings/api 申请）："
+                      "Git Bash `export OPENALEX_API_KEY=<key>`（或写入 ~/.bashrc）、"
+                      "PowerShell `setx OPENALEX_API_KEY <key>`（需重开终端）。"
+                      "🔴 不要把 key 明文写进 tools/lit_config.yaml —— 该文件已被 git 跟踪，"
+                      "明文 key 会随下次提交永久留在库历史。", file=sys.stderr)
             time.sleep(wait)
         except Exception:
             if att == retries:
@@ -718,23 +769,40 @@ def build_search_expr(query):
     旧版把整串原样传给 `search=`，OpenAlex 按「短语」匹配，结果几乎必然为 0 条，
     于是白名单期刊内的所有近期论文都被当成候选（含大量生物/医学噪声）。
 
-    这里改为：按空格切词 → 转义 → 用 `AND` 连接。同义词族用 `~` 前缀显式分组，
-    形如 `~a|b|c` 表示 (a OR b OR c)。只有全部组都命中才进候选，噪声大幅下降。
+    这里改为：按空格切词 → 转义 → 用 `AND` 连接。同义词族用 `~` 分组，**两种写法都支持**：
+      · `~a b c~`  组内空格分隔（新语法，组内 OR）
+      · `~a|b|c`   组内竖线分隔（旧语法，组内 OR）
+    组内每个词都先剥掉标记用的 `~`，再按 `|` 与空格切分；只有全部组都命中才进候选。
+
+    🔴 2026-10-16 修复两个标记解析缺陷：
+      1) 单词组 `~solo~` 此前残留尾部 `~` → 发出 `"solo~"`，检索必然 0 命中（潜伏 bug）。
+      2) `~a|b|c` 旧语法此前被当**单个 token** → 发出 `"a|b|c"`（既非 OR 也非短语），
+         是上述 `keyword_sets` 失真缺陷的源头（检索侧被静默收死）。
+      3) 漏空格的相邻组 `~a b~~c d~`：先把 `~~` 规范成 `~ ~` 再切词，保证分成两组。
+    新语法（`~a b~ ~c d~`）语义不变。
     """
     groups, cur = [], []
-    for tok in (query or "").split():
-        if tok.startswith("~"):
-            if cur:
-                groups.append(cur); cur = []
-            cur = [tok[1:]]
-        elif tok.endswith("~"):
-            cur.append(tok[:-1])
+    # 漏空格的相邻组 `~a b~~c d~` → 规范化成 `~ ~`，再按空格切词即可正确分段。
+    q = re.sub(r"~{2,}", "~ ~", query or "")
+    for tok in q.split():
+        starts, ends = tok.startswith("~"), tok.endswith("~")
+        if starts and cur:                       # 新组开始 → 收束上一组
             groups.append(cur); cur = []
-        else:
-            if cur:
-                cur.append(tok)
-            else:
-                cur = [tok]
+        # 剥掉标记用 `~` 后按 `|` 与空格切分（兼容旧 `~a|b|c` 与新 `~a b~`）。
+        body = tok.strip("~")
+        words = [w for w in re.split(r"[|\s]+", body) if w]
+        if not words:
+            continue
+        if starts and ends:                      # `~a b~` / `~solo~`：完整一组
+            groups.append(words)
+        elif starts:                             # `~a b`：新组开端，续到闭合
+            cur = list(words)
+        elif ends:                               # `a b~`：闭合当前组
+            cur.extend(words); groups.append(cur); cur = []
+        elif cur:                                # 组内续词
+            cur.extend(words)
+        else:                                    # 裸词 → 自成单数组
+            groups.append(words)
     if cur:
         groups.append(cur)
     parts = []
@@ -894,7 +962,7 @@ def discover(query, config, days, limit, since_date=None, known=None):
             cq = "*" if cursor == "*" else urllib.parse.quote(cursor, safe="")
             url = f"{base}&cursor={cq}"
             if len(batches) == 1 and _page == 0:
-                print(f"检索 OpenAlex:\n  {url}\n", file=sys.stderr)
+                print(f"检索 OpenAlex:\n  {_redact(url)}\n", file=sys.stderr)
             try:
                 data = _get(url, cfg=config)
             except Exception as e:                # noqa: BLE001
@@ -1174,6 +1242,20 @@ def selftest():
     good = "lithium" in ks and "sodium" in ks and "zinc" in ks and "~lithium|sodium|zinc" not in ks
     print(f"  [{'ok' if good else 'FAIL'}] OR 词组展开 -> {ks}")
     ok = ok and good
+    # 🔴 2026-10-16：新语法 `~a b~`（组内空格）也必须展开为**无标记的单词**，
+    #    否则首尾 `~` 粘进词里 ⇒ 锚点词永远匹配不到 ⇒ 仅靠锚点命中的候选相关度归零被整段滤掉。
+    ks2 = keyword_sets("~machine learning foundation~ ~materials solid-state~")
+    good = (ks2 == ["machine", "learning", "foundation", "materials", "solid-state"]
+            and not any("~" in w for w in ks2))
+    print(f"  [{'ok' if good else 'FAIL'}] 新语法 `~a b~` 展开为无标记单词 -> {ks2}")
+    ok = ok and good
+    good = kw_hit("materials", "materials science") and kw_hit("machine", "machine materials")
+    print(f"  [{'ok' if good else 'FAIL'}] 锚点词可命中（修复前 `~materials` 恒不命中）-> {good}")
+    ok = ok and good
+    # 单词组 `~solo~` 也不得残留 `~`
+    good = keyword_sets("~solo~") == ["solo"]
+    print(f"  [{'ok' if good else 'FAIL'}] 单词组 `~solo~` -> {keyword_sets('~solo~')}")
+    ok = ok and good
 
     # ---- 期刊分级：tier → 阈值/精读档（回归夹具，2026-10-06）----
     # 🔴 夹具用**合成配置**，不读真实 lit_config.yaml：旧版断言 `Nature=T0` / `0927-0256=T4`
@@ -1338,6 +1420,51 @@ def selftest():
     n_low_c = sum(1 for c in keptC if c["journal_tier"] == "T3")
     good = n_low_c == 0
     print(f"  [{'ok' if good else 'FAIL'}] A 反例：factor=0 恢复旧行为（低档=0）-> T3={n_low_c}")
+    ok = ok and good
+
+    # ---- OpenAlex API key / URL 脱敏（2026-10-15 回归夹具）----
+    # 🔴 夹具必须**干掉环境变量**才是 hermetic 的：本机（用户注册表）设有
+    #    OPENALEX_API_KEY ⇒ 若不清，下面的「配置优先/无 key」反例会读到真实环境值而误判 FAIL
+    #    （kb_toolcheck 会常驻报 lit_discover selftest FAIL）。故先 pop 并在 finally 恢复。
+    prev = os.environ.pop("OPENALEX_API_KEY", None)
+    try:
+        good = openalex_api_key({"datasource": {"api_key": "K1"}}) == "K1"
+        print(f"  [{'ok' if good else 'FAIL'}] 反例：配置 api_key 被读到 -> {good}")
+        ok = ok and good
+        os.environ["OPENALEX_API_KEY"] = "ENVK"
+        good = openalex_api_key({"datasource": {"api_key": "K1"}}) == "ENVK"
+        print(f"  [{'ok' if good else 'FAIL'}] 正例：环境变量 OPENALEX_API_KEY 优先于配置 -> {good}")
+        ok = ok and good
+        os.environ.pop("OPENALEX_API_KEY", None)
+        good = openalex_api_key({"datasource": {}}) == "" and openalex_api_key({}) == ""
+        print(f"  [{'ok' if good else 'FAIL'}] 反例：无 key（配置空/无 datasource）返回空串 -> {good}")
+        ok = ok and good
+    finally:
+        if prev is None:
+            os.environ.pop("OPENALEX_API_KEY", None)
+        else:
+            os.environ["OPENALEX_API_KEY"] = prev
+    # 脱敏：URL 里的 key 值不得原样出现在日志里
+    red = _redact("https://api.openalex.org/works?filter=x&api_key=SECRET123&search=y")
+    good = "SECRET123" not in red and "api_key=***" in red
+    print(f"  [{'ok' if good else 'FAIL'}] 脱敏：日志中 key 被替换为 *** -> {red.split('api_key=')[1][:4]}")
+    ok = ok and good
+
+    # ---- 检索表达式：两组 AND（2026-10-16 收窄 AI 方向噪声）----
+    expr = build_search_expr("~machine learning~ ~materials chemistry~")
+    good = ('("machine" OR "learning")' in expr and '("materials" OR "chemistry")' in expr
+            and expr.count(" AND ") == 1)
+    print(f"  [{'ok' if good else 'FAIL'}] 表达式：两段 ~…~ → 两个 OR 组以 AND 连接 -> {expr}")
+    ok = ok and good
+    # 反例：单段（旧配置形态）不产生 AND
+    expr1 = build_search_expr("~machine learning~")
+    good = " AND " not in expr1
+    print(f"  [{'ok' if good else 'FAIL'}] 反例：单段 → 无 AND（保持旧行为）-> {expr1}")
+    ok = ok and good
+    # 反例：段间缺空格会把两组粘成一个词（钉住解析边界）
+    expr_bad = build_search_expr("~a b~~c d~")
+    good = expr_bad.count(" AND ") == 1 and '"b"' in expr_bad and '"c"' in expr_bad
+    print(f"  [{'ok' if good else 'FAIL'}] 边界：`~a b~~c d~` 仍解析为两组 -> {expr_bad}")
     ok = ok and good
 
     print("=== selftest", "PASS ===" if ok else "FAIL ===")

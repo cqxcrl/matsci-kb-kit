@@ -5,6 +5,7 @@ wiki/concepts
 wiki/entities
 wiki/topics
 wiki/outputs
+wiki/experiments
 raw/pdf
 raw/text
 raw/assets

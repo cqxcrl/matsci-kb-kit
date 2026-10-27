@@ -41,13 +41,10 @@ from pathlib import Path
 # 🔴 不再用 `sys.stdout = io.TextIOWrapper(sys.stdout.buffer, ...)`：宿主若把 stdout
 #    换成没有 .buffer 的对象（测试台/嵌入环境），这一行在 **import 期**就 AttributeError，
 #    连 --selftest 都跑不起来。reconfigure 在无该方法的宿主上会抛异常，故整体兜住。
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                            # noqa: BLE001
-    pass
 
 import fitz  # PyMuPDF
+import kb_lib as K
+K.console_encoding()
 
 # 单篇导出图的看门狗秒数。lit_batch 以**进程内**方式调用本模块，一个坏页让 get_pixmap
 # 挂死就会拖停整批；所以这里给导出图加一道超时（见 _export_figure）。
@@ -324,11 +321,15 @@ def extract_pdf(pdf, out="", assets=None, raw_dir=None, dpi=150, main_pages=None
     #    使两层结构对齐（否则新件又落回 raw/text 根，结构回潮）。仅当 PDF 位于分类子目录
     #    （形如 raw/pdf/<分类>/x.pdf）时才加一级；PDF 已在 raw/pdf 根（历史散件）则保持旧行为。
     #    显式 --out 时完全尊重调用方，不做任何改写。
+    # 🔴 2026-10-12 修正：当调用方**已经把 --raw-dir 指到该分类目录**（如
+    #    `--raw-dir raw/text/01-电池与电解液`，而 PDF 在 `raw/pdf/01-电池与电解液/`）时，
+    #    旧实现会**再拼一层同名分类** ⇒ `raw/text/01-电池与电解液/01-电池与电解液/`。
+    #    判据：`raw_dir` 的**末级目录名已等于 cat** 时不再重复拼接。
     if out:
         md_path = Path(out)
     else:
         cat = Path(pdf).parent.name
-        if cat in RAW_TEXT_CATEGORIES:
+        if cat in RAW_TEXT_CATEGORIES and Path(raw_dir).name != cat:
             md_path = Path(raw_dir) / cat / f"{title}.md"
         else:
             md_path = Path(raw_dir) / f"{title}.md"
@@ -627,6 +628,31 @@ def selftest():
         stray = list(raw_dir.glob("*.tmp"))
         good = not stray
         print(f"  [{'ok' if good else 'FAIL'}] 原子写后无 .tmp 残留 -> {[p.name for p in stray]}")
+        ok = ok and good
+
+        # 🆕 2026-10-12 回归夹具：--raw-dir 已指到分类目录时**不得重复拼接分类名**。
+        #    真实事故：`--raw-dir raw/text/01-电池与电解液` + PDF 在 `raw/pdf/01-电池与电解液/`
+        #    ⇒ 旧版落到 `raw/text/01-电池与电解液/01-电池与电解液/`。
+        cat = RAW_TEXT_CATEGORIES[0]                    # 取一个真实分类名（如 01-电池与电解液）
+        catdir = work / "raw" / "pdf" / cat
+        catdir.mkdir(parents=True, exist_ok=True)
+        src2 = catdir / "cat-paper.pdf"
+        d = fitz.open()
+        d.new_page().insert_text((72, 72), "cat")
+        d.save(str(src2))
+        d.close()
+        # (a) raw_dir 已是分类目录 → 只落一层
+        r1 = extract_pdf(src2, raw_dir=str(raw_dir / cat), assets=str(ast_dir), no_images=True)
+        p1 = Path(r1["_md_abs"])
+        good = p1.parent.name == cat and p1.parent.parent.name == "text"
+        print(f"  [{'ok' if good else 'FAIL'}] --raw-dir=分类目录：不重复拼接 -> {p1.parent}")
+        ok = ok and good
+        # (b) raw_dir 是根目录 → 仍按 PDF 分类加一层（旧行为不变）
+        r2 = extract_pdf(src2, raw_dir=str(raw_dir), assets=str(ast_dir),
+                         no_images=True, force=True)
+        p2 = Path(r2["_md_abs"])
+        good = p2.parent.name == cat and p2.parent.parent.name == "text"
+        print(f"  [{'ok' if good else 'FAIL'}] --raw-dir=根目录：仍加分类层 -> {p2.parent}")
         ok = ok and good
     finally:
         shutil.rmtree(work, ignore_errors=True)

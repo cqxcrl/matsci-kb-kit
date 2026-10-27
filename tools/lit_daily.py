@@ -33,14 +33,11 @@ import time
 
 # Windows 控制台/管道默认按 ANSI 代码页（本机 cp936）编码，输出里的 ✅/⚠️ 会直接抛
 # UnicodeEncodeError。所有工具统一在 import 期把 stdout 切到 UTF-8（errors=replace 兜底）。
-try:                                                           # noqa: SIM105
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                                              # noqa: BLE001
-    pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import kb_lib as K                                            # noqa: E402
+K.console_encoding()
 
 DISCOVER = os.path.join(HERE, "lit_discover.py")
 DIGEST = os.path.join(HERE, "lit_digest.py")

@@ -72,12 +72,12 @@
 
 | 层 | 内容 | 在哪 |
 |---|---|---|
-| **结构** | `wiki/{concepts,entities,sources,topics,outputs}` + `raw/` + 5 个 Obsidian Bases 视图 | `scaffold/` |
-| **工具** | **48 个** Python 工具（`kb_*` 检索与质检 19 个、`lit_*` 文献流水线 14 个、`qc_*` 3 个、**`sci_*` 决策层 12 个**）+ 1 份多学科期刊池 | `tools/` |
+| **结构** | `wiki/{concepts,entities,sources,topics,outputs,experiments}` + `raw/` + 5 个 Obsidian Bases 视图 | `scaffold/` |
+| **工具** | **63 个**文件：`kb.py` 统一入口 + `kb_*` 检索与体检 21 个、`lit_*` 文献流水线 17 个、`qc_*` 质检 10 个、**`sci_*` 决策层 13 个**，另加 1 份多学科期刊池 | `tools/` |
 | **纪律** | `CLAUDE.md`：页面 schema、`evidence_base` 证据承重、批判性标记、元数据静默丢失防线、L1/L2/L3 分层检索 | `CLAUDE.md` |
-| **流程技能** | 5 个技能：`lit-watch` 文献全链 ｜ `lit-pipeline` 本地约定 ｜ `kb-query` 检索 ｜ `kb-lint` 体检 ｜ **`kb-onboard` 首跑配置向导** | `skills/` |
+| **流程技能** | 6 个技能：`lit-watch` 文献全链 ｜ `lit-pipeline` 本地约定 ｜ `lit-browser-fetch` 反爬兜底 ｜ `kb-query` 检索 ｜ `kb-lint` 体检 ｜ **`kb-onboard` 首跑配置向导** | `skills/` |
 | **客户端** | `mcp/server.py`：把 **19 个**工具暴露给任何支持 MCP 的 AI 客户端 | `mcp/` |
-| **决策层** | **Sci-Assistant**：C1 切入点发现 / C2 实验方案推荐 / C3 课题进展统筹（12 个 `sci_*` 工具，v0 全量完成） | `docs/SCI-ASSISTANT.md` |
+| **决策层** | **Sci-Assistant**：C1 切入点发现 / C2 实验方案推荐 / C3 课题进展统筹（13 个 `sci_*` 工具，v0 全量完成） | `docs/SCI-ASSISTANT.md` |
 
 ---
 
@@ -116,10 +116,13 @@ matsci-kb list
 matsci-kb kb_init ./my-vault
 
 # 检索知识库
-matsci-kb kb_search "电解液设计"
+matsci-kb kb_search "固态电解质 界面"
+
+# 统一入口：自动在传统 RAG 与 Agentic RAG 之间选择
+matsci-kb kb ask "这个方向的证据充分吗"
 
 # 运行 Sci-Assistant 工具
-matsci-kb sci_landscape --direction "电解液设计"
+matsci-kb sci_landscape --direction "<你的研究方向>"
 ```
 
 > 💡 npm 安装会自动检查 Python 依赖，缺失时会提示安装命令。
@@ -190,19 +193,19 @@ python scripts/kb_init.py --target /path/to/my-vault
 Windows 示例：
 
 ```powershell
-python scripts/kb_init.py --target "E:\MyVault"
+python scripts/kb_init.py --target "D:\MyVault"
 ```
 
 它做的事（**幂等**：已存在的文件默认**不覆盖**）：
 
-1. 建 **15 个**目录（含 `.gitkeep`）＋ `wiki/.index/`
+1. 建目录树（含 `.gitkeep`）＋ `wiki/.index/`
 2. 放 **4 个**根元文件：`index.md` `tags.md` `log_ops.md` `log_insights.md`
 3. 放 **5 个** `.base` 视图（4 个在库根，`剪藏文集.base` 在 `optional/`）
 4. 放 `.obsidian/`（app.json / core-plugins.json）与 `.gitignore`
 5. 放 `profile.md`（首跑访谈用的空白档案）
-6. 放 `tools/`（**48 个**工具）与 `CLAUDE.md`（方法论）
+6. 放 `tools/`（**63 个**工具）与 `CLAUDE.md`（方法论）
 7. 由模板写 `tools/lit_config.yaml`
-8. 装 5 个技能到 `.dsh/skills/` 与 `.claude/skills/`（双入口）
+8. 装 **6 个**技能到 `.dsh/skills/` 与 `.claude/skills/`（双入口）
 9. **跑一次索引构建**——空库也会产出一个**合法的空索引**
 
 常用开关：
@@ -265,6 +268,7 @@ my-vault/
 │   ├── sources/               文献卡（一篇论文 = 一页）
 │   ├── topics/                主题综述页（把一个概念簇讲成一个知识模块）
 │   ├── outputs/               产出（lint 报告、综述稿、分析结论）
+│   ├── experiments/           实验方案（sci_protocol_gen --export-experiment 落盘）
 │   ├── index.md               全库总览（Pages 表）
 │   ├── tags.md                标签清单
 │   ├── log_ops.md             操作日志（每次操作追加一行）
@@ -304,7 +308,7 @@ my-vault/
 - 把索引当知识去手工编辑 → 下次重建就被覆盖，白干。
 - 把 `raw/` 当笔记去改 → 回链与证据全部失真。
 
-### 4.3 页面的五种类型
+### 4.3 页面的六种类型
 
 | 类型 | 目录 | 写什么 | 谁写 |
 |---|---|---|---|
@@ -313,6 +317,12 @@ my-vault/
 | `source` | `wiki/sources/` | **一篇文献一页**：摘要 + 要点 + 批判性评估 | 文献流水线建骨架，你补正文 |
 | `topic` | `wiki/topics/` | 把一簇概念讲成一个独立知识模块 | 你（达到触发条件时才建） |
 | `output` | `wiki/outputs/` | 报告、综述稿、分析结论 | 工具或你 |
+| `experiment` | `wiki/experiments/` | **审核过的实验方案**（目标／参数／步骤，逐条带 quote） | `sci_protocol_gen.py --export-experiment <METHOD_ID>`，经你审核 |
+
+> `experiments/` 是唯一**由工具写入**的知识层目录。它进知识层（而不是 `projects/`）
+> 是为了让方案也能被 `kb_route` 检索到——否则「上次那个方案怎么配的」永远查不出来。
+> 页面清单的唯一来源是 `kb_lib.PAGE_DIRS`，类型→目录的映射是 `kb_lib.TYPE_DIR`；
+> `kb_selftest` 断言两者一致，加类型要同时改。
 
 ### 4.4 一页的最小结构
 
@@ -399,17 +409,28 @@ python tools/kb_search.py "固态电解质 界面"
 `kb.py` 是检索的统一入口，把最常用的几种模式收在一个命令里：
 
 ```bash
-python tools/kb.py "固态电解质界面"                 # 默认 BM25
-python tools/kb.py "固态电解质界面" --mode semantic  # 语义（需先建嵌入索引）
-python tools/kb.py "锂沉积效率"     --mode hybrid    # BM25 + 语义 RRF 融合
-python tools/kb.py "SSE" --resolve                  # 只做别名解析
-python tools/kb.py "固态电解质" --route              # ★ 分层取证，首选（见下）
-python tools/kb.py --corpus "界面阻抗"               # raw 全文块检索（可回指 行号）
-python tools/kb.py --stats                          # 索引概览
-python tools/kb.py --doctor                         # 环境诊断
+python tools/kb.py search "固态电解质界面" --mode bm25   # ★ 零额外依赖，先跑这个
+python tools/kb.py search "固态电解质界面"               # 默认 hybrid（见下方警告）
+python tools/kb.py search "锂沉积效率" --mode semantic   # 纯向量召回
+python tools/kb.py ask "这个方向的证据充分吗"             # 自动在传统 RAG / Agentic RAG 间选
+python tools/kb.py ask "锂枝晶 抑制" --strategy agentic --budget 4,5,6
+python tools/kb.py "SSE" --resolve                      # 只做别名解析
+python tools/kb.py "固态电解质" --route                  # ★ 分层取证，首选（见下）
+python tools/kb.py --corpus "界面阻抗"                   # raw 全文块检索（可回指行号）
+python tools/kb.py --stats                              # 索引概览
+python tools/kb.py --doctor                             # 环境诊断
 ```
 
 常用参数：`-k 10`（条数）、`--type concept,entity`（限定页面类型）、`--json`（机器可读）。
+
+> 🔴 **`--mode` 的默认值是 `hybrid`，而 `hybrid` 不会静默降级。**
+> 它同时要求①嵌入索引已建（`python tools/kb.py index embed`）②本地有可用的
+> Reranker（默认 `BAAI/bge-reranker-base`，来自 `sentence-transformers`）。
+> 任一缺失就直接报 `RetrievalUnavailable` 并**退出码 3**——这是刻意设计：
+> 把 hybrid 悄悄退化成 BM25 会让你以为拿到了融合结果。
+>
+> **没装可选依赖时用 `--mode bm25`**，它只需要 `jieba` + 索引文件。
+> Reranker 默认**只读本地模型、不联网下载**；确需首次下载时显式加 `--allow-download`。
 
 ### 5.3 分层取证 `kb_route`（为什么它最重要）
 
@@ -455,7 +476,26 @@ python tools/kb_backlinks.py --suggest   # 孤立页 + 补链建议
 python tools/kb_stats.py                 # 统计仪表板
 python tools/kb_where.py "某表述"         # ★ 断言"库内没有 X"之前必跑
 python tools/qc_base_check.py --check    # 5 个 Bases 视图是否被静默收窄
+python tools/qc_schema_check.py          # frontmatter schema 校验
 python tools/kb_toolcheck.py             # 实跑每个工具的自检（工具"能不能用"的唯一判据）
+```
+
+**证据承重专项**（`evidence_base` 是这套方法论的核心不变量，见 `CLAUDE.md`）：
+
+```bash
+python tools/qc_evidence_base.py         # 机械判定 concept/topic 页的证据等级
+python tools/qc_evidence_audit.py        # 揪出「正文引了但 sources: 没登记」的卡
+python tools/qc_evidence_note.py --plan decisions.json --apply   # 补一手源 / 如实降级
+python tools/qc_sources_drift.py         # sources: 语义漂移（L1 页混进了语义字段）
+python tools/qc_si_backfill.py           # 给缺 si_status 的 source 卡补判定
+```
+
+**项目工程专项**（只在 `projects/*/` 下有意义，空库跑会得到「无对象」而非报错）：
+
+```bash
+python tools/qc_proj_sources.py          # projects/*/sources 卡片校验
+python tools/qc_proj_names.py            # 文献文件命名矩阵审计（只读）
+python tools/qc_proj_assets.py           # Extract 图片链接审计（只读）
 ```
 
 > 🔴 **`kb_where.py` 的用途**：它跨四个目录检索并**逐目录报命中数**。
@@ -518,7 +558,7 @@ automation:
        query: "battery lithium sodium zinc electrolyte solid-state interphase"}
 ```
 
-三条要记住的规则：
+四条要记住的规则：
 
 1. **期刊白名单是范围边界**：白名单为空 = 退化成全网关键词检索。
    要加刊**不要凭记忆写 ISSN**，用 `python tools/lit_journals.py --add "Nature Energy"` 解析。
@@ -526,6 +566,11 @@ automation:
    **永远无物可滤**、五档行为完全相同（分级形同虚设）。T0/T1 保持宽松是刻意的：
    顶刊召回优先，靠 `uncapped` + 增强精读兜底。
 3. **`uncapped: true`** = 该档文献**不被 `--limit` 截断**（顶刊宁可多不能漏）。
+4. **OpenAlex 翻页要 API key**：自 2026-10 起，`cursor=` 翻到第 2 页无 key 直接
+   `401 API key required for cursor paging` ⇒ 每个分片**只取回首屏**，命中 >`per_page`
+   的分片被静默截断。免费申请：<https://openalex.org/settings/api>。
+   🔴 **用环境变量 `OPENALEX_API_KEY`，不要把 key 明文写进 `lit_config.yaml`**——
+   那个文件被 git 跟踪，明文 key 会永久留在历史里。环境变量优先级更高。
 
 ### 6.1 阶段总览
 
@@ -537,8 +582,11 @@ automation:
 | A″ 勾选 | `lit_digest.py --list` / `--pick` | `picks/…-picks.json`（**全字段，零损失**） | 0/2 |
 | B 取全文 | `lit_fetch.py --in <picks> --outdir raw/pdf` | `raw/pdf/*.pdf` + 下载清单 | 0=至少一篇成功／**4=全部失败** |
 | B′ 收编 | `lit_manual_import.py` | 手工下载的 PDF 改名入库 + 台账 | 0 |
+| B″ 补 SI | `lit_si.py fetch` | `raw/pdf/_si/*` **或** 手动下载清单 | 0=取到/判定无 SI／**4=有 SI 但一份没取到** |
+| B‴ 浏览器兜底 | `lit_browser_fetch.py --latest --apply` | 反爬站点的正文与 SI + 下载报告 | 0/2/4 |
 | C 提取 | `lit_batch.py --extract` | `raw/text/…/<标题>.md` + `raw/assets/<slug>/fig_*.png` | 0 |
 | D 建卡 | `lit_batch.py --ingest [--apply]` | `wiki/sources/*.md` **骨架** + 门禁报告 | 0=过／**1=写坏**／**2=缺补链** |
+| D′ 二次加工 | `lit_enrich.py request` → 你的模型 → `lit_enrich.py apply` | 带**原文 quote** 的证据化字段 | 0/1/2 |
 | E 收尾 | `lit_finish.py --apply` | `index.md` 行、`log_ops.md`、索引 | 0/1 |
 | F 缺口 | `lit_gapscan.py` | 下一轮检索式（带出处与信号） | 0/1/2 |
 
@@ -547,7 +595,7 @@ automation:
 **0 · 体检**
 
 ```bash
-python tools/lit_doctor.py          # 46 项：配置 / 去重对账 / 欠账 / 索引 / 任务
+python tools/lit_doctor.py          # 配置 / 去重对账 / 欠账 / 索引 / 任务
 python tools/lit_doctor.py --fix    # 安全修复
 ```
 
@@ -589,6 +637,37 @@ python tools/lit_manual_import.py --apply  # 改名并移入 raw/pdf/
 
 收件箱默认 `raw/pdf/Manual Download/`。未匹配的隔离到 `raw/pdf/_unmatched/`，**永不删除**。
 
+**B″ · 补 SI（补充材料）**
+
+```bash
+python tools/lit_si.py scan "<某篇.pdf>"                     # 只判定有没有 SI
+python tools/lit_si.py fetch "<某篇.pdf>"                    # 判定 + 干跑
+python tools/lit_si.py fetch "<某篇.pdf>" --apply            # 真正下载到 raw/pdf/si/
+python tools/lit_si.py fetch --text raw/text/x.md --doi 10.xxxx/yyy --apply
+```
+
+**判据只认原文**，不认机读字段：Crossref `relation` 实测常年为空，Europe PMC `hasSuppl`
+只反映它自己有没有托管附件。所以本工具直接从 PDF 文字层找**声明句式**（如
+"Supporting Information is available free of charge"），只认句式、不认裸词——
+否则会把「讨论别人的 SI」「建议期刊改进 SI 格式」的文章误判成有 SI，白追一轮。
+
+能自动推直链的只有三家（Nature/Springer、Elsevier、Wiley），其中 **Wiley 的文件名必须
+从 PDF 末尾的 `SupportingFile:` 字段读，不可由 DOI 推导**。RSC/ACS/Science/IOP
+对脚本一律 403/302，**只能进手动下载清单**。退出码 **4 = 有 SI 但一份都没取到**。
+
+**B‴ · 浏览器兜底（反爬站点）**
+
+```bash
+python tools/lit_browser_fetch.py --latest                # 干跑：挑最新仍有失败的 fetch_result
+python tools/lit_browser_fetch.py --latest --apply        # 真跑（真实浏览器 + 类人鼠标）
+python tools/lit_browser_fetch.py --doi 10.xxxx/yyy --apply
+python tools/lit_browser_fetch.py --login --login-url "<机构入口>"   # 先存登录态
+```
+
+需要可选依赖 `playwright` + `curl_cffi`（见 `requirements-optional.txt`），**默认干跑**。
+它比 `lit_fetch` 慢得多，所以只当兜底：先用 B/B″，剩下的失败件才交给它。
+详细姿势见技能 `lit-browser-fetch`。
+
 **C · 提取（PDF → 文本 + 插图）**
 
 ```bash
@@ -616,6 +695,26 @@ python tools/lit_batch.py --ingest --apply   # 写骨架
 - **软失败（退出码 2）**：出站链接 < 2 或入站 = 0——页面本身完好，但**补链纪律未完成**。
   工具**不替你补链**（那会凭空造出错误关联），只把缺口列出来。
   **看到 2 就要去补链，别当成功。**
+
+**D′ · 证据化二次加工（可选，但强烈推荐）**
+
+骨架卡只有标题 + 摘要 + `## 待精读`。要往里填**结论性内容**，走这条两步路：
+
+```bash
+python tools/lit_enrich.py request --page sources/<某卡>.md --json > req.json
+#   → 把 req.json 交给你的模型，让它产出 proposal.json（每条结论必须带 evidence）
+python tools/lit_enrich.py apply --proposal proposal.json          # 干跑校验
+python tools/lit_enrich.py apply --proposal proposal.json --apply  # 写进卡片
+```
+
+**这个工具本身不调用任何 LLM**，只提供模型无关的 JSON 接口——所以你用哪家模型都行。
+它做的校验是机械的：每条 claim 的 `evidence.path` 必须是库内 markdown、不许路径穿越、
+`quote` 必须能在原文里逐字找到（长度也有上限）。写入落在
+`<!-- lit_enrich:start --> ## LLM 二次加工 <!-- lit_enrich:end -->` 这对标记之间，
+并把卡片的 `source_reliability` 改成「已做带原文定位的 LLM 二次加工；仍须人工复核」。
+
+> 🔴 **为什么不让模型直接改卡片**：没有 quote 校验的话，你分不清哪些是原文、
+> 哪些是模型编的。这一步的价值全在「机械可验」，不在「自动」。
 
 **E · 收尾**
 
@@ -646,8 +745,12 @@ python tools/lit_gapscan.py --queries       # 只出检索式，直接喂回阶�
 | `lit_daily.py` | **0** 全成功 ／ **2** `--directions` 与配置不匹配 ／ **3** 有方向失败 ／ **4** 全失败 |
 | `lit_discover.py` | 0 ／ **3** = 有分片失败 |
 | `lit_fetch.py` | 0 = 至少一篇成功 ／ **4 = 全部失败** |
+| `lit_si.py fetch` | 0 = 已取到 **或** 判定无 SI ／ **4 = 有 SI 但一份都没取到**（须进手动清单）／ 2 = 用法错误 |
+| `lit_browser_fetch.py` | **0** 全成功 ／ **3** 部分成功或 SI 仍缺 ／ **4** 正文全失败 ／ 2 = 用法错误 |
 | `lit_ingest.py` 门禁 | 0 = 过 ／ **1 = 写坏** ／ **2 = 缺补链** |
+| `lit_enrich.py apply` | 0 = 校验通过 ／ **1 = proposal 不合法或写后断言失败**（quote 找不到、路径穿越、标记不成对…，已自动回退备份）／ 2 = 用法错误 |
 | `lit_gapscan.py` | 0 ／ **1 = 降级**（索引读不到，权重会失真）／ 2 = 写盘失败 |
+| `kb.py search` | 0 ／ **3 = `RetrievalUnavailable`**（hybrid 缺嵌入索引或 Reranker，不降级）／ 2 = 用法错误 |
 
 > ⚠️ **不要把「失败」读成「这个方向没有新文献」**——那正是这套退出码要防的事。
 
@@ -703,7 +806,9 @@ python mcp/server.py --selftest                               # CI 用
 
 | 工具 | 用途 |
 |---|---|
-| `kb.py` | **统一入口**（bm25/语义/混合/route/corpus/doctor） |
+| `kb.py` | **统一入口**（`ask` / `search` / `route` / `corpus` / `resolve` / `index` / `serve` / `stats` / `doctor` / `lint` / `toolcheck` / `tools`，并兼容 `lit`/`qc`/`sci` 三个子入口） |
+| `kb_rag.py` | 传统 RAG：BM25 / 向量 / RRF 融合 / 本地 CrossEncoder 精排（**不静默降级**） |
+| `kb_agentic.py` | Agentic RAG：规划 → 分层检索 → 图扩展 → 停止判据 → 证据包（模型无关） |
 | `kb_route.py` | ★ **分层上下文包** L1/L2/L3 不混排（Agent 首选） |
 | `kb_search.py` | BM25 + 语义 + 混合检索 |
 | `kb_build_index.py` | 构建／增量更新索引（`--full` `--lite` `--embed` `--stats` `--add`） |
@@ -716,6 +821,7 @@ python mcp/server.py --selftest                               # CI 用
 | `kb_cite.py` | GB/T 7714 引用格式化（`--copy` 到剪贴板） |
 | `kb_dois.py` | 库内 DOI 清单（去重键之一，缓存增量） |
 | `kb_tags.py` | 标签统计 |
+| `kb_manifest.py` | 静态生成「工具与参数」机器可读清单（**不导入、不执行**被扫描脚本） |
 | `kb_serve.py` | 常驻检索服务（可选加速器，`--warm` / `--status` / `--stop`） |
 
 ### 质检与自检
@@ -728,22 +834,32 @@ python mcp/server.py --selftest                               # CI 用
 | `kb_selftest.py` | 底座不变量自检 |
 | `kb_lib.py` | 共享库（被其它工具导入） |
 | `qc_base_check.py` | 5 个 Bases 视图选中集合重算 + 漂移守门 |
-| `qc_evidence_base.py` | 机械判定 concept/topic 页的 `evidence_base` |
 | `qc_schema_check.py` | frontmatter schema 校验 |
+| `qc_evidence_base.py` | 机械判定 concept/topic 页的 `evidence_base` |
+| `qc_evidence_audit.py` | 核对「正文引用了但 `sources:` 未登记」的卡：判它是**证据**还是**只是参见** |
+| `qc_evidence_note.py` | 按 decisions JSON 对 L1 页执行「补一手源」或「如实降级」 |
+| `qc_sources_drift.py` | `sources:` 语义漂移修复器（把 L1 页移出语义字段） |
+| `qc_si_backfill.py` | 给缺 `si_status` 的 source 卡补判定 |
+| `qc_proj_sources.py` | `projects/*/sources` 项目内 source 卡校验 |
+| `qc_proj_names.py` | 项目文献文件命名矩阵审计（只读） |
+| `qc_proj_assets.py` | 项目 Extract 图片链接审计（只读） |
 
 ### 文献流水线（`lit_*`）
 
 | 工具 | 用途 |
 |---|---|
-| `lit_doctor.py` | 流水线体检（46 项，`--fix` 安全修复） |
+| `lit_doctor.py` | 流水线体检（`--fix` 安全修复） |
 | `lit_daily.py` | 每日发现（配置驱动、可续跑） |
 | `lit_discover.py` | 单方向检索（tier 阈值、分片并行、翻页） |
 | `lit_digest.py` | 摘要渲染与勾选 |
-| `lit_fetch.py` | 取 OA 全文（含 SI 尽力抓取） |
+| `lit_fetch.py` | 取 OA 全文 |
+| `lit_si.py` | **SI（补充材料）**判定／自动获取／手动清单素材（判据只认 PDF 文字层） |
+| `lit_browser_fetch.py` | 真实浏览器 + 类人鼠标，**兜底**下载 `lit_fetch` 拿不到的正文与 SI |
 | `lit_manual_import.py` | 手工下载 PDF 收编入库 |
 | `lit_batch.py` | 批量提取／建卡的欠账台账（单篇失败不中断整批） |
 | `lit_extract.py` | 单 PDF 图文提取（原子写） |
 | `lit_ingest.py` | 建卡骨架 **＋ 骨架门禁** |
+| `lit_enrich.py` | 为已有 source 卡生成并应用**带原文证据**的二次加工提案 |
 | `lit_finish.py` | 入库收尾（index.md / log_ops.md / 索引） |
 | `lit_gapscan.py` | 缺口扫描 → 下一轮检索式 |
 | `lit_catalogue.py` | 去重目录构建（缓存增量） |
@@ -757,7 +873,7 @@ python mcp/server.py --selftest                               # CI 用
 
 ## 9. Sci-Assistant 决策层
 
-> **v0 全量完成 2026-10-21** ｜ 12 个 `sci_*` 工具 ｜ 3 大核心能力
+> **v0 全量完成** ｜ 13 个 `sci_*` 工具 ｜ 3 大核心能力 + 1 层贯穿
 
 Sci-Assistant 是基于知识库的**科研课题辅助系统**——从切入点发现、实验方案设计到进展追踪，形成"知识→决策→行动→反馈"的闭环。
 
@@ -765,22 +881,32 @@ Sci-Assistant 是基于知识库的**科研课题辅助系统**——从切入�
 
 | # | 能力 | 场景 | 工具 |
 |---|---|---|---|
-| **C1** | **切入点发现** | 已有大方向（如"电解液设计"），找未被充分探索的细分点 | `sci_landscape.py` `sci_gap_scan.py` `sci_topic_rec.py` |
+| **C1** | **切入点发现** | 已有大方向，想找未被充分探索的细分点 | `sci_landscape.py` `sci_gap_scan.py` `sci_topic_rec.py` |
 | **C2** | **实验方案推荐** | 确定切入点后，设计实验路线 | `sci_method_extract.py` `sci_protocol_gen.py` `sci_lab_match.py` `sci_method_chain.py` |
-| **C3** | **课题进展统筹** | 实验推进中，记录、分析、调整 | `sci_progress.py` `sci_data_analysis.py` `sci_ecsa_qc.py` `sci_review.py` |
+| **C3** | **课题进展统筹** | 实验推进中，记录、分析、调整 | `sci_progress.py` `sci_data_analysis.py` `sci_ecsa_qc.py` `sci_review.py` `sci_reagent_import.py` |
+| **贯穿** | **证据回链** | 任何输出都要能指回 source 卡 | `sci_links.py` |
+
+```bash
+python tools/sci_landscape.py --direction "<你的研究方向>"     # C1：景观
+python tools/sci_gap_scan.py    --direction "<你的研究方向>"   # C1：空白信号
+python tools/sci_protocol_gen.py --method "<某方法>"           # C2：方案
+python tools/sci_progress.py    --list                        # C3：课题台账
+```
 
 ### 设计原则
 
-1. **证据链不可断**：任何推荐/参数必须能回指 source 卡或原文
-2. **事实型输出**：不生成"优势/适用条件"等判断，判断层单独走 LLM + quote 校验
-3. **写前备份**：覆盖固定落点文件前自动备份
-4. **自检纪律**：所有工具带 `--selftest`（总计 178 项）
+1. **证据链不可断**：任何推荐/参数必须能回指 source 卡或原文；无出处的结论标"库内无证据"
+2. **事实型输出**：不生成"优势/适用条件"等判断，判断层单独走 LLM + quote 机械校验
+3. **写前备份**：覆盖固定落点文件前自动备份到 `_scratch/backup/`
+4. **数字不写死**：阈值与路径从配置文件读，不在代码里硬编码
+5. **自检纪律**：所有工具带 `--selftest`（含正例与反例夹具）
 
-### 实测案例
+### 已知边界
 
-- **电解液设计方向（C1）**：200 卡候选 → 10 个子方向 → 9 个空白信号 → 5 个切入点（2 high）
-- **锌电解液方案（C2）**：3 个候选方法对比，参数逐条带 quote，32 条判断 0 失败
-- **ECSA 重算与复盘（C3）**：失效案例重算，5 条建议 6 条证据 0 失败
+- **C1 候选集不是全库普查**：取 BM25 前 N 张 source 卡，N 可配。
+- **C2 方法库无"优势/局限"字段**：策略层只做事实排列，判断层另走 LLM。
+- **C3 归因是"可能原因"**：不是因果，证据不足即丢弃。
+- **`sci_ecsa_qc.py` 是电化学专用**（ECSA/Cdl 五道门），其他领域请照它的门禁结构另写。
 
 详见 [`docs/SCI-ASSISTANT.md`](docs/SCI-ASSISTANT.md)。
 
@@ -791,6 +917,12 @@ Sci-Assistant 是基于知识库的**科研课题辅助系统**——从切入�
 **Q：`--doctor` 报「嵌入索引不存在」**
 正常。语义检索是**可选增强**。想要就 `pip install sentence-transformers` 后
 `python tools/kb_semantic_search.py --build`。
+
+**Q：`kb.py search` 报 `RetrievalUnavailable`、退出码 3**
+默认 `--mode hybrid` **要求**嵌入索引 + 本地 Reranker，缺一就报错——它**不会**
+静默降级成 BM25（那会让你以为拿到的是融合结果）。两条路：
+① 加 `--mode bm25`（零额外依赖）；② `pip install -r requirements-optional.txt`
+后 `python tools/kb.py index embed`。Reranker 首次需下载时还要显式加 `--allow-download`。
 
 **Q：搜索返回 0 命中，但库里有页面**
 99% 是**忘了重建索引**：`python tools/kb_build_index.py`（增量，秒级）。
@@ -811,6 +943,17 @@ frontmatter 被写坏（最常见：长字段含冒号**没加引号**）。
 
 **Q：`lit_fetch` 退出码 4**
 **全部下载失败**（不是"没有新文献"）。看 `downloads/manifest-<时间戳>.md` 里的清单手工下载，再走 B′。
+
+**Q：`lit_discover` / `lit_daily` 退出码 3，或每个方向都只回同样多条**
+两种成因，看日志区分：
+① **缺 OpenAlex API key** ⇒ cursor 翻页从第 2 页起 `401`，每个分片被截断成首屏。
+设 `OPENALEX_API_KEY` 环境变量（**别写进 `lit_config.yaml`**）。
+② 真的分片检索失败（网络／限流）。日志里会写具体分片与 HTTP 状态。
+
+**Q：`lit_si.py fetch` 退出码 4**
+**判定有 SI，但一份都没取到**。RSC/ACS/Science/IOP 对脚本一律 403/302，
+属预期：工具会把手动下载清单写出来。别改判据去"修"它——判据只认 PDF 里的
+**声明句式**，放宽成裸词会把「讨论别人的 SI」的文章误判成有 SI，白追一轮。
 
 **Q：`lit_fetch` 提示 Unpaywall 回退被跳过**
 `lit_config.yaml: datasource.mailto` 为空。填**你的真实邮箱**可进 OpenAlex 礼貌池
@@ -854,7 +997,7 @@ frontmatter 被写坏（最常见：长字段含冒号**没加引号**）。
 | 类别 | 文件 | 怎么改 |
 |---|---|---|
 | **生成物** | `tools/**`、`skills/**`、`CLAUDE.md`、`docs/METHODOLOGY.md`、`docs/TOOLS.md`、`kit.yaml` | ❌ **勿手改**；改真源后重跑生成器 |
-| **手写件** | `build/**`、`mcp/**`、`scripts/**`、`README.md`、`LICENSE`、`NOTICE.md`、`pyproject.toml`、`requirements*.txt`、`docs/GETTING-STARTED.md`、`docs/ARCHITECTURE.md`、`docs/MCP.md`、`scaffold/**` | ✅ 直接改 |
+| **手写件** | `build/**`、`mcp/**`、`scripts/**`、`README.md`、`LICENSE`、`NOTICE.md`、`pyproject.toml`、`package.json`、`requirements*.txt`、`docs/GETTING-STARTED.md`、`docs/ARCHITECTURE.md`、`docs/MCP.md`、`docs/SCI-ASSISTANT.md`、`scaffold/**` | ✅ 直接改 |
 
 生成物文件头都有醒目横幅：
 
@@ -865,31 +1008,69 @@ frontmatter 被写坏（最常见：长字段含冒号**没加引号**）。
 **重新生成**：
 
 ```bash
-python build/build_kit.py                 # 用默认源库生成到本仓库根
+export MATSCI_KB_SRC="/path/to/你的知识库"    # Windows: set MATSCI_KB_SRC=...
+python build/build_kit.py                     # 生成到本仓库根
 python build/build_kit.py --src <库根> --out <kit根>
-python build/build_kit.py --check         # 只跑泄漏扫描
+python build/build_kit.py --check             # 只跑泄漏扫描
 ```
 
-三条架构不变量：
+生成器**不内置任何本机路径**：`--src` 缺省读 `MATSCI_KB_SRC`，两者都没有就中止（退出码 2）。
+
+五条架构不变量：
 
 1. **`--out` 不得落在 `--src` 内**（硬门禁，防止把生成物写回真源）。
-2. **生成后全树泄漏扫描**（`build/rules/leak_denylist.txt`），任一命中即**构建失败**。
-3. **漂移可见**：`scrub` / `drop_sections` 规则若在真源找不到目标会**告警**；
+2. **生成后全树泄漏扫描**，任一命中即**构建失败**。词表由两份合并而成：
+   `build/rules/leak_denylist.txt`（公开，通用形态：家目录／用户名路径）
+   + `build/rules/private/leak_denylist.txt`（gitignored，源库专名）。
+   扫描范围 `SCAN_TARGETS` 覆盖 `tools/ docs/ skills/ scaffold/ mcp/ bin/ scripts/`
+   **以及全部手写件**（`README.md` `CLAUDE.md` `kit.yaml` `package.json`
+   `requirements*.txt` `index.js`）——手写件同样会泄密，不能豁免。
+   ⚠️ `build/` **刻意不扫**：规则文件本身必须以字面量保存这些专名，否则无从替换。
+   代价由第 5 条兜住。
+3. **漂移可见**：`scrub` / `drop_sections` / `drop_lines` 的规则若在真源找不到目标会**告警**；
    残留泄漏由第 2 条兜底为失败。
+4. **`include.txt` 必须对 import 闭合**：它是白名单，但 `kb.py` 会动态导入
+   `kb_rag` / `kb_agentic`，被收录的工具也会 `import kb_lib` / `lit_ingest` 等兄弟模块。
+   漏收一个 ⇒ 生成物在自己仓库里 `ImportError`。加新工具时连带查它的 import。
+5. **`private/` 永不发布**——git 与 npm 两条路都要堵：
+   - git：`.gitignore` 里有 `build/rules/private/`；
+   - npm：🔴 `.gitignore` **管不住 npm 包**。npm 明确规定「被 `files` 收进来的文件
+     无法再用 `.npmignore`／`.gitignore` 排除」，实测 `files` 写 `"build/"` 时
+     `npm pack` 把五个私有规则文件整包发了出去。所以 `files` 里的 `build` 条目
+     **逐文件列**，不写整目录。`scripts/verify_kit.py` 第 6 项把这条断言机械化了。
 
-规则文件在 `build/rules/`：`include.txt`（白名单）、`exclude.txt`（排除审计）、
-`scrub.yaml`（字面→替换去个人化）、`drop_sections.yaml`（`CLAUDE.md` 块级替换）、
-`leak_denylist.txt`（fail-closed 扫描）。
+规则文件在 `build/rules/`（公开件与私有件的分界详见 [`build/rules/README.md`](build/rules/README.md)）：
+
+| 文件 | 发布 | 作用 |
+|---|---|---|
+| `include.txt` | ✅ | 随包工具白名单（须 import 闭合，见不变量 4） |
+| `exclude.txt` | ✅ | 排除审计：每个**不收**的工具都写明理由 |
+| `leak_denylist.txt` | ✅ | 通用形态词表（家目录／用户名路径）。收录门槛：在本 kit 树上 **0 命中** |
+| `examples/` | ✅ | 五个私有规则的**假值**模板，供新用户 `cp -r` 起步 |
+| `private/scrub.yaml` | 🔴 | 逐文件字面量替换（结构性去个人化；未命中则告警） |
+| `private/global_scrub.yaml` | 🔴 | 全局专名替换（库名／工程名／研究方向／文献卡 slug）。**顺序敏感**：长而具体的在前，短兜底在后。同一文件内替换是统一的，所以 selftest 断言仍自洽。未命中**不**告警（专名可能本就不出现），由 denylist 兜底 |
+| `private/drop_sections.yaml` | 🔴 | `CLAUDE.md` / `TOOLS.md` 的块级变换：`rules` 字面量替换、`drop_headings` 按标题整段删（用于源库的活台账，字面量会天天漂移）、`drop_lines` 按正则逐行删 |
+| `private/skill_scrub.yaml` | 🔴 | 技能文件的**正则**替换。技能是人写的散文，同一专名会以多种形态出现（带盘符／正斜杠／裸名／旧名），字面量覆盖不住 |
+| `private/leak_denylist.txt` | 🔴 | fail-closed 扫描词表的私有半份，分三组：本机路径 / 库名与工程名 / **源库真实研究方向与文献卡 slug** |
+
+> 🔴 第 ③ 组是「不得上传本地文献与隐私」这条红线的机械化形式。
+> 新增源库专名时**先加进 denylist**，再去补 scrub 规则——顺序反了就会漏。
+>
+> 🔴 私有规则缺失时**不静默降级**：生成直接中止；`--check` 仍可跑（CI 的干净 checkout
+> 本来就没有 `private/`，靠公开那份通用词表兜底），但会打印 `[warn]` 说明降级范围。
 
 **验证**（改完 `build/` 必跑）：
 
 ```bash
-python scripts/verify_kit.py     # 泄漏扫描 + py_compile + --help + 空库冒烟 + MCP
+python build/build_kit.py --check    # 只跑泄漏扫描（快）
+python scripts/verify_kit.py         # 泄漏扫描 + py_compile + --help + 空库冒烟 + MCP + npm 白名单
 ```
 
 CI 在每次 push／PR 跑同一条命令（`.github/workflows/verify.yml`）。
 
 `kit.yaml` 记录了生成溯源：源 commit、生成时间、工具清单与**逐文件 sha256**。
+若生成时源库 `tools/` 有未提交改动，`source_dirty_tools` 会列出脏文件——
+因为只记 commit 就是**假溯源**：照着那个 commit 拉源码重建，得到的不是这份 kit。
 
 ---
 

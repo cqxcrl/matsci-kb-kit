@@ -7,6 +7,8 @@
   2. 全部生成工具 py_compile 通过
   3. 每个随包工具 --help 可运行（不产生副作用）
   4. 空库冒烟：临时目录跑 kb_init → kb_build_index → kb_search（不 exit 2）→ kb_toolcheck
+  5. MCP server：注册表可列 + 对空库实跑一个只读工具
+  6. npm files 白名单不会把 build/rules/private/ 打进包
 
 用法：python scripts/verify_kit.py [--kit <kit根>]
 退出码：0 全绿；非 0 表示失败项数。
@@ -104,6 +106,37 @@ def main():
                     print(f"[5] MCP server：{'OK' if ok_mcp else 'FAIL'}")
                     if not ok_mcp:
                         print(r5.stdout[-500:]); print(r6.stdout[-500:]); fails += 1
+
+    # 6) npm 包不得含私有去个人化规则
+    # 🔴 files 白名单会**压过** .gitignore：npm 明确规定「被 files 收进来的文件无法再用
+    #    .npmignore/.gitignore 排除」。曾实测 package.json 写 "build/" 时，npm pack 把
+    #    build/rules/private/ 下五个含源库专名的规则文件整包发了出去。
+    #    所以这里把 files 里所有 build* 条目按 glob 展开，断言没有一条落在 rules/private。
+    import glob as _glob
+    import json as _json
+    pkg = os.path.join(kit, "package.json")
+    leaked = []
+    if os.path.isfile(pkg):
+        with open(pkg, "r", encoding="utf-8") as f:
+            entries = _json.load(f).get("files") or []
+        for e in entries:
+            if not (e == "build" or e.startswith("build/")):
+                continue
+            base = os.path.join(kit, e.rstrip("/"))
+            paths = (_glob.glob(os.path.join(base, "**"), recursive=True)
+                     if e.endswith("/") else [base])
+            for p in paths:
+                rel = os.path.relpath(p, kit).replace("\\", "/")
+                if "rules/private" in rel:
+                    leaked.append(f"files 条目 {e!r} → {rel}")
+        ok_pkg = not leaked
+        print(f"[6] npm files 白名单：{'OK' if ok_pkg else 'FAIL'}")
+        if not ok_pkg:
+            for x in leaked:
+                print(f"      {x}")
+            print("      修法：把 files 里的 \"build/\" 换成逐条公开文件"
+                  "（见 build/rules/README.md 的「为什么不能整目录白名单」）")
+            fails += 1
 
     print("")
     print(f"=== verify_kit：{'PASS' if fails == 0 else f'FAIL ({fails})'} ===")

@@ -46,6 +46,12 @@ TOOLS = os.path.join(VAULT, "tools")
 PY = sys.executable
 TIMEOUT = 240
 
+# 🔴 项目工具目录（2026-10-23 扩围）：`projects/*/ingest/tools/*.py` 此前**完全在门禁之外**——
+#    既不在本工具的名单里，也不在 `kb_lint_deep` 的 E 族里，于是
+#    `batch_digests.py` 那种「连 --help 都写 166 个文件」的脚本能长期不被发现。
+#    项目工具与 `tools/` 的区别只是位置，风险相同（都直接写库内数据）。
+_PROJ_TOOLS_GLOB = os.path.join(VAULT, "projects", "*", "ingest", "tools", "*.py")
+
 # 页面/工具之外的「工作区」根，用于写盘防呆快照。
 #
 # 🔴 2026-10-10 扩围（P2-8）：原监视集只有 ("tools", "wiki/.index")，
@@ -67,7 +73,11 @@ TIMEOUT = 240
 #    （如 os.utime 回写时间戳 + 等长原地改写），本判据抓不到——这种形态在本库工具链里
 #    没有实例，且真出现时它连 mtime 都能伪造，哈希判据也未必是瓶颈所在。
 #    若将来需要更强判据，加 `--hash-watch` 开关即可，不要默认开启。
-_WATCH_DIRS = ("tools", "wiki", "raw/notes/lit-watch", ".qc")
+# 🔴 2026-10-23：加 `projects`。项目工具就住在 `projects/*/ingest/tools/`，它们写的是
+#    `projects/*/sources/`、`ingest/_digests/`、`references/SI/` —— 旧监视集对这三处
+#    完全失明，于是「项目工具意外写盘」永远抓不到。加进来的代价只是快照多扫一遍
+#    projects 树（(mtime,size) 判据，~1000 文件量级，实测可忽略）。
+_WATCH_DIRS = ("tools", "wiki", "raw/notes/lit-watch", ".qc", "projects")
 
 # 显式**不监视**的子树（相对库根，前缀匹配）。写成清单而不是靠「不写进 _WATCH_DIRS」，
 # 这样以后有人扩大监视范围时，这两处不会被顺手带进来。
@@ -231,6 +241,17 @@ def _last_line(s, n=70):
     return ls[-1][:n] if ls else ""
 
 
+def _has_cli(src):
+    """源码是否声明了 CLI 入口（argparse 或显式 `--help` 处理）。
+
+    🔴 为什么要先判再跑：项目里存在**历史一次性脚本**（manual argv、模块顶层就写盘）。
+    对它们执行 `--help` 等于执行 main **并把数据写坏**——写盘防呆只能在事后记账，
+    不能阻止写入。故对「无 CLI 声明」的脚本**不实跑**，标 NO-CLI 并说明原因。
+    本工具宁可漏一次「帮助不像帮助」，也不制造一次真实写盘。
+    """
+    return ("argparse" in src) or ('"--help"' in src) or ("'--help'" in src)
+
+
 def _guard(pre, since, label, rec):
     """比对快照并把结果写进 rec。区分「意外写盘」与「窗口外的并发外部编辑」。
 
@@ -252,8 +273,13 @@ def _guard(pre, since, label, rec):
 
 
 def check_one(name, path, do_write_guard=True):
-    """返回 dict：{name, compile, selftest, help, write_guard, notes[], external_writes}"""
-    rec = {"name": name, "compile": None, "selftest": None,
+    """返回 dict：{name, compile, selftest, help, write_guard, notes[], external_writes}
+
+    `name` 是**报告里的显示名**（项目工具用库根相对路径，避免不同项目同名脚本混淆）；
+    名单查表（_SELFTEST_ARGV / _WRITE_ON_SELFTEST）一律按**文件名**匹配。
+    """
+    base = os.path.basename(path)
+    rec = {"name": name, "file": base, "compile": None, "selftest": None,
            "help": None, "write_guard": None, "external_writes": [], "notes": []}
 
     # --- B 编译健全性 ---
@@ -270,10 +296,10 @@ def check_one(name, path, do_write_guard=True):
     if has_st:
         # 窗口起点必须在被测工具**启动之前**取：mtime 落在窗口内的改动才可能是它写的。
         since = _now_ns()
-        pre = _snapshot() if (do_write_guard and name not in _WRITE_ON_SELFTEST) else None
+        pre = _snapshot() if (do_write_guard and base not in _WRITE_ON_SELFTEST) else None
         # 少数工具的开关不叫 `--selftest`（如 kb_lint_deep 走 kb_lint 的 --selftest-deep），
         # 用逐工具 argv 表表达，**不要**为了统一而给工具硬塞一个假开关。
-        rc, out = _run([PY, path] + _SELFTEST_ARGV.get(name, ["--selftest"]))
+        rc, out = _run([PY, path] + _SELFTEST_ARGV.get(base, ["--selftest"]))
         if rc is None:
             rec["selftest"] = "TIMEOUT"
         elif rc != 0:
@@ -295,6 +321,11 @@ def check_one(name, path, do_write_guard=True):
     # --- H CLI 健全性（--help 必须真的是帮助，不得执行 main） ---
     # 判定只看**输出是否像帮助**（usage/用法/options）；不强制 rc==0，
     # 因为自定义解析器在缺必填参数时可能返回非零（如 kb_where 返回 2）。
+    if not _has_cli(src):
+        rec["help"] = "NO-CLI"
+        rec["notes"].append("--help: 源码无 argparse/--help 处理，未实跑"
+                            "（跑它会执行 main，可能写盘）")
+        return rec
     since = _now_ns()
     pre = _snapshot() if do_write_guard else None
     rc, out = _run([PY, path, "--help"])
@@ -310,25 +341,57 @@ def check_one(name, path, do_write_guard=True):
     return rec
 
 
-def _tool_list(only=None):
-    names = sorted(os.path.basename(p) for p in
-                   glob.glob(os.path.join(TOOLS, "kb_*.py")) +
-                   glob.glob(os.path.join(TOOLS, "qc_*.py")) +
-                   glob.glob(os.path.join(TOOLS, "lit_*.py")) +
-                   # 🔴 显式补 `kb.py`：它没有下划线，**天然逃过上面的 `kb_*.py` glob**，
-                   #    于是这个「首选入口」成了全库唯一没有任何自动门禁的工具
-                   #    （既不在本名单，也不在 kb_lint_deep 的 E 族里）。
-                   glob.glob(os.path.join(TOOLS, "kb.py")))
+def _tool_entries(only=None):
+    """→ [(显示名, 绝对路径)]。
+
+    显示名：`tools/` 下的用**文件名**（保持报告紧凑、与既有习惯一致）；
+    `projects/*/ingest/tools/` 下的用**库根相对路径**（不同项目有同名脚本时不会混淆）。
+    `--tools` 过滤同时接受显示名、文件名、去掉 .py 的写法。
+    """
+    items = []
+    for p in (glob.glob(os.path.join(TOOLS, "kb_*.py")) +
+              glob.glob(os.path.join(TOOLS, "qc_*.py")) +
+              glob.glob(os.path.join(TOOLS, "lit_*.py")) +
+              # 🔴 Sci-Assistant 工具层（2026-10-18 起）：`sci_*.py` 与 kb_/qc_/lit_ 一样
+              #    必须实跑自检——否则新增工具会静默逃过 E 族执行层。
+              glob.glob(os.path.join(TOOLS, "sci_*.py")) +
+              # 🔴 显式补 `kb.py`：它没有下划线，**天然逃过上面的 `kb_*.py` glob**，
+              #    于是这个「首选入口」成了全库唯一没有任何自动门禁的工具
+              #    （既不在本名单，也不在 kb_lint_deep 的 E 族里）。
+              glob.glob(os.path.join(TOOLS, "kb.py"))):
+        items.append((os.path.basename(p), p))
+    # 🔴 2026-10-23 扩围：项目工具。原先只在项目文档里被提及，没有任何自动检查。
+    items += [(_rel(p), p) for p in glob.glob(_PROJ_TOOLS_GLOB)]
     # 只排除**本检查器自身**（跑自己会递归）。kb_lib / kb_lint_deep 现在都在名单内：
     # 前者由 _EXCLUDED 说明理由并转由 kb_selftest.py 覆盖，后者本轮补了真 CLI。
-    names = [n for n in names if n not in ("kb_toolcheck.py", "__init__.py")]
+    items = [(n, p) for n, p in items
+             if os.path.basename(p) not in ("kb_toolcheck.py", "__init__.py")]
+    items.sort(key=lambda x: (x[1].startswith(os.path.join(VAULT, "projects")), x[0]))
     if only:
         want = {x.strip() for x in only.split(",") if x.strip()}
-        names = [n for n in names if n in want or n[:-3] in want]
-    return names
+        items = [(n, p) for n, p in items
+                 if n in want or os.path.basename(p) in want
+                 or os.path.basename(p)[:-3] in want]
+    return items
+
+
+def _tool_list(only=None):
+    """兼容旧调用：只返回显示名。"""
+    return [n for n, _ in _tool_entries(only)]
+
+
+def _record_failed(rec):
+    """单项检查是否有失败；NO-FLAG/NO-CLI 等能力说明不算失败。"""
+    return (rec.get("compile") == "FAIL"
+            or rec.get("selftest") in ("FAIL", "TIMEOUT")
+            or rec.get("help") == "NOT-HELP"
+            or rec.get("write_guard") == "WRITES")
 
 
 def main():
+    # 本文件 `--help` 打印的 __doc__ 含 ✅ 等非 GBK 字符；不先设编码，
+    # CP936 控制台下 print 会抛 UnicodeEncodeError ⇒ `--help` 退出码 1。
+    K.console_encoding()
     if "--selftest" in sys.argv:
         return run_selftest()
     if "--help" in sys.argv or "-h" in sys.argv:
@@ -341,28 +404,32 @@ def main():
             only = sys.argv[i + 1]
     as_json = "--json" in sys.argv
 
-    names = _tool_list(only)
+    entries = _tool_entries(only)
     rows = []
-    for n in names:
-        rows.append(check_one(n, os.path.join(TOOLS, n)))
+    for n, p in entries:
+        rows.append(check_one(n, p))
+    failed = any(_record_failed(r) for r in rows)
 
     if as_json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
-        return 0
+        return 1 if failed else 0
 
     print("=== 全库工具完整性 + 可行性检查 ===\n")
-    print(f"{'tool':34s} {'comp':5s} {'selftest':9s} {'help':9s} {'write':7s}")
+    width = max([34] + [len(r["name"]) for r in rows])
+    print(f"{'tool':{width}s} {'comp':5s} {'selftest':9s} {'help':9s} {'write':7s}")
     problems = []
+    no_cli = []
     exempt = 0
     ext_total = 0
     for r in rows:
         flag = ""
-        if r["compile"] == "FAIL" or r["selftest"] == "FAIL" \
-           or r["help"] == "NOT-HELP" or r["write_guard"] == "WRITES":
+        if _record_failed(r):
             flag = "  <<<"
             problems.append(r)
+        if r["help"] == "NO-CLI":
+            no_cli.append(r)
         w = r["write_guard"] or "-"
-        if r["name"] in _WRITE_ON_SELFTEST and r["selftest"] not in (None, "NO-FLAG"):
+        if r["file"] in _WRITE_ON_SELFTEST and r["selftest"] not in (None, "NO-FLAG"):
             # 白名单内工具：其 selftest 本就会写盘，故写盘判据（S 段）被跳过，
             # 但 --help 段仍在监视。用 `*` 标出来，避免读表的人误以为「它也被全量监视了」。
             w = str(w) + "*"
@@ -371,7 +438,9 @@ def main():
         print(f"{r['name']:34s} {str(r['compile']):5s} {str(r['selftest']):9s} "
               f"{str(r['help']):9s} {w:7s}{flag}")
     print()
-    print(f"工具数: {len(rows)}  |  问题工具: {len(problems)}")
+    n_proj = sum(1 for r in rows if r["name"].startswith("projects/"))
+    print(f"工具数: {len(rows)}（tools/ {len(rows) - n_proj}，项目工具 {n_proj}）"
+          f"  |  问题工具: {len(problems)}")
     print(f"监视范围: " + ", ".join(_WATCH_DIRS)
           + f"（排除 {'/'.join(_WATCH_EXCLUDE)}）")
     print(f"selftest 写盘豁免（_WRITE_ON_SELFTEST，标 *）: {exempt} 个"
@@ -380,10 +449,15 @@ def main():
         print(f"窗口外并发改动（不计入判定）: {ext_total} 个文件"
               f" —— 本库 Lead/subagent 会并发编辑 tools/ 与 wiki/，"
               f"数值偏高时本次写盘判据可信度下降")
+    if no_cli:
+        print(f"\n无 CLI 入口（未实跑 --help，避免误触发写盘）: {len(no_cli)} 个"
+              f" —— 这些脚本只能靠人工/静态检查确认安全性")
+        for r in no_cli:
+            print(f"  · {r['name']}")
     for r in problems:
         for nt in r["notes"]:
             print(f"  · {r['name']}: {nt}")
-    return 0
+    return 1 if failed else 0
 
 
 # =================================================================== 自检
@@ -391,7 +465,7 @@ def main():
 def run_selftest():
     """已知答案反算：正例（好工具）必须判 ok，反例（坏工具）必须被抓住。"""
     import tempfile
-    global VAULT, _WATCH_DIRS, _WATCH_EXCLUDE
+    global VAULT, _WATCH_DIRS, _WATCH_EXCLUDE, TOOLS, _PROJ_TOOLS_GLOB
     ok = fail = 0
 
     def chk(label, cond):
@@ -403,7 +477,15 @@ def run_selftest():
             fail += 1
             print(f"  [FAIL] {label}")
 
-    d = tempfile.mkdtemp(prefix="kbtool_")
+    healthy = {"compile": "ok", "selftest": "PASS", "help": "ok", "write_guard": None}
+    chk("退出码判定正例：四类检查通过时不失败", not _record_failed(healthy))
+    for field, value in (("compile", "FAIL"), ("selftest", "FAIL"),
+                         ("selftest", "TIMEOUT"), ("help", "NOT-HELP"),
+                         ("write_guard", "WRITES")):
+        chk(f"退出码判定反例：{field}={value} 必须失败",
+            _record_failed({**healthy, field: value}))
+
+    d = K.make_temp_dir(prefix="kbtool_")
 
     def write(fn, content):
         p = os.path.join(d, fn)
@@ -432,9 +514,11 @@ def run_selftest():
     r = check_one("bad_st.py", bad_st)
     chk("反例 selftest 报 FAIL 被抓住", r["selftest"] == "FAIL")
 
-    # 反例2：--help 不提供帮助（无 argparse，直接执行 main）
+    # 反例2：有 CLI 声明但 `--help` 不提供帮助（直接执行 main）
+    #   2026-10-23 调整：无 CLI 声明的脚本现在**不实跑**（见反例3b），
+    #   所以本夹具必须显式带上 CLI 声明，否则测的就不是 H 段判据了。
     bad_help = write("bad_help.py",
-                     "import sys\nprint('running main, wrote something')\n")
+                     "import argparse\nprint('running main, wrote something')\n")
     r = check_one("bad_help.py", bad_help)
     chk("反例 --help 非帮助被抓住", r["help"] == "NOT-HELP")
 
@@ -443,11 +527,48 @@ def run_selftest():
     r = check_one("bad_compile.py", bad_compile)
     chk("反例 语法错误 compile=FAIL", r["compile"] == "FAIL")
 
+    # ---- 2026-10-23 新增夹具：项目工具入网 + 无 CLI 脚本不得被实跑 ----------
+    # 反例3b：**无 CLI 声明**的写盘脚本，`--help` 绝不能被实跑。
+    #   历史缺陷原型：`batch_digests.py` 无 argparse、main() 一进来就 os.makedirs +
+    #   逐篇写盘 ⇒ 一次 `--help` 写出 166 个摘要文件。本夹具钉住「不跑」这条安全属性，
+    #   而不是只断言 help 字段的字符串。
+    old_wd2 = _WATCH_DIRS
+    _WATCH_DIRS = (d,)
+    silent = write("silent_writer.py",
+                   "import os\n"
+                   "open(os.path.join(os.path.dirname(__file__),'boom.txt'),'w').write('x')\n")
+    r = check_one("silent_writer.py", silent)
+    _WATCH_DIRS = old_wd2
+    chk("反例 无 CLI 声明的写盘脚本未被 --help 实跑（NO-CLI 且未产生 boom.txt）",
+        r["help"] == "NO-CLI" and not os.path.exists(os.path.join(d, "boom.txt")))
+
+    # 正例：项目工具必须进入名册（旧实现只 glob tools/，项目脚本全在门外）
+    old_tools, old_glob = TOOLS, _PROJ_TOOLS_GLOB
+    fake_tools = os.path.join(d, "tools")
+    proj_tools = os.path.join(d, "projects", "PX", "ingest", "tools")
+    os.makedirs(fake_tools, exist_ok=True)
+    os.makedirs(proj_tools, exist_ok=True)
+    for p in (os.path.join(fake_tools, "kb_dummy.py"),
+              os.path.join(proj_tools, "proj_dummy.py")):
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("print('x')\n")
+    TOOLS = fake_tools
+    _PROJ_TOOLS_GLOB = os.path.join(d, "projects", "*", "ingest", "tools", "*.py")
+    entries = dict((n, p) for n, p in _tool_entries())
+    TOOLS, _PROJ_TOOLS_GLOB = old_tools, old_glob
+    # 注意：夹具里的工具在临时目录，`_rel()` 相对**真实**库根会得到 `../../…`，
+    # 故按**文件名**断言而不是按 `projects/` 前缀（前缀只在真实库结构下成立）。
+    proj_key = [n for n in entries if n.endswith("proj_dummy.py")]
+    chk(f"正例 项目工具进入名册（{proj_key[:1]}）",
+        len(entries) == 2 and len(proj_key) == 1)
+
     # 反例4：--help 路径写盘（须打开 do_write_guard，且监视目录临时指向临时夹）
-    global _WATCH_DIRS, _WATCH_EXCLUDE
+    # （`global _WATCH_DIRS` 已在函数开头声明，此处不再重复——Python 不允许
+    #   在「同一作用域内使用之后」再声明 global，会直接 SyntaxError。）
     old = _WATCH_DIRS
     _WATCH_DIRS = (d,)  # 绝对路径，直接监视临时目录
-    writer = write("writer.py", "import os,sys\n"
+    # 带 argparse 的声明，确保进入 H 段实跑（无 CLI 声明的脚本已被反例3b 钉住不跑）
+    writer = write("writer.py", "import os,sys,argparse\n"
                                 "print('usage: writer.py')\n"
                                 "open(os.path.join(os.path.dirname(__file__),'side.txt'),'w').write('x')\n"
                                 "raise SystemExit(0)\n")

@@ -9,8 +9,8 @@
   3. --merge   逐条校验证据页存在、quote 是页面正文连续子串，渲染 review.md
 
 用法：
-  python tools/sci_review.py --project "ECSA-重算与复盘" --data <ecsa_result.json> --build
-  python tools/sci_review.py --project "ECSA-重算与复盘" --merge <review.json>
+  python tools/sci_review.py --project "课题A" --data <ecsa_result.json> --build
+  python tools/sci_review.py --project "课题A" --merge <review.json>
   python tools/sci_review.py --selftest
 
 🔴 建议必须挂库内证据（页面 + 原文），校验不过的条目丢弃；

@@ -65,6 +65,20 @@ defaults:
 datasource:
   api: "https://api.openalex.org"
   mailto: ""
+  # OpenAlex 自 2026-10 起要求 **cursor 翻页必须带 API key**：无 key 时第 2 页起返回
+  # `401 API key required for cursor paging` ⇒ 每个分片只取回首屏，命中 >per_page 的
+  # 分片被静默截断（旧版会误报成 rc=3「分片检索失败」）。
+  # 免费申请：https://openalex.org/settings/api（一分钟）。
+  #
+  # 🔴 **不要把 key 明文写在这个字段里。** 本文件会被复制进你的库、而库通常被 git 跟踪，
+  #    明文 key 会随下次提交永久留在历史里（删文件也删不掉历史）。
+  #    请用**环境变量 `OPENALEX_API_KEY`**——代码里它的优先级**高于**本字段
+  #    （见 lit_discover.openalex_api_key）：
+  #      Git Bash:   export OPENALEX_API_KEY="<你的key>"      # 或写进 ~/.bashrc
+  #      PowerShell: setx OPENALEX_API_KEY "<你的key>"        # 需重开终端
+  #      计划任务:   在调用 lit_daily 的 .cmd 里先 set OPENALEX_API_KEY=...
+  #    ⚠️ 本字段留空 = 不注入 key（只取首屏）。key 也绝不写进日志或 URL 打印。
+  api_key: ""
 
 # ---------------------------------------------------------------- 5. 落盘约定
 layout:

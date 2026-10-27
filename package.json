@@ -1,6 +1,6 @@
 {
   "name": "matsci-kb-kit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Toolbox + methodology for building an Obsidian knowledge base: retrieval, literature pipeline, QC, MCP server, and Sci-Assistant decision layer.",
   "main": "index.js",
   "bin": {
@@ -8,6 +8,7 @@
   },
   "scripts": {
     "postinstall": "node scripts/check-python-deps.js",
+    "prepack": "node scripts/clean-pycache.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
@@ -39,7 +40,13 @@
     "skills/",
     "docs/",
     "mcp/",
-    "build/",
+    "build/README.md",
+    "build/build_kit.py",
+    "build/rules/README.md",
+    "build/rules/include.txt",
+    "build/rules/exclude.txt",
+    "build/rules/leak_denylist.txt",
+    "build/rules/examples/",
     "bin/",
     "CLAUDE.md",
     "kit.yaml",

@@ -21,14 +21,22 @@
 ⇒ 教训：**「写明检索范围」只在范围本身完备时才有意义。**
    范围不完备时，写明了反而让错误的「0 命中」显得可信。
 
-本库的资料实际分布在**四个**目录；任一遗漏都会把"存在"报成"不存在"：
+本库的资料分布在**静态目录**（raw/ wiki/）与**动态发现的综述工程**两类；任一遗漏都会把"存在"报成"不存在"：
 
-    raw/                              # 一手资料（clippings/ literatures-md/ _pdf/ …）
+    raw/                              # 一手资料（clippings/ 全文提取/ pdf/ …）
     wiki/                             # 知识页（sources/ concepts/ entities/ …）
-    projects/references/   # 参考文献全文抓取件
-    projects/               # 综述工程自身（evidence/ draft/ …）
+    projects/<slug>/references/       # 综述工程参考文献全文抓取件（动态发现）
+    projects/<slug>/                  # 综述工程自身（evidence/ draft/ …）（动态发现）
 
-另有 `wiki/.claude-rename/`（历史重命名备份，312 文件）与 `wiki/.index/`（派生数据），
+> 🔴 **综述工程目录是动态发现的**（2026-10-22 修，坑 3）：`projects/` 下任一含
+> `references/` **或** `draft/` 子目录的工程即被纳入检索（`proj-<slug>-refs` /
+> `proj-<slug>`）。此前把 `legacy-review-project` 写死在 `SEARCH_DIRS` 里，
+> **新工程一建，它的 references/ 就落出检索范围** ⇒ 2026-09-26 的 Shiryaev 事故
+> （三处检索都报 0 命中、全文一直在 references/ 内）会在新工程上重演。
+> 唯一保留的历史命名是 `review-references` / `review-project`（该工程的取证文件与
+> selftest 夹具引用这两个名字，改名会破坏它们）。
+
+另有 `wiki/.claude-rename/`（历史重命名备份）与 `wiki/.index/`（派生数据），
 二者**已被本库检索层排除**，本工具同样默认排除。
 
 本库纪律映射
@@ -51,26 +59,61 @@ import sys
 #    也就是**它最该给出答案的那一刻**（实测：`--help` 与普通调用都崩，rc=1）。
 #    本工具是 CLAUDE.md 明令「断言『库内无 X』之前必跑」的那一个，
 #    崩在默认控制台等于该纪律无法执行。
-try:                                                           # noqa: SIM105
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:                                              # noqa: BLE001
-    pass
+#    2026-10-14：编码策略收敛到 kb_lib.console_encoding（诊断 P1-3）——
+#    它按「是否终端 + 控制台代码页」决定用 UTF-8 还是回落到控制台原编码，
+#    比无条件 reconfigure 更不容易在 cp936 终端上出乱码。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from kb_lib import console_encoding  # noqa: E402
+
+console_encoding()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-# (显示名, 相对路径, 是否默认启用)
-SEARCH_DIRS = [
+# 静态目录（与综述工程无关、永远存在的资料层）
+STATIC_DIRS = [
     ("raw", "raw", True),
     ("wiki", "wiki", True),
-    # ⚠️ Phase 3 已把综述工程归档到 `projects/`
-    #    迁到 `projects/`。**这个工具的路径错一处，
-    #    整套「四目录完备检索」纪律就静默失效**——而它正是为那次「三处独立检索
-    #    都断言 Shiryaev 不在库内，其实在 references/」的事故而写的。
-    ("review-references", "projects/references", True),
-    ("review-project", "projects", True),
-    ("archive", "projects/_superseded", False),
+    ("archive", "projects/legacy-review-project/_superseded", False),
 ]
+
+
+def _review_projects():
+    """动态发现综述工程：`projects/<slug>/` 下含 `references/` **或** `draft/` 即视为
+    知识工程（其 references 是全文抓取件、evidence/draft 是论断出处，都必须被检索）。
+
+    坑 3（2026-10-22 修）：原实现把 legacy-review-project 写死在 SEARCH_DIRS，
+    新工程一建，它的 references/ 就落出「完备检索」范围 ⇒ Shiryaev 事故重演。
+    唯一特例：legacy-review-project 保留历史名 `review-references` / `review-project`
+    （取证文件与 selftest 夹具依赖这两个名字）。
+    """
+    out = []
+    base = os.path.join(ROOT, "projects")
+    if not os.path.isdir(base):
+        return out
+    for slug in sorted(os.listdir(base)):
+        p = os.path.join(base, slug)
+        if not os.path.isdir(p):
+            continue
+        if (os.path.isdir(os.path.join(p, "references"))
+                or os.path.isdir(os.path.join(p, "draft"))):
+            if slug == "legacy-review-project":
+                out.append(("review-references", "projects/legacy-review-project/references", True))
+                out.append(("review-project", "projects/legacy-review-project", True))
+            else:
+                out.append(("proj-%s-refs" % slug, "projects/%s/references" % slug, True))
+                out.append(("proj-%s" % slug, "projects/%s" % slug, True))
+    return out
+
+
+def build_search_dirs():
+    dirs = list(STATIC_DIRS)
+    dirs.extend(_review_projects())
+    return dirs
+
+
+# (显示名, 相对路径, 是否默认启用)
+SEARCH_DIRS = build_search_dirs()
 
 EXCLUDE_SEGMENTS = {".index", ".claude-rename", "__pycache__", ".git",
                     "tmp_img"}          # 临时脚本/图片目录，会污染「库内命中」计数
@@ -216,14 +259,36 @@ def selftest():
     """正例反例夹逼 —— 只测「该找到的找到了」会漏掉「该漏的漏了没有」。"""
     fails = []
 
-    _rr = next((d[1] for d in SEARCH_DIRS if d[0] == "review-references"), None)
+    # 🆕 正例 6（坑 3 回归夹具）：新建综述工程必须**自动**进入检索范围。
+    #    创建 probe 工程后再重建目录清单；若新工程落出范围，这个夹具立刻 FAIL。
+    import shutil as _sh6
+    _probe_proj = os.path.join(ROOT, "projects", "_kbwhere_probe_rev")
+    _probe_token = "kbwhere-probe-token-20261022"
+    try:
+        os.makedirs(os.path.join(_probe_proj, "references"), exist_ok=True)
+        os.makedirs(os.path.join(_probe_proj, "draft"), exist_ok=True)
+        with io.open(os.path.join(_probe_proj, "references", "pr.md"), "w",
+                     encoding="utf-8") as f:
+            f.write("Contains %s marker.\n" % _probe_token)
+        dirs = build_search_dirs()
+        if not any(d[0] == "proj-_kbwhere_probe_rev-refs" for d in dirs):
+            fails.append("正例6：新建综述工程未被动态发现（坑 3 回归夹具）")
+        hits6, _ = search(_probe_token, [d for d in dirs if d[2]])
+        if not hits6.get("proj-_kbwhere_probe_rev-refs"):
+            fails.append("正例6：probe 工程 references/ 内的标记串未命中")
+    finally:
+        _sh6.rmtree(_probe_proj, ignore_errors=True)
+
+    dirs = build_search_dirs()
+
+    _rr = next((d[1] for d in dirs if d[0] == "review-references"), None)
 
     # 正例 1：Shiryaev 全文须在 review-references 里找到（源库事故回归；无该语料则跳过）
     if _rr and _anchor_present(_rr, "Shiryaev"):
-        hits, scanned = search("Shiryaev", [d for d in SEARCH_DIRS if d[2]])
+        hits, scanned = search("Shiryaev", [d for d in dirs if d[2]])
         if not hits.get("review-references"):
             fails.append("正例1：`Shiryaev` 未在 review-references 命中（事故回归夹具）")
-        hits2, _ = search("d6dd00132g", [d for d in SEARCH_DIRS if d[2]])
+        hits2, _ = search("d6dd00132g", [d for d in dirs if d[2]])
         if not hits2.get("review-references"):
             fails.append("正例2：`d6dd00132g` 未在 review-references 命中")
     else:
@@ -231,19 +296,19 @@ def selftest():
 
     # 正例 3：raw 里的既有内容仍须命中（同样仅在锚点存在时断言）
     if _anchor_present("raw", "A-Lab"):
-        hits3, _ = search("A-Lab", [d for d in SEARCH_DIRS if d[2]])
+        hits3, _ = search("A-Lab", [d for d in dirs if d[2]])
         if not hits3.get("raw"):
             fails.append("正例3：`A-Lab` 未在 raw 命中")
     else:
         print("  [skip] 正例3：本库 raw 不含 `A-Lab`（源库专属锚点，跳过）")
 
     # 反例 1：绝不存在的串必须零命中（否则是宽度过松）
-    hits4, _ = search("zzz-绝不存在-qqq-20260926", [d for d in SEARCH_DIRS if d[2]])
+    hits4, _ = search("zzz-绝不存在-qqq-20260926", [d for d in dirs if d[2]])
     if sum(len(v) for v in hits4.values()) != 0:
         fails.append("反例1：不存在的串被命中（匹配过松）")
 
     # 反例 2：`.index` 与 `log.md` 必须被排除
-    hits5, _ = search("concept linked by", [d for d in SEARCH_DIRS if d[2]])
+    hits5, _ = search("concept linked by", [d for d in dirs if d[2]])
     for name, lst in hits5.items():
         for rel, _ln in lst:
             if ".index" in rel or rel.endswith("/log.md") or rel == "wiki/log.md":
@@ -310,8 +375,8 @@ def selftest():
         for f in fails:
             print("  - " + f, file=sys.stderr)
         return 1
-    print("[SELFTEST PASS] 5 正例 + 5 反例全部通过"
-          "（含 `Shiryaev` 必须命中 references/ 的事故回归夹具）")
+    print("[SELFTEST PASS] 6 正例 + 5 反例全部通过"
+          "（含 `Shiryaev` 事故回归与新建工程动态发现夹具）")
     return 0
 
 

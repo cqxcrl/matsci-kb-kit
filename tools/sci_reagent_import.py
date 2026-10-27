@@ -276,6 +276,11 @@ def merge_reagents(records, synonym_pairs=None):
 
 # ---------------------------------------------------------------- 输出
 
+def json_payload(meta, reagents):
+    """JSON 结果载荷；保留完整归并清单，日志由 CLI 另行路由。"""
+    return {"meta": meta, "reagents": reagents}
+
+
 def write_csv(path, records):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     cols = ["类别", "名称", "别名", "规格", "CAS", "单位", "数量", "最近入库",
@@ -379,6 +384,9 @@ def _selftest():
             str([x["name"] for x in merged]))
         chk("归并：数量按有符号累加（含退货）", ca["qty"] == 1.0, str(ca and ca["qty"]))
         chk("归并：规格去重后保留三种", ca["spec"].count(";") == 2, ca["spec"])
+        payload = json_payload({"reagents_merged": 6}, [{"name": str(i)} for i in range(6)])
+        chk("JSON：reagents 保留完整归并清单（不截取前 5 条）",
+            len(payload["reagents"]) == 6)
         p_csv, n = write_csv(os.path.join(tmp, "out.csv"), recs)
         chk("输出：CSV 写后复算行数一致", n == len(recs))
         p_y = write_yaml(os.path.join(tmp, "out.yaml"),
@@ -436,24 +444,24 @@ def main(argv=None):
         "privacy": "只取 B/C/D（单号/品名/规格）+ 必要数量与 CAS；未导出价格、客户、经办人与照片",
         "note": "采购记录 ≠ 现有库存：数量为入库累计（含负数为退货），是否还有余量需人工确认",
     }
-    print(f"[ok] 读取 {os.path.basename(xp)}（{size_mb:.0f} MB，仅解析 XML，未加载图片）")
-    print(f"     行数 {len(recs)}   分类 {cats}   归并后试剂 {len(merged)} 条")
+    log = sys.stderr if args.json else sys.stdout
+    print(f"[ok] 读取 {os.path.basename(xp)}（{size_mb:.0f} MB，仅解析 XML，未加载图片）", file=log)
+    print(f"     行数 {len(recs)}   分类 {cats}   归并后试剂 {len(merged)} 条", file=log)
     sample = [r for r in recs if r["category"] != "试剂"][:5]
     for r in sample:
-        print(f"     非试剂样例：{r['name']}  →  {r['category']}（{r['reason']}）")
+        print(f"     非试剂样例：{r['name']}  →  {r['category']}（{r['reason']}）", file=log)
     unknown = [r for r in recs if r["category"] == "未知"]
     for r in unknown[:10]:
-        print(f"     [?] 未知：{r['name']}（单位 {r['unit']}）")
+        print(f"     [?] 未知：{r['name']}（单位 {r['unit']}）", file=log)
     if args.json:
-        print(json.dumps({"meta": meta, "reagents": merged[:5]},
-                         ensure_ascii=False, indent=2))
+        print(json.dumps(json_payload(meta, merged), ensure_ascii=False, indent=2))
     if not args.apply:
-        print("     （干跑；加 --apply 写 CSV/YAML）")
+        print("     （干跑；加 --apply 写 CSV/YAML）", file=log)
         return 0
     p_csv, n = write_csv(os.path.join(K.VAULT, args.out_csv), recs)
     p_y = write_yaml(os.path.join(K.VAULT, args.out_yaml), meta, merged)
-    print(f"[ok] CSV：{os.path.relpath(p_csv, K.VAULT)}（{n} 行）")
-    print(f"[ok] YAML：{os.path.relpath(p_y, K.VAULT)}（{len(merged)} 条试剂）")
+    print(f"[ok] CSV：{os.path.relpath(p_csv, K.VAULT)}（{n} 行）", file=log)
+    print(f"[ok] YAML：{os.path.relpath(p_y, K.VAULT)}（{len(merged)} 条试剂）", file=log)
     return 0
 
 

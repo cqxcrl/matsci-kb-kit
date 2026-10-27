@@ -28,13 +28,10 @@ import argparse
 from collections import defaultdict
 from datetime import datetime
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kb_lib as K
+K.console_encoding()
 
 
 # ---------------------------------------------------------------- 数据加载
@@ -192,6 +189,7 @@ def compute_stats(meta, full, bm):
     # ---- 索引文件信息
     index_files = {}
     for label, path in [("meta.json", K.META_PATH),
+                        ("meta_fm.json", K.META_FM_PATH),
                         ("meta_full.json", K.FULL_PATH),
                         ("bm25.json", K.BM25_PATH),
                         ("meta_lite.json", K.META_LITE_PATH)]:

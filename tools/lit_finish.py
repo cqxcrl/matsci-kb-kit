@@ -27,6 +27,18 @@
     python tools/lit_finish.py --apply --with-semantic      # 额外增量嵌入本次新页（--add）
     python tools/lit_finish.py --no-chain --apply           # 只改 md，不跑索引工具
     python tools/lit_finish.py --selftest
+
+项目卡模式（2026-10-23 新增）
+----------------------------
+    python tools/lit_finish.py --src-dir projects/<slug>/sources \
+        --log-ops projects/<slug>/ingest/log_ops.md --since 2026-10-22 --apply
+
+· `--src-dir` 切换卡片目录：`--pages` / `--since` / `--days` 都按该目录扫描。
+· **项目模式下不写 index 行**：`projects/*/sources/index.md` 是**手维的结构化文档**
+  （构成表、缺口表、跨位置索引），与 `wiki/index.md` 的「一行一卡」表结构不同；
+  按 wiki 表去插入会把卡片行插进错误的表。工具宁可不做，也不猜结构。
+· `--log-ops` 可指向项目内日志；不写日志脚本另起一套格式时，保留默认 `wiki/log_ops.md`
+  （全库操作台账）。
 """
 import argparse
 import datetime
@@ -109,6 +121,30 @@ def _zh_short(fm, base):
     s = re.sub(r"^\d{4}-", "", base or "")
     s = re.sub(r"-[A-Za-z]+$", "", s)
     return s if re.search(r"[\u4e00-\u9fff]", s) else ""
+
+
+def _resolve_path(p):
+    """库根相对或绝对路径 → 绝对路径（正/反斜杠都收）。"""
+    s = str(p or "").strip().strip('"').replace("\\", "/")
+    if not s:
+        return s
+    return s if os.path.isabs(s) else os.path.join(K.VAULT, *s.split("/"))
+
+
+def norm_page_arg(p):
+    """把 --pages 的入参归一成 `wiki/sources/` 下的**文件名（含 .md）**。
+
+    兼容用户实际写法：裸页名（`2026-xxx`）、带后缀（`2026-xxx.md`）、
+    带目录（`sources/2026-xxx.md` / `wiki/sources/2026-xxx.md` / 含反斜杠）。
+    裸名**必须补 `.md`**，否则下游 `os.path.join(SRC_DIR, page_file)` 会去找
+    不带后缀的路径而 FileNotFoundError（2026-10-14 实际踩到）。
+    """
+    s = str(p or "").strip().strip('"').replace("\\", "/")
+    if not s:
+        return s
+    if not s.lower().endswith(".md"):
+        s += ".md"
+    return s.split("/")[-1]
 
 
 def page_row(page_file, page_meta=None, indeg=None):
@@ -304,6 +340,99 @@ def write_log_ops(pages, apply=False, quiet=False):
     return {"ok": ok, "why": "已追加并复核" if ok else "写入后复核失败"}
 
 
+# ---------------------------------------------------------------- 计数漂移体检
+#
+# 🔴 由来（2026-10-14 诊断意见 P0-2）：本库最痛恨「静默失效的声明」，而**手写页数**
+#    正是最典型的一种——CLAUDE.md 写着「724 页」时实测已 862 页，且**没有任何东西会报错**，
+#    因为漂移的是一句散文。纠正办法不是「记得改」，而是**让机器每次收尾都算一遍**。
+#
+# 判定口径（**只报事实，不改文件**）：
+#   扫描「常驻配置类文档」里形如「合计 N 页」「N 页：」的**未标注快照**声明，
+#   与真实页数（meta.json 的 `count`，同一份被检索层消费的数据）比对。
+#   · 带 🕐 或「快照」字样的行 = **已声明为历史快照**，不算漂移（合法用法）
+#   · 数值不等 ⇒ 报「文档计数漂移」，并给出该改的文件
+#   · 完全不写数字（写「以 kb_stats.py 为准」）⇒ 无声明，**不报**（这是推荐写法）
+
+DRIFT_SCAN_DOCS = (
+    "CLAUDE.md",
+    "tools/_MAINTENANCE.md",
+    "tools/_LIT-WATCH-NEXT.md",
+    ".dsh/skills/kb-query/SKILL.md",
+    "tools/_README.md",
+)
+
+# 「合计/共/总计/总 N 页」「N 页：」「N 页（」等计数声明形态。
+# ⚠️ 刻意**不**去匹配一切「N 页」——正文里的「共 44 页（正文 1-44）」是**论文**页数，
+#    不是本库计数；误报会让这条检查沦为噪声（本库的判据：宁可少报，不可误报）。
+#    故只认两种「紧邻 页 的计数语气」：
+#      ① 量词开头：合计/总计/总 N 页
+#         ⚠️ **刻意不收「共」**：实测它命中的几乎全是**论文**行（`共 44 页（正文 1-44）`），
+#            不是本库计数。这一条是正则探针实测出来的（见 §校验器自检纪律：夹具要含反例）。
+#      ② 计数后紧跟**冒号**：`**862 页**：concepts/…`（表格里的「知识层」行）
+#         —— 论文行是「共 44 页（正文 1-44）」，冒号与括号都可排除，此处只认冒号。
+# 🔴 `页` 与标点之间**允许 `**`**：文档里最常见的就是 `**862 页**：` 这种加粗写法，
+#    首版漏了它 ⇒ 实测「该报的没报」（夹具 ①② 同时抓出）。
+_DOC_COUNT_RE = re.compile(
+    r"(?:合计|总计|总)\s*\**\s*(\d{2,6})\s*\**\s*页"          # 合计 724 页
+    r"|\**\s*(\d{2,6})\s*\**\s*页\s*\**\s*[:：]"             # **724 页**：/ 862 页：
+)
+
+
+def real_page_count():
+    """真实页面数：取 meta.json 的 `count`（与检索层同一份数据，不另算一遍）。"""
+    try:
+        with open(K.META_PATH, encoding="utf-8") as f:
+            n = json.load(f).get("count")
+        return int(n) if n else None
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+def doc_count_claims():
+    """-> [(文件, 行号, 行文本, 声明值)]，只含**未声明为快照**的计数声明。"""
+    out = []
+    for rel in DRIFT_SCAN_DOCS:
+        p = os.path.join(K.VAULT, *rel.split("/"))
+        if not os.path.exists(p):
+            continue
+        for i, line in enumerate(K.read_text(p).split("\n"), 1):
+            if "🕐" in line or "快照" in line:
+                continue                      # 已声明为历史快照：合法，不报
+            for m in _DOC_COUNT_RE.finditer(line):
+                v = m.group(1) or m.group(2)
+                try:
+                    out.append((rel, i, line.strip(), int(v)))
+                except (TypeError, ValueError):
+                    pass
+    return out
+
+
+def check_count_drift(quiet=False):
+    """比对文档计数声明与真实页数。
+
+    -> (ok, detail)；ok=False 表示存在**漂移的未标注声明**（应当修文档或改用权威引用）。
+    真实页数取不到（索引缺失）时返回 (True, "跳过：索引缺失")，**不误报**。
+    """
+    real = real_page_count()
+    if not real:
+        return True, "跳过：meta.json 无 count（先跑 kb_build_index.py）"
+    claims = doc_count_claims()
+    stale = [(f, ln, txt, v) for f, ln, txt, v in claims if v != real]
+    if not quiet:
+        print(f"\n=== 文档计数漂移体检（真实 {real} 页）===")
+        if not claims:
+            print("  [ok] 未发现未标注的快照计数声明（推荐写法：只写「以 kb_stats.py 为准」）")
+        for f, ln, txt, v in claims:
+            mark = "ok " if v == real else "DRIFT"
+            print(f"  [{mark}] {f}:{ln}  声明 {v} 页  {txt[:80]}")
+    if stale:
+        if not quiet:
+            print(f"  ⚠️ {len(stale)} 处文档计数已漂移：手写数字必然过期，"
+                  "请改为「以 `python tools/kb_stats.py` 为准」或标注 🕐 快照。")
+        return False, f"{len(stale)} 处漂移"
+    return True, f"{len(claims)} 处声明均与真实值一致"
+
+
 # ---------------------------------------------------------------- 收尾链路
 
 def run_chain(pages, with_corpus=False, with_semantic=False, do_index=True, quiet=False):
@@ -351,6 +480,18 @@ def run_chain(pages, with_corpus=False, with_semantic=False, do_index=True, quie
     if not with_semantic or not with_corpus:
         print("  提示：语料索引（--with-corpus）与语义索引（--with-semantic）未跑，"
               "新页暂不进对应的检索面。")
+    # 🆕 2026-10-14（诊断 P0-2）：文档计数漂移体检——**报告但不阻断**。
+    #    为什么不作为链路步骤算 rc：它是「文档卫生」而非「本次 ingest 的正确性」，
+    #    让它否掉 --apply 的退出码，会诱导人去忽略它（绿灯失效的另一种形态）。
+    #    故此处只在**有漂移时**显式告警；无漂移不占版面。
+    try:
+        ok_drift, detail = check_count_drift(quiet=True)
+        if not ok_drift:
+            print(f"  ⚠️ 文档计数漂移：{detail}——手写页数已过期，请改为"
+                  "「以 `python tools/kb_stats.py` 为准」或标注 🕐 快照"
+                  "（明细：`python tools/lit_finish.py --count-check`）")
+    except Exception as e:                       # noqa: BLE001
+        print(f"  [!] 计数漂移体检异常（不阻断）：{e}")
     return results
 
 
@@ -461,6 +602,60 @@ def selftest():
         # ④ 备份确实落盘（CLAUDE.md 写盘铁律 3）
         bak = backup_first(INDEX_MD)
         chk("写盘前备份落盘到 .qc_backup_*/", bool(bak) and os.path.exists(bak), str(bak))
+
+        # ⑤ 🆕 计数漂移体检：**正例 + 反例**都必须成立
+        #    （只测「该过的过了」会漏掉「该报的没报」——CLAUDE.md §校验器自检纪律 第 3 条）
+        fake_meta = os.path.join(tmp, "wiki/.index/meta.json")
+        os.makedirs(os.path.dirname(fake_meta), exist_ok=True)
+        with open(fake_meta, "w", encoding="utf-8") as f:
+            json.dump({"count": 862}, f)
+        doc = os.path.join(tmp, "CLAUDE.md")
+
+        def _drift(text):
+            with open(doc, "w", encoding="utf-8") as f:
+                f.write(text)
+            return check_count_drift(quiet=True)
+
+        orig_meta = K.META_PATH
+        orig_vault = K.VAULT
+        try:
+            K.META_PATH = fake_meta
+            K.VAULT = tmp          # 让 DRIFT_SCAN_DOCS 解析到合成目录，而不是真库
+            ok_d, det = _drift("知识层 **862 页**：concepts 若干\n")
+            chk("计数体检：声明值与真实值一致 -> 通过", ok_d, det)
+            ok_d, det = _drift("知识层 **724 页**：concepts 若干\n")
+            chk("计数体检：声明值过期 -> 报漂移（反例必须报）", not ok_d, det)
+            ok_d, det = _drift("知识层 **724 页**　🕐 2026-10-10 快照\n")
+            chk("计数体检：标注 🕐 快照 -> 不算漂移", ok_d, det)
+            ok_d, det = _drift("页数一律以 `python tools/kb_stats.py` 为准\n")
+            chk("计数体检：不写死数字 -> 无声明，不报", ok_d, det)
+        finally:
+            K.META_PATH = orig_meta
+            K.VAULT = orig_vault
+
+        # ⑥ 项目卡模式（2026-10-23）：只写指定日志，**绝不**碰 wiki/index.md。
+        #    反例含义：若把项目卡按 wiki 行写法插进 index.md，项目索引的构成/缺口表
+        #    会被污染，而且卡片会被插进「跨位置索引」那张错误的表。
+        import contextlib
+        import io
+        proj_src = os.path.join(tmp, "projects", "P", "sources")
+        os.makedirs(proj_src, exist_ok=True)
+        with open(os.path.join(proj_src, "2026-proj-JACS.md"), "w",
+                  encoding="utf-8", newline="\n") as f:
+            f.write('---\ntype: source\nsummary: "项目卡摘要"\n'
+                    'authors: [A. Author]\nyear: 2026\njournal: "JACS"\n---\n# x\n')
+        proj_log = os.path.join(tmp, "projects", "P", "ingest", "log_ops.md")
+        os.makedirs(os.path.dirname(proj_log), exist_ok=True)
+        idx_before = K.read_text(INDEX_MD)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc6 = main(["--pages", "2026-proj-JACS", "--src-dir", proj_src,
+                        "--log-ops", proj_log, "--apply", "--no-chain"])
+        chk("项目模式：写出项目日志",
+            rc6 == 0 and os.path.exists(proj_log)
+            and "入库 1 篇" in K.read_text(proj_log), buf.getvalue()[-160:])
+        chk("项目模式：不修改 wiki/index.md", K.read_text(INDEX_MD) == idx_before)
+        chk("项目模式：明确说明跳过 index 行", "跳过 index" in buf.getvalue())
     finally:
         K.VAULT, K.WIKI, g["SRC_DIR"], g["INDEX_MD"], g["LOG_OPS"] = orig
         shutil.rmtree(tmp, ignore_errors=True)
@@ -471,24 +666,46 @@ def selftest():
 
 # ---------------------------------------------------------------- CLI
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="入库收尾：index.md 行 + log_ops.md + 索引重建")
-    ap.add_argument("--pages", nargs="*", default=[], help="指定 source 卡文件名（wiki/sources/ 下）")
+    ap.add_argument("--pages", nargs="*", default=[],
+                    help="指定 source 卡文件名（wiki/sources/ 下；裸名/带 .md/带目录均可）")
     ap.add_argument("--since", default="", help="按修改时间取该日期之后的卡片（YYYY-MM-DD）")
     ap.add_argument("--days", type=int, default=1, help="未给 --since 时取近 N 天（默认 1）")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--src-dir", default="",
+                    help="卡片目录（库根相对或绝对；默认 wiki/sources）。项目卡用 projects/<slug>/sources")
+    ap.add_argument("--log-ops", default="", help="日志文件（默认 wiki/log_ops.md）")
     ap.add_argument("--apply", action="store_true", help="真正写 index.md / log_ops.md")
     ap.add_argument("--no-chain", action="store_true", help="不跑索引/校验链路")
     ap.add_argument("--no-index", action="store_true", help="不重建 BM25 索引")
     ap.add_argument("--with-corpus", action="store_true", help="额外重建全文分块索引（约 66s）")
     ap.add_argument("--with-semantic", action="store_true", help="额外增量嵌入本次新页")
+    ap.add_argument("--count-check", action="store_true",
+                    help="只跑文档计数漂移体检（扫描文档里的手写页数声明并比对真实值）")
     ap.add_argument("--selftest", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.selftest:
         return selftest()
 
+    global SRC_DIR, LOG_OPS
+    if args.src_dir:
+        SRC_DIR = _resolve_path(args.src_dir)
+        if not os.path.isdir(SRC_DIR):
+            print(f"[!] 卡片目录不存在：{SRC_DIR}", file=sys.stderr)
+            return 2
+    if args.log_ops:
+        LOG_OPS = _resolve_path(args.log_ops)
+    project_mode = os.path.normcase(SRC_DIR) != os.path.normcase(
+        os.path.join(K.VAULT, "wiki", "sources"))
+    if args.count_check:
+        ok, detail = check_count_drift(quiet=False)
+        print(f"\n{'[ok] 无漂移' if ok else '[warn] 存在漂移'}：{detail}")
+        return 0 if ok else 1
+
     pages = args.pages or recent_pages(args.since or None, args.days, args.limit)
+    pages = [norm_page_arg(p) for p in pages]
     if not pages:
         print("没有需要收尾的页面（用 --pages 指定，或 --since/--days 放宽时间）。")
         return 0
@@ -498,12 +715,19 @@ def main():
     if len(pages) > 10:
         print(f"  … 另 {len(pages) - 10} 页")
 
-    # 🔴 入站数**一次扫描**算出全部页（旧版每页重扫全 wiki：72 页 ≈ 14000 次文件读）
-    indeg = build_indeg_map()
-    rows = [page_row(p, indeg=indeg.get(p[:-3] if p.lower().endswith(".md") else p, 0))
-            for p in pages]
-    ri = write_index(rows, apply=args.apply)
-    print(f"\n[index.md] {ri['why']}")
+    if project_mode:
+        # 项目索引是手维文档（构成表/缺口表/跨位置索引），不是「一行一卡」的表；
+        # 按 wiki 的行格式插入会落到错误的表里。故**不写**，并明确说明原因。
+        ri = {"ok": True, "why": "项目模式：跳过 index 行（项目索引为手维结构化文档）",
+              "added": 0, "inserted": []}
+        print(f"\n[index.md] {ri['why']}")
+    else:
+        # 🔴 入站数**一次扫描**算出全部页（旧版每页重扫全 wiki：72 页 ≈ 14000 次文件读）
+        indeg = build_indeg_map()
+        rows = [page_row(p, indeg=indeg.get(p[:-3] if p.lower().endswith(".md") else p, 0))
+                for p in pages]
+        ri = write_index(rows, apply=args.apply)
+        print(f"\n[index.md] {ri['why']}")
     # 只把**真正新增进 index.md 的页**写进日志：以前传的是本次扫描到的全部页
     # （--days 60 时会写"入库 503 篇"这种与事实不符的记录）。
     logged_pages = [b + ".md" for b in (ri.get("inserted") or [])] or pages

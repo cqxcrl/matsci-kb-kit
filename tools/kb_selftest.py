@@ -18,14 +18,250 @@ import sys
 import os
 import tempfile
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import kb_lib as K  # noqa: E402
+K.console_encoding()
+
+
+# 🔴 2026-10-15：临时目录**统一走 kb_lib**（此前本文件自建、其余工具各写一份手写回退）。
+#    `K.temp_dir()` = 可写目录（mkdtemp 失败/不可写则 os.makedirs）+ 清理失败不抛。
+#    为什么清理不能抛：它处在 finally 路径上，一抛就**整个自检崩掉、汇总行都打不出来**
+#    （实测 8 项全过后崩在清理，看起来像「自检失败」）。详见 kb_lib 里的完整说明。
+
+def check_type_dir(ok):
+    """🆕 2026-10-14（诊断 P1-4）：TYPE_DIR 收敛到 kb_lib 后的一致性不变量。
+
+    该常量此前在 `kb_search` 与 `kb_route` **各有一份**，且都带同样的
+    「entitys 不是 entities」注释。收敛后在此钉住它**与 PAGE_DIRS 同集合**——
+    否则「扫描的目录」与「类型→目录的映射」会各自漂移，而 path 是 Agent
+    读取页面、生成引用的入口，不匹配就是**静默 404**（页面在，按 path 却读不到）。
+    """
+    try:
+        good = set(K.TYPE_DIR.values()) == set(K.PAGE_DIRS)
+        print(f"  [{'ok' if good else 'FAIL'}] TYPE_DIR 值集合 == PAGE_DIRS"
+              f"（{sorted(K.TYPE_DIR.values())}）")
+        ok = ok and good
+        # 正例 + 反例：必须覆盖每个 PAGE_DIR，且**不含** entity→entitys 那种错拼
+        good = ("entitys" not in K.TYPE_DIR.values()
+                and K.TYPE_DIR.get("entity") == "entities")
+        print(f"  [{'ok' if good else 'FAIL'}] 反例：entity→entities（不是 entitys）")
+        ok = ok and good
+        # 路径解析：正例必须给出真实相对路径；反例（未知类型）必须返回空串，不猜
+        good = (K.page_path_for_type("x", "entity") == "wiki/entities/x.md"
+                and K.page_path_for_type("x", "unknown-type-zzz") == "")
+        print(f"  [{'ok' if good else 'FAIL'}] page_path_for_type 正例/反例"
+              f"（未知类型返回空串，不猜）")
+        ok = ok and good
+    except Exception as _e:                                    # noqa: BLE001
+        print(f"  [FAIL] TYPE_DIR 一致性检查异常：{_e}")
+        ok = False
+    return ok
+
+
+def check_dual_parser(ok, sample_n=120):
+    """🆕 2026-10-14（诊断 P2-9）：断言两套 frontmatter 解析器结果等价。
+
+    本库有**两套**解析器：`kb_lib.parse_frontmatter`（自研轻量，写入/索引侧）
+    与 `yaml.safe_load`（lint 侧复核）。两者对同一文件判定不一致时，会出现
+    「lint 说没问题、检索层解析不出来」这类**静默失效**——本库头号失效形态。
+
+    判定口径（**分级**，不分级就会让噪声淹没真问题）：
+      · **键集相同** —— 硬失败。键丢了才会导致整块元数据静默消失。
+      · **标量值** —— 只有「非转义类」分歧才算硬失败。
+        frontmatter 里把双引号写成 `\\"` 的页有 87/862，kb_lib **不做反转义**
+        ⇒ 检索摘要会显示 `\\"` 而非 `"`。这是**写入侧的数据卫生问题**（该由 kb_lint
+        报出来让人去清），**不是解析器缺陷**；改 `_unquote` 反而会掩盖坏数据。
+        故此类只计数上报，不判失败。
+    """
+    try:
+        import random
+        import yaml
+        files = sorted(K.iter_page_files())
+        if not files:
+            print("  [skip] 库内无页面，跳过双解析器抽样")
+            return ok
+        rnd = random.Random(20261014)              # 固定种子：可复现
+        sample = rnd.sample(files, min(sample_n, len(files)))
+        key_mismatch, val_mismatch, parsed, escape_div = [], [], 0, 0
+        for p in sample:
+            fm_raw, _ = K.split_frontmatter(K.read_text(p))
+            if not fm_raw.strip():
+                continue
+            try:
+                y = yaml.safe_load(fm_raw)
+            except Exception:                      # noqa: BLE001
+                continue                           # yaml 自己都解析不了 ⇒ 交给 kb_lint 报
+            if not isinstance(y, dict):
+                continue
+            m = K.parse_frontmatter(fm_raw)
+            parsed += 1
+            kd = set(y) ^ set(m)
+            if kd:
+                key_mismatch.append((os.path.basename(p), sorted(kd)))
+            for k in set(y) & set(m):
+                yv, mv = y[k], m[k]
+                if isinstance(yv, list) or isinstance(mv, list):
+                    continue                       # 列表形态差异属实：只查键
+                # ⚠️ **比较必须用完整值**：曾把显示用的截断串拿去比较，
+                #    结果 18 处"不一致"全是截断伪影（前 25 字相同、后面才分叉）。
+                #    这正是本库「计数器本身出错却被读成内容质量」的形态。
+                a, b = str(yv), str(mv)
+                if K._unquote(a) == K._unquote(b):
+                    continue
+                if K._unquote(b).replace('\\"', '"').replace("\\\\", "\\") \
+                        == K._unquote(a):
+                    escape_div += 1                # 已知的 `\"` 转义差异（见 docstring）
+                    continue
+                val_mismatch.append((os.path.basename(p), k, a[:60], b[:60]))
+        good = not key_mismatch
+        print(f"  [{'ok' if good else 'FAIL'}] 双解析器键集一致"
+              f"（抽 {parsed} 页，键差集非空 {len(key_mismatch)} 页）")
+        for n, ks in key_mismatch[:3]:
+            print(f"        - {n}: 差集 {ks}")
+        ok = ok and good
+        good2 = not val_mismatch
+        print(f"  [{'ok' if good2 else 'FAIL'}] 双解析器标量值一致"
+              f"（真分歧 {len(val_mismatch)} 处；另 {escape_div} 处属"
+              f"已知的 `\\\"` 转义差异，不计失败）")
+        for n, k, a, b in val_mismatch[:5]:
+            print(f"        - {n} [{k}]: yaml={a!r} vs kb_lib={b!r}")
+        ok = ok and good2
+        if escape_div:
+            print("  [info] 上述 \\\" 差异源于**页面里把双引号写成了 \\\"**："
+                  "建议交 kb_lint 清理（不要改 _unquote——那会掩盖坏数据）")
+        # 反例夹具：含冒号值 / 行内数组 / 转义引号 —— 两解析器都必须保住键
+        probe = ('type: source\ntags: [a, b]\nsummary: "含: 冒号"\n'
+                 'title: "带 \\" 引号"\n')
+        m = K.parse_frontmatter(probe)
+        y = yaml.safe_load(probe)
+        good3 = (set(y) == set(m) and m.get("type") == "source"
+                 and m.get("tags") == ["a", "b"])
+        print(f"  [{'ok' if good3 else 'FAIL'}] 反例夹具：含冒号值/行内数组/"
+              f"转义引号 —— 两解析器键集相同（yaml={sorted(y)}，kb={sorted(m)}）")
+        ok = ok and good3
+    except ImportError:
+        print("  [info] 未安装 pyyaml，跳过双解析器一致性检查")
+    except Exception as _e:                                    # noqa: BLE001
+        print(f"  [FAIL] 双解析器检查异常：{_e}")
+        ok = False
+    return ok
+
+
+def check_page_fm_sidecar(ok):
+    """🆕 2026-10-15：`page_fm` 侧车与向后兼容的守门夹具。
+
+    背景：首轮把预取限定词内嵌进 `meta.json`，使它 961 KB → 1214 KB（+26%）。
+    第二轮拆成 `meta_fm.json` 侧车。本夹具钉住三条契约：
+
+      ① 侧车存在 ⇒ `load_page_fm` 读侧车
+      ② 侧车缺失但 `meta` 内嵌 `page_fm`（**旧索引过渡态**）⇒ 回退到内嵌，**不静默给空**
+         ——静默空值比慢更危险：L2 的立身之本就是随身带可靠性限定词
+      ③ 两者都没有 ⇒ 返回空 dict 且**不抛异常**（不能让检索整体失败）
+
+    ⚠️ 用一个合成 meta 测②③，**不碰真实索引文件**（自检零副作用）。
+    """
+    import json as _json
+    try:
+        # ① 真实侧车（存在时必须读得到）
+        real = K.load_page_fm()
+        print(f"  [{'ok' if real else 'info'}] 侧车 meta_fm.json 可用（{len(real)} 条）")
+        # ② 旧索引过渡态：合成 meta 带内嵌 page_fm，且**临时把侧车路径指向不存在的位置**
+        saved = K.META_FM_PATH
+        try:
+            K.META_FM_PATH = os.path.join(K.INDEX_DIR, "__nonexistent_for_selftest__.json")
+            synth = {"page_fm": {"某页": {"source_reliability": "R"}}}
+            got = K.load_page_fm(synth)
+            good = got.get("某页", {}).get("source_reliability") == "R"
+            print(f"  [{'ok' if good else 'FAIL'}] 侧车缺失时回退 meta 内嵌 page_fm"
+                  f"（拿到 {len(got)} 条）")
+            ok = ok and good
+            # ③ 两者都无 ⇒ 空 dict 且不抛
+            got2 = K.load_page_fm({})
+            good2 = got2 == {}
+            print(f"  [{'ok' if good2 else 'FAIL'}] 侧车与内嵌都无 ⇒ 空 dict 不抛异常")
+            ok = ok and good2
+            # ④ 反例：侧车内容坏掉时必须回退，而不是让检索崩
+            bad_path = os.path.join(K.INDEX_DIR, "__bad_for_selftest__.json")
+            with open(bad_path, "w", encoding="utf-8") as f:
+                f.write("{ this is not json")
+            K.META_FM_PATH = bad_path
+            try:
+                got3 = K.load_page_fm({"page_fm": {"p": {"si_status": "missing"}}})
+                good3 = got3.get("p", {}).get("si_status") == "missing"
+                print(f"  [{'ok' if good3 else 'FAIL'}] 反例：侧车 JSON 损坏 ⇒ 回退内嵌不崩")
+                ok = ok and good3
+            finally:
+                try:
+                    os.remove(bad_path)
+                except OSError:
+                    pass
+        finally:
+            K.META_FM_PATH = saved
+    except Exception as _e:                                    # noqa: BLE001
+        print(f"  [FAIL] page_fm 侧车检查异常：{_e}")
+        ok = False
+    return ok
+
+
+def check_temp_dir_helper(ok):
+    """🆕 2026-10-15：临时目录助手的守门夹具（正例 + 反例 + 回退）。
+
+    为什么值得一个夹具：`K.make_temp_dir` / `K.temp_dir` 现在是**全部工具 selftest 的
+    共同底座**（此前 12 个工具各写一份手写回退，且在受限环境下全线崩在"建目录"这一步）。
+    底座一坏，几十个工具的自检会**同时**变成假失败 —— 正是「计数器本身出错却被读成
+    内容质量问题」那一类失效，必须钉住。
+    """
+    try:
+        d = K.make_temp_dir(prefix="kb_selftest_t_")
+        wrote = False
+        try:
+            p = os.path.join(d, "x.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("hello")
+            with open(p, encoding="utf-8") as f:
+                wrote = f.read() == "hello"
+        finally:
+            K.remove_temp_dir(d)
+        print(f"  [{'ok' if wrote else 'FAIL'}] make_temp_dir 建出的目录**确实可写**"
+              f"（写了能读回）")
+        ok = ok and wrote
+
+        cleaned = not os.path.exists(d)
+        print(f"  [{'ok' if cleaned else 'FAIL'}] remove_temp_dir 真删掉了")
+        ok = ok and cleaned
+
+        # `with` 形态
+        with K.temp_dir(prefix="kb_selftest_ctx_") as cd:
+            inside = os.path.isdir(cd)
+        print(f"  [{'ok' if inside and not os.path.exists(cd) else 'FAIL'}] "
+              f"temp_dir() 上下文可用且退出后清理")
+        ok = ok and inside and not os.path.exists(cd)
+
+        # 回退：第一个基目录不可写 ⇒ 必须落到第二个可用基目录
+        import glob as _glob
+        g1 = os.path.join(K.VAULT, ".qc", "_selftest_nonexistent_base_zzz")
+        import tempfile as _tf
+        d2 = K.make_temp_dir(prefix="kb_selftest_fb_", bases=[g1, _tf.gettempdir()])
+        good_fb = bool(d2) and os.path.isdir(d2)
+        K.remove_temp_dir(d2)
+        print(f"  [{'ok' if good_fb else 'FAIL'}] 反例：首个基目录不可用 ⇒ 回退到下一个可写基目录")
+        ok = ok and good_fb
+
+        # 反例：全部基目录都不可用 ⇒ 必须抛 OSError（不能静默返回坏目录）
+        try:
+            K.make_temp_dir(bases=[os.path.join("Z:", "nope_zzz"),
+                                   os.path.join("Z:", "nope_yyy")])
+            raised = False
+        except OSError:
+            raised = True
+        print(f"  [{'ok' if raised else 'FAIL'}] 反例：无可用基目录 ⇒ 抛 OSError（不静默返坏路径）")
+        ok = ok and raised
+    except Exception as _e:                                    # noqa: BLE001
+        print(f"  [FAIL] 临时目录助手检查异常：{_e}")
+        ok = False
+    return ok
 
 
 def main():
@@ -78,7 +314,8 @@ def main():
     ok = ok and inside_vault
     print(f"  [{'ok' if not_archive else 'FAIL'}] 默认写盘目标不在 _archive（归档只进不出）")
     ok = ok and not_archive
-    with tempfile.TemporaryDirectory() as _qd:
+    # 临时目录统一走 K.temp_dir()（可写 + 清理不抛），理由见文件头说明。
+    with K.temp_dir(prefix="kb_selftest_") as _qd:
         _old = os.environ.get("MATSCI_QC_DIR")
         try:
             os.environ["MATSCI_QC_DIR"] = _qd
@@ -97,7 +334,7 @@ def main():
     #   会因此假 FAIL。旧版正例写成 `os.path.exists(qc_input("queue.json"))`，
     #   把「解析规则对」错判成「库里有 queue.json」，属于把缺省值当断言。
     #   改为：在隔离临时目录里钉住**行为**——存在则返回该路径、缺失则不误报。
-    with tempfile.TemporaryDirectory() as _qid:
+    with K.temp_dir(prefix="kb_selftest_qc_") as _qid:
         _oldq = os.environ.get("MATSCI_QC_DIR")
         try:
             os.environ["MATSCI_QC_DIR"] = _qid
@@ -182,7 +419,7 @@ def main():
     import tempfile as _tf
     _wdir = None
     try:
-        _wdir = _tf.mkdtemp(prefix="kb_selftest_write_")
+        _wdir = K.make_temp_dir(prefix="kb_selftest_write_")
         _saved_vault = K.VAULT
         _saved_qcw = K.qc_work_dir
         K.VAULT = _wdir
@@ -239,7 +476,9 @@ def main():
     #    （CLAUDE.md §校验器自检纪律 明确点名这类"自检断言当前状态"的腐坏）。
     #    ⇒ 降为 WARN：报出来，但不否定整轮自检。
     names = set()
-    for rel in K.iter_page_files():
+    # 🔴 索引口径包含项目卡（kb_build_index.scan_pages 用 include_projects=True）；
+    #    这里若只数 wiki 页，165 张项目卡会被误报成「索引多出来的幽灵页」。
+    for rel in K.iter_page_files(include_projects=True):
         names.add(os.path.basename(rel)[:-3])
     full = os.path.join(K.INDEX_DIR, "meta_full.json")
     if os.path.exists(full):
@@ -252,6 +491,11 @@ def main():
               + ("" if diff == 0 else "  ← 跑 kb_build_index.py 刷新，非代码缺陷"))
     else:
         print("  [info] meta_full.json 不存在，跳过索引一致性检查")
+
+    ok = check_type_dir(ok) and ok
+    ok = check_dual_parser(ok) and ok
+    ok = check_page_fm_sidecar(ok) and ok
+    ok = check_temp_dir_helper(ok) and ok
 
     print("=== selftest", "PASS ===" if ok else "FAIL ===")
     return 0 if ok else 1
