@@ -133,7 +133,8 @@ def main():
     if not args.no_index:
         log("[9] 构建索引")
         bi = os.path.join(tgt, "tools", "kb_build_index.py")
-        r = subprocess.run([PY, bi, "--lite"], cwd=tgt)
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        r = subprocess.run([PY, bi, "--lite"], cwd=tgt, env=env)
         log(f"  kb_build_index --lite → exit={r.returncode}")
 
     log("")
