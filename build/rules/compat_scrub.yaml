@@ -6,6 +6,8 @@
 #      且 ast.parse(feature_version=(3,10)) 检测不到该词法差异 → 转 .format。
 #   2. Windows-only 语义夹具：不存在盘符 Z: 在 Linux 上是相对路径、makedirs
 #      会成功 → 反例改用「基目录是文件」（两 OS 必抛 OSError）。
+#   3. 跨平台语义 bug：normalize_page_dir 先 strip("/") 再判绝对路径，POSIX
+#      首斜杠被吃掉 → Linux 上 /abs/... 误收为相对路径；判定前移到 strip 之前。
 #
 # 纪律：与 private/scrub.yaml 同 schema（rules: file/find/replace），但本表
 # 公开；find 必须与源文件病灶逐字一致，未命中即告警（漂移可见）。不手改生成物、
@@ -51,3 +53,22 @@
                         ev.append(f"p{i} [{tag}]: {re.sub(r'\s+', ' ', t[s:e]).strip()[:170]}")
   "replace": |2-
                         ev.append("p{} [{}]: {}".format(i, tag, re.sub(r'\s+', ' ', t[s:e]).strip()[:170]))
+- "file": |-
+    lit_ingest.py
+  "find": |2-
+        d = (raw or "").strip().replace("\\", "/").strip("/")
+        if not d:
+            return default, None
+        d = re.sub(r"(^|/)ingest/sources$", r"\1sources", d)
+        if re.match(r"^[A-Za-z]:", d) or d.startswith("/"):
+            return None, f"--page-dir 必须是相对库根的路径，收到绝对路径：{raw}"
+  "replace": |2-
+        d = (raw or "").strip().replace("\\", "/")
+        # 绝对路径判定必须先于 strip("/")：否则 POSIX 绝对路径的首斜杠被 strip
+        # 吃掉，Linux 上 /abs/... 会被误收为相对路径（CI ubuntu+3.11 实测）。
+        if re.match(r"^[A-Za-z]:", d) or d.startswith("/"):
+            return None, f"--page-dir 必须是相对库根的路径，收到绝对路径：{raw}"
+        d = d.strip("/")
+        if not d:
+            return default, None
+        d = re.sub(r"(^|/)ingest/sources$", r"\1sources", d)

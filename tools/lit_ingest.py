@@ -106,12 +106,15 @@ def normalize_page_dir(raw, default="wiki/sources"):
     Windows 反斜杠统一成 `/`，去首尾斜杠；空值回退默认目录。
     旧布局 `projects/<P>/ingest/sources` 归一为 `projects/<P>/sources`（2026-10-22 目录迁移）。
     """
-    d = (raw or "").strip().replace("\\", "/").strip("/")
+    d = (raw or "").strip().replace("\\", "/")
+    # 绝对路径判定必须先于 strip("/")：否则 POSIX 绝对路径的首斜杠被 strip
+    # 吃掉，Linux 上 /abs/... 会被误收为相对路径（CI ubuntu+3.11 实测）。
+    if re.match(r"^[A-Za-z]:", d) or d.startswith("/"):
+        return None, f"--page-dir 必须是相对库根的路径，收到绝对路径：{raw}"
+    d = d.strip("/")
     if not d:
         return default, None
     d = re.sub(r"(^|/)ingest/sources$", r"\1sources", d)
-    if re.match(r"^[A-Za-z]:", d) or d.startswith("/"):
-        return None, f"--page-dir 必须是相对库根的路径，收到绝对路径：{raw}"
     if ".." in d.split("/"):
         return None, f"--page-dir 不得含 `..`（会逃出库根）：{raw}"
     return d, None

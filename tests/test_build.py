@@ -291,14 +291,22 @@ class TestCompatScrub(unittest.TestCase):
             raised = False
         except OSError:
             raised = True'''
+    LESION_PAGEDIR = r'''    d = (raw or "").strip().replace("\\", "/").strip("/")
+    if not d:
+        return default, None
+    d = re.sub(r"(^|/)ingest/sources$", r"\1sources", d)
+    if re.match(r"^[A-Za-z]:", d) or d.startswith("/"):
+        return None, f"--page-dir 必须是相对库根的路径，收到绝对路径：{raw}"'''
 
     def test_compat_rules_target_both_lesions(self):
         compat = BP.load_compat()
         self.assertIn("kb_selftest.py", compat)
         self.assertIn("lit_si.py", compat)
+        self.assertIn("lit_ingest.py", compat)
         for name, lesion in (("kb_selftest.py", self.LESION_SELFTEST),
                              ("kb_selftest.py", self.LESION_ZBASE),
-                             ("lit_si.py", self.LESION_LIT_SI)):
+                             ("lit_si.py", self.LESION_LIT_SI),
+                             ("lit_ingest.py", self.LESION_PAGEDIR)):
             self.assertTrue(any(f == lesion for f, _ in compat[name]),
                             f"compat 规则的 find 必须与病灶原文逐字一致：{name}")
 
@@ -311,21 +319,40 @@ class TestCompatScrub(unittest.TestCase):
                 encoding="utf-8", newline="\n")
             (src / "tools" / "lit_si.py").write_text(
                 self.LESION_LIT_SI + "\n", encoding="utf-8", newline="\n")
+            (src / "tools" / "lit_ingest.py").write_text(
+                self.LESION_PAGEDIR + "\n", encoding="utf-8", newline="\n")
             warn = []
             with mock.patch.object(BP, "load_lines",
-                                   return_value=["kb_selftest.py", "lit_si.py"]):
+                                   return_value=["kb_selftest.py", "lit_si.py",
+                                                 "lit_ingest.py"]):
                 n = BP.generate_tools(str(src), str(out), {}, [], {}, warn,
                                       lambda m: None)
-            self.assertEqual(n, 2)
+            self.assertEqual(n, 3)
             self.assertEqual(warn, [])
             t1 = (out / "tools" / "kb_selftest.py").read_text(encoding="utf-8")
             t2 = (out / "tools" / "lit_si.py").read_text(encoding="utf-8")
+            t3 = (out / "tools" / "lit_ingest.py").read_text(encoding="utf-8")
             self.assertNotIn("f\"（crlf=", t1)
             self.assertIn("保住 CRLF（crlf={} bare={}）\".format(", t1)
             self.assertNotIn("f\"p{i} [{tag}]", t2)
             self.assertIn("\"p{} [{}]: {}\".format(", t2)
             self.assertNotIn("os.path.join(\"Z:\", \"nope_zzz\")", t1)
             self.assertIn("kb_selftest_basefile_zzz", t1)
+            self.assertNotIn(self.LESION_PAGEDIR, t3)
+            self.assertIn('d = d.strip("/")', t3)
+
+    def test_normalize_page_dir_rejects_posix_abs_on_this_os(self):
+        """strip("/") 先于绝对路径判定会把 POSIX 首斜杠吃掉 → Linux 上 /abs/...
+        被误收为相对路径（CI 实测 FAIL）。修复后两 OS 都必须拒绝。"""
+        sys.path.insert(0, str(ROOT / "tools"))
+        import lit_ingest as LI
+        for raw in ("/tmp/abs/page/dir", os.path.abspath("wiki/sources"),
+                    "projects/../../etc"):
+            got, err = LI.normalize_page_dir(raw)
+            self.assertIsNone(got, f"必须拒绝：{raw}")
+            self.assertTrue(err)
+        got, err = LI.normalize_page_dir("projects\\A\\ingest\\sources\\")
+        self.assertEqual((got, err), ("projects/A/sources", None))
 
     def test_file_base_raises_on_this_os(self):
         """Z: 盘符反例的跨平台替代语义守卫：基目录是**文件**时 make_temp_dir
@@ -348,6 +375,9 @@ class TestCompatScrub(unittest.TestCase):
         self.assertIn("\"p{} [{}]: {}\".format(", t2)
         self.assertNotIn("os.path.join(\"Z:\", \"nope_zzz\")", t1)
         self.assertIn("kb_selftest_basefile_zzz", t1)
+        t3 = (ROOT / "tools" / "lit_ingest.py").read_text(encoding="utf-8")
+        self.assertNotIn(self.LESION_PAGEDIR, t3)
+        self.assertIn('d = d.strip("/")', t3)
 
     @unittest.skipUnless(sys.version_info >= (3, 12),
                          "FSTRING_* tokens require py3.12+; CI 3.11 由 py_compile 兜底")

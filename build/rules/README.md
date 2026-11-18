@@ -49,7 +49,7 @@ build/rules/
 ├── include.txt            公开 · 随包工具白名单（纯文件名，不含专名）
 ├── exclude.txt            公开 · 刻意排除项的审计记录 + 理由
 ├── leak_denylist.txt      公开 · 通用形态规则（家目录/用户名路径）
-├── compat_scrub.yaml      公开 · Python 版本兼容字面替换（PEP 701 f-string → .format），未命中告警
+├── compat_scrub.yaml      公开 · 版本/跨平台兼容字面替换（PEP 701、Windows-only 夹具），未命中告警
 ├── examples/              公开 · 私有规则的假值模板，供新用户起步
 │   ├── scrub.yaml
 │   ├── global_scrub.yaml
@@ -100,6 +100,10 @@ tools 另有一层**公开兼容层** `compat_scrub.yaml`，在全局专名替�
 活库跑在较新 Python 上，而插件声明 ≥3.10（CI 跑 3.11）。PEP 701 允许 f-string
 **表达式内**出现反斜杠仅 py≥3.12，3.11 下是 SyntaxError；且
 `ast.parse(feature_version=(3,10))` 检测不到该词法差异。故按逐文件字面量把病灶
-转成 `.format`（反斜杠落在表达式外）。本表不含专名、公开可跟踪；未命中即告警
-（漂移可见）。守卫：`tests/test_build.py::TestCompatScrub` 钉住两处已知病灶，
+转成 `.format`（反斜杠落在表达式外）。同表还修跨平台语义病灶：Windows-only
+反例（不存在盘符 `Z:` 在 Linux 是相对路径）改「基目录是文件」；
+`normalize_page_dir` 先 `strip("/")` 吃掉 POSIX 首斜杠致绝对路径误收 → 判定前移。
+本表不含专名、公开可跟踪；未命中即告警
+（漂移可见）。守卫：`tests/test_build.py::TestCompatScrub` 钉住已知病灶（4 规则）
+与双 OS 均成立的语义断言，
 并在 py≥3.12 上用 tokenize 深度跟踪全仓扫描表达式内反斜杠（0 命中才过）。

@@ -1,7 +1,7 @@
 _generated_by: build/build_plugin.py
 _note: 本插件是由源知识库过滤+去个人化生成的派生数据；真源不在此仓库。
 source_commit: 61b947df257b61aea16e02a30eff5bf0b79c2ab9
-built_at: '2026-11-18T15:27:31'
+built_at: '2026-11-18T15:49:50'
 note: 生成物请勿手改；改真源后重跑 build_plugin.py。
 tools:
 - tools/caj_to_pdf.py
@@ -113,7 +113,7 @@ tool_sha256:
   tools/lit_fetch.py: 68ec8236844cf5407930f0357ee14da6b945b5d1418a7eadb3cca827c6e1dd25
   tools/lit_finish.py: ac771f1e24c5872efa74ce02cd9083fbd9356b52e41b2e0e9a4079da86783b5f
   tools/lit_gapscan.py: 7b2282944ce4e59cb28fc547b574dc9cbe73158a3a90b6b8b3fed970bcf69388
-  tools/lit_ingest.py: 88e8b5f64c6c9c51193c8ed56895baa97965a3f49c5ce59a8daeb0dc39b83508
+  tools/lit_ingest.py: 831813851bd0aada36f10297b714c267ff45e504d7f48d8af5553d388e0fe067
   tools/lit_journals.py: 72df5ccc29225c69dab6b814431d2e6cce2684d3d9d119eb5d0ed9cde5a04e9a
   tools/lit_manual_import.py: ea51f3fedf9071d065eb75c7d23a8423982acd48052484b42f04498eeac01992
   tools/lit_report.py: 4d9bb1682679ea2438eb21f09a8e2e52b596ce824635aa95b4f69beb714cb5aa

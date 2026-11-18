@@ -75,6 +75,9 @@ CI（`.github/workflows/verify.yml`）在 ubuntu 上跑 verify_plugin ＋ unitte
   CI 3.11 会 SyntaxError，且 `ast.parse(feature_version=(3,10))` 测不出。
   病灶经公开 `build/rules/compat_scrub.yaml` 在构建期转 `.format`；
   不手改生成物、不动活库。守卫见 `TestCompatScrub`。
+- **跨平台语义病灶**：Windows-only 反例（不存在盘符 `Z:`）与 `strip("/")` 吃掉
+  POSIX 首斜杠（绝对路径误收）都只在 Linux CI 爆；同经 `compat_scrub.yaml`
+  构建期字面替换，`TestCompatScrub` 以双 OS 均成立的断言钉住语义。
 - **委托纪律**：「已声明」≠「已生效」——技能在**插件级**注册，`kb_init` 不复制技能进库。
 
 ## 五、细则索引
