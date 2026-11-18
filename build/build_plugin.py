@@ -123,6 +123,21 @@ def load_skill_scrub():
     return [(r["pattern"], r["replace"]) for r in data.get("rules", [])]
 
 
+def load_compat():
+    """公开兼容规则层 {filename: [(find, replace), ...]}（build/rules/compat_scrub.yaml）。
+
+    活库跑在较新 Python 上，插件声明 ≥3.10：PEP 701 f-string 表达式内反斜杠
+    这类词法差异在构建期转 .format。与 private scrub 不同，本表公开可跟踪；
+    文件缺失时 _read 直接抛错（fail-closed，不静默跳过兼容层）。
+    """
+    import yaml
+    data = yaml.safe_load(_read(os.path.join(RULES, "compat_scrub.yaml"))) or {}
+    by_file = {}
+    for r in data.get("rules", []):
+        by_file.setdefault(r["file"], []).append((r["find"], r["replace"]))
+    return by_file
+
+
 def load_drop_sections():
     """CLAUDE.md / _README.md 的块级删除表：{rules, tools_rules, drop_headings, drop_lines}。
 
@@ -148,10 +163,10 @@ def apply_global_scrub(text, pairs, counter):
     return text
 
 
-def apply_scrub(text, filename, scrub, warn):
+def apply_scrub(text, filename, scrub, warn, label="scrub"):
     for find, repl in scrub.get(filename, []):
         if find not in text:
-            warn.append(f"scrub 未命中 {filename}: {find[:60]!r}（源文件可能已变）")
+            warn.append(f"{label} 未命中 {filename}: {find[:60]!r}（源文件可能已变）")
             continue
         text = text.replace(find, repl)
     return text
@@ -167,6 +182,7 @@ def add_banner(text):
 
 def generate_tools(src, out, scrub, gscrub, gcount, warn, log):
     inc = load_lines("include.txt")
+    compat = load_compat()
     n = 0
     for name in inc:
         s = os.path.join(src, "tools", name)
@@ -175,6 +191,7 @@ def generate_tools(src, out, scrub, gscrub, gcount, warn, log):
             continue
         text = apply_global_scrub(apply_scrub(_read(s), name, scrub, warn),
                                   gscrub, gcount)
+        text = apply_scrub(text, name, compat, warn, label="compat")
         _write(os.path.join(out, "tools", name), add_banner(text))
         n += 1
     # include 白名单是 tools/ 的唯一真源：被排除的旧生成物必须清掉，

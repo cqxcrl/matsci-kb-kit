@@ -1,0 +1,26 @@
+# compat_scrub.yaml — 公开兼容规则层（可跟踪、可审查，不含任何专名）。
+#
+# 为什么需要：活库（真源）跑在较新 Python 上，插件声明 >=3.10、CI 跑 3.11。
+# PEP 701 允许 f-string 表达式内出现反斜杠仅 py>=3.12；3.11 下是 SyntaxError。
+# ast.parse(feature_version=(3,10)) 检测不到该词法差异，故在构建期按逐文件
+# 字面量替换转为 .format（反斜杠落在表达式外）。
+#
+# 纪律：与 private/scrub.yaml 同 schema（rules: file/find/replace），但本表
+# 公开；find 必须与源文件病灶逐字一致，未命中即告警（漂移可见）。不手改生成物、
+# 不动活库。新增病灶时在此追加规则并补 tests/test_build.py 钉住断言。
+# 本文件由 .qc/gen_compat.py 从病灶原文生成（块标量缩进由 yaml.dump 保证）。
+"rules":
+- "file": |-
+    kb_selftest.py
+  "find": |2-
+            print(f"  [{'ok' if good else 'FAIL'}] write_text_keep_eol 保住 CRLF"
+                  f"（crlf={_raw.count(b'\r\n')} bare={_raw.count(b'\n') - _raw.count(b'\r\n')}）")
+  "replace": |2-
+            print("  [{}] write_text_keep_eol 保住 CRLF（crlf={} bare={}）".format(
+                'ok' if good else 'FAIL', _raw.count(b'\r\n'), _raw.count(b'\n') - _raw.count(b'\r\n')))
+- "file": |-
+    lit_si.py
+  "find": |2-
+                        ev.append(f"p{i} [{tag}]: {re.sub(r'\s+', ' ', t[s:e]).strip()[:170]}")
+  "replace": |2-
+                        ev.append("p{} [{}]: {}".format(i, tag, re.sub(r'\s+', ' ', t[s:e]).strip()[:170]))

@@ -275,5 +275,79 @@ class TestBasesAndPluginYaml(unittest.TestCase):
             self.assertNotIn("kit", doc["_note"])
 
 
+class TestCompatScrub(unittest.TestCase):
+    """PEP 701：f-string 表达式内反斜杠仅 py≥3.12 合法；插件声明 ≥3.10、
+    CI 跑 3.11。公开 compat 规则层在构建期把病灶转 .format（不动活库、
+    不手改生成物）。ast.parse(feature_version=(3,10)) 测不出该词法差异，
+    故用字面量钉住 + 真 CI 兜底。"""
+
+    LESION_SELFTEST = r'''        print(f"  [{'ok' if good else 'FAIL'}] write_text_keep_eol 保住 CRLF"
+              f"（crlf={_raw.count(b'\r\n')} bare={_raw.count(b'\n') - _raw.count(b'\r\n')}）")'''
+    LESION_LIT_SI = r'''                    ev.append(f"p{i} [{tag}]: {re.sub(r'\s+', ' ', t[s:e]).strip()[:170]}")'''
+
+    def test_compat_rules_target_both_lesions(self):
+        compat = BP.load_compat()
+        self.assertIn("kb_selftest.py", compat)
+        self.assertIn("lit_si.py", compat)
+        for name, lesion in (("kb_selftest.py", self.LESION_SELFTEST),
+                             ("lit_si.py", self.LESION_LIT_SI)):
+            self.assertTrue(any(f == lesion for f, _ in compat[name]),
+                            f"compat 规则的 find 必须与病灶原文逐字一致：{name}")
+
+    def test_generate_tools_applies_compat(self):
+        with tempfile.TemporaryDirectory() as td:
+            src, out = pathlib.Path(td) / "src", pathlib.Path(td) / "out"
+            (src / "tools").mkdir(parents=True)
+            (src / "tools" / "kb_selftest.py").write_text(
+                self.LESION_SELFTEST + "\n", encoding="utf-8", newline="\n")
+            (src / "tools" / "lit_si.py").write_text(
+                self.LESION_LIT_SI + "\n", encoding="utf-8", newline="\n")
+            warn = []
+            with mock.patch.object(BP, "load_lines",
+                                   return_value=["kb_selftest.py", "lit_si.py"]):
+                n = BP.generate_tools(str(src), str(out), {}, [], {}, warn,
+                                      lambda m: None)
+            self.assertEqual(n, 2)
+            self.assertEqual(warn, [])
+            t1 = (out / "tools" / "kb_selftest.py").read_text(encoding="utf-8")
+            t2 = (out / "tools" / "lit_si.py").read_text(encoding="utf-8")
+            self.assertNotIn("f\"（crlf=", t1)
+            self.assertIn("保住 CRLF（crlf={} bare={}）\".format(", t1)
+            self.assertNotIn("f\"p{i} [{tag}]", t2)
+            self.assertIn("\"p{} [{}]: {}\".format(", t2)
+
+    def test_shipped_tools_free_of_pep701_lesions(self):
+        t1 = (ROOT / "tools" / "kb_selftest.py").read_text(encoding="utf-8")
+        t2 = (ROOT / "tools" / "lit_si.py").read_text(encoding="utf-8")
+        self.assertNotIn("f\"（crlf=", t1)
+        self.assertNotIn("f\"p{i} [{tag}]", t2)
+        self.assertIn("保住 CRLF（crlf={} bare={}）\".format(", t1)
+        self.assertIn("\"p{} [{}]: {}\".format(", t2)
+
+    @unittest.skipUnless(sys.version_info >= (3, 12),
+                         "FSTRING_* tokens require py3.12+; CI 3.11 由 py_compile 兜底")
+    def test_no_pep701_expression_backslashes_anywhere(self):
+        """通用守卫：f-string 表达式内（FSTRING_START/END 区间里的 STRING token）
+        出现反斜杠仅 py≥3.12 合法。字面文本部分的反斜杠（FSTRING_MIDDLE）全版本
+        合法，不算病灶。"""
+        import io
+        import tokenize
+        bad = []
+        for sub in ("tools", "scripts", "mcp", "build"):
+            for p in sorted((ROOT / sub).rglob("*.py")):
+                if "__pycache__" in p.parts:
+                    continue
+                depth = 0
+                readline = io.StringIO(p.read_text(encoding="utf-8")).readline
+                for t in tokenize.generate_tokens(readline):
+                    if t.type == tokenize.FSTRING_START:
+                        depth += 1
+                    elif t.type == tokenize.FSTRING_END:
+                        depth -= 1
+                    elif depth > 0 and t.type == tokenize.STRING and "\\" in t.string:
+                        bad.append(f"{p.relative_to(ROOT)}:{t.start[0]} {t.string[:40]}")
+        self.assertEqual(bad, [])
+
+
 if __name__ == "__main__":
     unittest.main()

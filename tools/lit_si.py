@@ -156,7 +156,7 @@ def scan_text(pages):
                 if len(ev) < 8:
                     s = max(0, m.start() - 70)
                     e = min(len(t), m.end() + 150)
-                    ev.append(f"p{i} [{tag}]: {re.sub(r'\s+', ' ', t[s:e]).strip()[:170]}")
+                    ev.append("p{} [{}]: {}".format(i, tag, re.sub(r'\s+', ' ', t[s:e]).strip()[:170]))
         for fn in SUPP_FILE.findall(t):
             if fn not in files:
                 files.append(fn)

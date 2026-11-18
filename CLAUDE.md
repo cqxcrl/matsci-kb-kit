@@ -71,6 +71,10 @@ CI（`.github/workflows/verify.yml`）在 ubuntu 上跑 verify_plugin ＋ unitte
   Claude Code 不展开它，需手动一步换 `${CLAUDE_PLUGIN_ROOT}`（docs/MCP.md）。
 - **caj_to_pdf 三分退出码**：0 全过 / 3 仅环境未就绪 / 2 真失败；
   `kb_toolcheck` 只豁免 3，不得按工具名宽豁免。
+- **PEP 701 f-string 反斜杠**：表达式内 `b'\r\n'` 这类写法仅 py≥3.12 合法，
+  CI 3.11 会 SyntaxError，且 `ast.parse(feature_version=(3,10))` 测不出。
+  病灶经公开 `build/rules/compat_scrub.yaml` 在构建期转 `.format`；
+  不手改生成物、不动活库。守卫见 `TestCompatScrub`。
 - **委托纪律**：「已声明」≠「已生效」——技能在**插件级**注册，`kb_init` 不复制技能进库。
 
 ## 五、细则索引

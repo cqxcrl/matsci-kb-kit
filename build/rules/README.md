@@ -49,6 +49,7 @@ build/rules/
 ├── include.txt            公开 · 随包工具白名单（纯文件名，不含专名）
 ├── exclude.txt            公开 · 刻意排除项的审计记录 + 理由
 ├── leak_denylist.txt      公开 · 通用形态规则（家目录/用户名路径）
+├── compat_scrub.yaml      公开 · Python 版本兼容字面替换（PEP 701 f-string → .format），未命中告警
 ├── examples/              公开 · 私有规则的假值模板，供新用户起步
 │   ├── scrub.yaml
 │   ├── global_scrub.yaml
@@ -94,3 +95,11 @@ python build/build_plugin.py --src "$MATSCI_KB_SRC" --out .
 4. 生成完毕后 `scan_leaks()` 用**公开 + 私有**两份 denylist 扫整个输出树，任一命中即构建失败
 
 第 4 步是 fail-closed 的兜底：前三步漏了什么，构建不会成功。
+
+tools 另有一层**公开兼容层** `compat_scrub.yaml`，在全局专名替换之后施加：
+活库跑在较新 Python 上，而插件声明 ≥3.10（CI 跑 3.11）。PEP 701 允许 f-string
+**表达式内**出现反斜杠仅 py≥3.12，3.11 下是 SyntaxError；且
+`ast.parse(feature_version=(3,10))` 检测不到该词法差异。故按逐文件字面量把病灶
+转成 `.format`（反斜杠落在表达式外）。本表不含专名、公开可跟踪；未命中即告警
+（漂移可见）。守卫：`tests/test_build.py::TestCompatScrub` 钉住两处已知病灶，
+并在 py≥3.12 上用 tokenize 深度跟踪全仓扫描表达式内反斜杠（0 命中才过）。

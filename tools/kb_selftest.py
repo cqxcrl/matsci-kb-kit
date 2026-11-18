@@ -706,8 +706,8 @@ def main():
         K.write_text_keep_eol(_c, "---\ntype: concept\n---\nnew\n")
         _raw = open(_c, "rb").read()
         good = _raw.count(b"\r\n") == 4 and _raw.count(b"\n") == 4
-        print(f"  [{'ok' if good else 'FAIL'}] write_text_keep_eol 保住 CRLF"
-              f"（crlf={_raw.count(b'\r\n')} bare={_raw.count(b'\n') - _raw.count(b'\r\n')}）")
+        print("  [{}] write_text_keep_eol 保住 CRLF（crlf={} bare={}）".format(
+            'ok' if good else 'FAIL', _raw.count(b'\r\n'), _raw.count(b'\n') - _raw.count(b'\r\n')))
         ok = ok and good
         _tie = os.path.join(_wdir, "wiki", "concepts", "tie.md")
         with open(_tie, "wb") as _f:

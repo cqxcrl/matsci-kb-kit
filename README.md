@@ -512,6 +512,9 @@ python scripts/export_plugin.py                # 白名单导出 + 终审泄漏�
 - CI 在 ubuntu 跑 `verify_plugin.py` + unittest（`.github/workflows/verify.yml`）；
   干净 checkout 无 private，扫描用公开半份词表并打印 warn，导出类测试自动 skip。
   **CI 绿 ≠ 本地终审绿**：发布前本地带 private 全量跑。
+- **Python 版本兼容**：活库跑较新 Python，插件声明 ≥3.10（CI 3.11）。PEP 701
+  f-string 表达式内反斜杠这类词法病灶经公开 `build/rules/compat_scrub.yaml`
+  在构建期转 `.format`（不手改生成物、不动活库）；`TestCompatScrub` 钉住。
 
 `plugin.yaml` 记录生成溯源：源 commit、生成时间、逐文件 sha256。
 

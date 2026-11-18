@@ -1,7 +1,7 @@
 _generated_by: build/build_plugin.py
 _note: 本插件是由源知识库过滤+去个人化生成的派生数据；真源不在此仓库。
 source_commit: 61b947df257b61aea16e02a30eff5bf0b79c2ab9
-built_at: '2026-11-17T13:17:24'
+built_at: '2026-11-18T15:02:07'
 note: 生成物请勿手改；改真源后重跑 build_plugin.py。
 tools:
 - tools/caj_to_pdf.py
@@ -93,7 +93,7 @@ tool_sha256:
   tools/kb_rag.py: 75220100a5517d65470d8046fde7a756b7d6aba2c805de88a36ab687c4478507
   tools/kb_route.py: adbc60408cc09555b9404ef0ab1ddc1cebb5a71a5bf762dee96c2e81d29eae82
   tools/kb_search.py: a18837dda72c3ff4dfbadc72e3976a25648f0212db80264abfc0fe24bbf1b362
-  tools/kb_selftest.py: c2ad0e277e1bfaf2a5853f6a2a9fded18216e23171fae919af0a0da0c04514ae
+  tools/kb_selftest.py: ecee656f8115943e343dbaef313bbb108be1bfc9cc0f05e3483db5a15d60199d
   tools/kb_semantic_search.py: 4f4352e4ae9b6a2d7c0cc0551565d1e89dec389c65ff9ed9ba0c14c46be081f9
   tools/kb_serve.py: b8a41266f1a29947161b515fd988bf720b21ad853ea52594ab61d6066a4b913e
   tools/kb_stats.py: 21babd8936525ddc97cf010a54f20353ea16e77321749899223dd3b7cc40ad78
@@ -117,7 +117,7 @@ tool_sha256:
   tools/lit_journals.py: 72df5ccc29225c69dab6b814431d2e6cce2684d3d9d119eb5d0ed9cde5a04e9a
   tools/lit_manual_import.py: ea51f3fedf9071d065eb75c7d23a8423982acd48052484b42f04498eeac01992
   tools/lit_report.py: 4d9bb1682679ea2438eb21f09a8e2e52b596ce824635aa95b4f69beb714cb5aa
-  tools/lit_si.py: 2ccc13ecc27ab67eb85e5be1ffd002dcb278704bd6c80befcc38e670bfb79236
+  tools/lit_si.py: cd1eaf38916bfe738eae68ed636529a4c1484c48f62647fe2b78d926b2c36fef
   tools/lit_si_unzip.py: ec8b6071415efa86dc60e54fa4872cd8dff5b7d3284981862f4d88f8255304f1
   tools/qc_author_gate.py: e0a981e46e09693ecf66297a57c5e4b51a57145a87439f87cf70de45f2d8ecbc
   tools/qc_author_gate_apply.py: 406cb8cccacbfcf28d13bb9628ef52589aec7fd8f687d41fcb0ede21cd5c2ba1
