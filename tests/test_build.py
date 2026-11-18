@@ -284,12 +284,20 @@ class TestCompatScrub(unittest.TestCase):
     LESION_SELFTEST = r'''        print(f"  [{'ok' if good else 'FAIL'}] write_text_keep_eol 保住 CRLF"
               f"（crlf={_raw.count(b'\r\n')} bare={_raw.count(b'\n') - _raw.count(b'\r\n')}）")'''
     LESION_LIT_SI = r'''                    ev.append(f"p{i} [{tag}]: {re.sub(r'\s+', ' ', t[s:e]).strip()[:170]}")'''
+    LESION_ZBASE = '''        # 反例：全部基目录都不可用 ⇒ 必须抛 OSError（不能静默返回坏目录）
+        try:
+            K.make_temp_dir(bases=[os.path.join("Z:", "nope_zzz"),
+                                   os.path.join("Z:", "nope_yyy")])
+            raised = False
+        except OSError:
+            raised = True'''
 
     def test_compat_rules_target_both_lesions(self):
         compat = BP.load_compat()
         self.assertIn("kb_selftest.py", compat)
         self.assertIn("lit_si.py", compat)
         for name, lesion in (("kb_selftest.py", self.LESION_SELFTEST),
+                             ("kb_selftest.py", self.LESION_ZBASE),
                              ("lit_si.py", self.LESION_LIT_SI)):
             self.assertTrue(any(f == lesion for f, _ in compat[name]),
                             f"compat 规则的 find 必须与病灶原文逐字一致：{name}")
@@ -299,7 +307,8 @@ class TestCompatScrub(unittest.TestCase):
             src, out = pathlib.Path(td) / "src", pathlib.Path(td) / "out"
             (src / "tools").mkdir(parents=True)
             (src / "tools" / "kb_selftest.py").write_text(
-                self.LESION_SELFTEST + "\n", encoding="utf-8", newline="\n")
+                self.LESION_SELFTEST + "\n" + self.LESION_ZBASE + "\n",
+                encoding="utf-8", newline="\n")
             (src / "tools" / "lit_si.py").write_text(
                 self.LESION_LIT_SI + "\n", encoding="utf-8", newline="\n")
             warn = []
@@ -315,6 +324,20 @@ class TestCompatScrub(unittest.TestCase):
             self.assertIn("保住 CRLF（crlf={} bare={}）\".format(", t1)
             self.assertNotIn("f\"p{i} [{tag}]", t2)
             self.assertIn("\"p{} [{}]: {}\".format(", t2)
+            self.assertNotIn("os.path.join(\"Z:\", \"nope_zzz\")", t1)
+            self.assertIn("kb_selftest_basefile_zzz", t1)
+
+    def test_file_base_raises_on_this_os(self):
+        """Z: 盘符反例的跨平台替代语义守卫：基目录是**文件**时 make_temp_dir
+        必须抛 OSError。Windows 与 Linux 上都成立（CI 也跑这条）。"""
+        sys.path.insert(0, str(ROOT / "tools"))
+        import kb_lib as K
+        with tempfile.TemporaryDirectory() as td:
+            fb = os.path.join(td, "base_is_a_file")
+            with open(fb, "w", encoding="utf-8") as f:
+                f.write("x")
+            with self.assertRaises(OSError):
+                K.make_temp_dir(bases=[fb, fb])
 
     def test_shipped_tools_free_of_pep701_lesions(self):
         t1 = (ROOT / "tools" / "kb_selftest.py").read_text(encoding="utf-8")
@@ -323,6 +346,8 @@ class TestCompatScrub(unittest.TestCase):
         self.assertNotIn("f\"p{i} [{tag}]", t2)
         self.assertIn("保住 CRLF（crlf={} bare={}）\".format(", t1)
         self.assertIn("\"p{} [{}]: {}\".format(", t2)
+        self.assertNotIn("os.path.join(\"Z:\", \"nope_zzz\")", t1)
+        self.assertIn("kb_selftest_basefile_zzz", t1)
 
     @unittest.skipUnless(sys.version_info >= (3, 12),
                          "FSTRING_* tokens require py3.12+; CI 3.11 由 py_compile 兜底")

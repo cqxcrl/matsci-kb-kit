@@ -41,7 +41,16 @@ def smoke(vault, with_obsidian):
         for tag, r in (("init", r1), ("doctor", r2), ("build", r3),
                        ("search", r4), ("toolcheck", r5)):
             if r.returncode != 0:
-                detail += f"\n[{tag}] {r.stdout[-600:]}\n{r.stderr[-600:]}"
+                detail += f"\n[{tag}] {r.stdout[-4000:]}\n{r.stderr[-2000:]}"
+    if r5.returncode != 0:
+        # toolcheck 的 notes 只留 selftest 末行，定位不了失败子项；
+        # 红的时候把对应 selftest 全文重跑 dump 出来（CI 日志即诊断）。
+        import re as _re
+        names = dict.fromkeys(_re.findall(r"· (\S+\.py): selftest:", r5.stdout or ""))
+        for name in names:
+            rr = run([PY, str(t / "tools" / name), "--selftest"], cwd=vault, timeout=300)
+            detail += (f"\n[selftest-full {name} rc={rr.returncode}]\n"
+                       f"{rr.stdout}\n{rr.stderr[-2000:]}")
     return ok, detail, t
 
 

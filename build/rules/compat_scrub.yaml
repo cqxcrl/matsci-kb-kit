@@ -1,9 +1,11 @@
 # compat_scrub.yaml — 公开兼容规则层（可跟踪、可审查，不含任何专名）。
 #
-# 为什么需要：活库（真源）跑在较新 Python 上，插件声明 >=3.10、CI 跑 3.11。
-# PEP 701 允许 f-string 表达式内出现反斜杠仅 py>=3.12；3.11 下是 SyntaxError。
-# ast.parse(feature_version=(3,10)) 检测不到该词法差异，故在构建期按逐文件
-# 字面量替换转为 .format（反斜杠落在表达式外）。
+# 为什么需要：活库（真源）跑在较新 Python / Windows 上，插件声明 >=3.10、
+# CI 跑 ubuntu + 3.11。两类病灶在构建期按逐文件字面量替换修掉：
+#   1. PEP 701：f-string 表达式内反斜杠仅 py>=3.12 合法（3.11 SyntaxError），
+#      且 ast.parse(feature_version=(3,10)) 检测不到该词法差异 → 转 .format。
+#   2. Windows-only 语义夹具：不存在盘符 Z: 在 Linux 上是相对路径、makedirs
+#      会成功 → 反例改用「基目录是文件」（两 OS 必抛 OSError）。
 #
 # 纪律：与 private/scrub.yaml 同 schema（rules: file/find/replace），但本表
 # 公开；find 必须与源文件病灶逐字一致，未命中即告警（漂移可见）。不手改生成物、
@@ -18,6 +20,31 @@
   "replace": |2-
             print("  [{}] write_text_keep_eol 保住 CRLF（crlf={} bare={}）".format(
                 'ok' if good else 'FAIL', _raw.count(b'\r\n'), _raw.count(b'\n') - _raw.count(b'\r\n')))
+- "file": |-
+    kb_selftest.py
+  "find": |2-
+            # 反例：全部基目录都不可用 ⇒ 必须抛 OSError（不能静默返回坏目录）
+            try:
+                K.make_temp_dir(bases=[os.path.join("Z:", "nope_zzz"),
+                                       os.path.join("Z:", "nope_yyy")])
+                raised = False
+            except OSError:
+                raised = True
+  "replace": |2-
+            # 反例：全部基目录都不可用 ⇒ 必须抛 OSError（不能静默返回坏目录）
+            # 跨平台：Linux 上 "Z:/..." 是相对路径、makedirs 会成功，Windows-only
+            # 的「不存在盘符」反例不成立；改用「基目录是文件」，两 OS 必失败。
+            import tempfile as _tfb
+            _fb = os.path.join(_tfb.gettempdir(), "kb_selftest_basefile_zzz")
+            with open(_fb, "w", encoding="utf-8") as _fhb:
+                _fhb.write("x")
+            try:
+                K.make_temp_dir(bases=[_fb, _fb])
+                raised = False
+            except OSError:
+                raised = True
+            finally:
+                os.remove(_fb)
 - "file": |-
     lit_si.py
   "find": |2-

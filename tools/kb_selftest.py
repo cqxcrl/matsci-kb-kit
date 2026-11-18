@@ -327,12 +327,19 @@ def check_temp_dir_helper(ok):
         ok = ok and good_fb
 
         # 反例：全部基目录都不可用 ⇒ 必须抛 OSError（不能静默返回坏目录）
+        # 跨平台：Linux 上 "Z:/..." 是相对路径、makedirs 会成功，Windows-only
+        # 的「不存在盘符」反例不成立；改用「基目录是文件」，两 OS 必失败。
+        import tempfile as _tfb
+        _fb = os.path.join(_tfb.gettempdir(), "kb_selftest_basefile_zzz")
+        with open(_fb, "w", encoding="utf-8") as _fhb:
+            _fhb.write("x")
         try:
-            K.make_temp_dir(bases=[os.path.join("Z:", "nope_zzz"),
-                                   os.path.join("Z:", "nope_yyy")])
+            K.make_temp_dir(bases=[_fb, _fb])
             raised = False
         except OSError:
             raised = True
+        finally:
+            os.remove(_fb)
         print(f"  [{'ok' if raised else 'FAIL'}] 反例：无可用基目录 ⇒ 抛 OSError（不静默返坏路径）")
         ok = ok and raised
     except Exception as _e:                                    # noqa: BLE001
