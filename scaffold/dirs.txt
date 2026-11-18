@@ -1,0 +1,22 @@
+# 用户库里应当存在的目录（相对库根）。kb_init.py 按此建目录 + .gitkeep。
+# 取自源库 tools/lit_doctor.py 的必需目录声明 + 各写入器的落点。
+wiki/sources
+wiki/concepts
+wiki/entities
+wiki/topics
+wiki/outputs
+wiki/experiments
+raw/pdf
+raw/text
+raw/assets
+raw/clippings
+raw/notes
+raw/notes/lit-watch/daily
+raw/notes/lit-watch/picks
+raw/notes/lit-watch/downloads
+raw/notes/lit-watch/state
+projects
+# 归档层与临时区（CLAUDE.md 分层约定）：_archive 只移不删（--update-tools 的
+# 旧 tools 备份落点 _archive/tools-backup-YYYYMMDD/）；_scratch 为在用临时区。
+_archive
+_scratch

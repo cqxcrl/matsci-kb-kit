@@ -1,0 +1,15 @@
+build/rules/private/
+__pycache__/
+*.pyc
+*.pyo
+dist/
+node_modules/
+.qc*/
+.superpowers/
+docs/superpowers/
+# Task 6：本地审计/验证产物（不随仓库发布；结论沉淀在 build/rules 与任务报告）
+build/audit-results.*
+build/audit-fails*.txt
+build/*.log
+build/debug-rules.txt
+build/kbwhere-help-probe.json

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "matsci-kb": {
+      "command": "python",
+      "args": ["${QODER_PLUGIN_ROOT}/mcp/server.py"],
+      "timeout": 120000
+    }
+  }
+}

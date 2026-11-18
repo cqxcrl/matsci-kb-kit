@@ -1,0 +1,25 @@
+filters:
+  and:
+    - file.inFolder("wiki/concepts")
+    - file.ext == "md"
+properties:
+  aliases:
+    displayName: 别名
+  summary:
+    displayName: 摘要
+  evidence_base:
+    displayName: 证据承重
+views:
+  - type: table
+    name: 概念索引
+    order:
+      - file.name
+      - file.tags
+      - evidence_base
+      - aliases
+      - summary
+  - type: list
+    name: 概念列表
+    order:
+      - file.name
+      - aliases

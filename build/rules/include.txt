@@ -1,0 +1,79 @@
+# 三族白名单（Task 6 空库可用性审计后的最终清单，71 件 = 70 个 .py + 1 个数据 yaml）。
+# 内联结论摘要：默认 kb_init（含索引）口径的空库复审，除 caj_to_pdf.py 可选层豁免外
+# 全部 selftest/help PASS；唯一排除 qc_fix_escaped_tex.py（一次性修复器，绑活库具体页）。
+# 排除/豁免理由见 exclude.txt；索引依赖工具的审计口径见 exclude.txt 尾注。
+# 核心检索层
+kb_lib.py
+kb.py
+kb_search.py
+kb_semantic_search.py
+kb_rag.py
+kb_agentic.py
+kb_manifest.py
+kb_route.py
+kb_corpus.py
+kb_graph.py
+kb_backlinks.py
+kb_build_index.py
+kb_lint.py
+kb_lint_deep.py
+kb_stats.py
+kb_cite.py
+kb_tags.py
+kb_where.py
+kb_selftest.py
+kb_toolcheck.py
+kb_serve.py
+kb_dois.py
+# 文献流水线
+lit_discover.py
+lit_fetch.py
+lit_extract.py
+lit_ingest.py
+lit_finish.py
+lit_daily.py
+lit_digest.py
+lit_catalogue.py
+lit_manual_import.py
+lit_batch.py
+lit_gapscan.py
+lit_doctor.py
+lit_journals.py
+lit_report.py
+lit_enrich.py
+lit_si.py
+lit_browser_fetch.py
+lit_cnki_fetch.py
+lit_si_unzip.py
+caj_to_pdf.py
+# QC 质检层（工作流必需 + 通用审计/修复器；Task 6 逐个空库验证）
+qc_proj_sources.py
+qc_proj_names.py
+qc_proj_assets.py
+qc_evidence_audit.py
+qc_evidence_note.py
+qc_evidence_base.py
+qc_schema_check.py
+qc_base_check.py
+qc_si_backfill.py
+qc_sources_drift.py
+qc_author_gate.py
+qc_author_gate_apply.py
+qc_batch_progress.py
+qc_find_ai_deps.py
+qc_fix_authors.py
+qc_fix_image_syntax.py
+qc_fix_pdf_links.py
+qc_fix_workspace_refs.py
+qc_fix_yaml.py
+qc_ledger.py
+qc_link_twins.py
+qc_link_wrap_sweep.py
+qc_pdf_identity.py
+qc_same_text.py
+qc_si_sweep.py
+qc_si_template_sweep.py
+qc_status.py
+qc_unwrap_author_links.py
+# 数据文件
+journals-multidisciplinary.yaml

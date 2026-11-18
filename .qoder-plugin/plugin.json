@@ -1,0 +1,13 @@
+{
+  "name": "matsci-knowledge-base",
+  "displayName": "Matsci Knowledge Base",
+  "version": "0.4.0",
+  "description": "Build and operate a materials-science knowledge base from scratch: layered Markdown vault, retrieval/indexing, QC and literature pipeline tools with dry-run-first write discipline. Obsidian optional.",
+  "descriptionZh": "从零搭建并运作材料科学知识库：分层 Markdown 库、检索/索引、质检与文献流水线工具，干跑优先的写盘纪律。Obsidian 仅为可选层。",
+  "author": { "name": "Matsci Knowledge Base contributors" },
+  "license": "MIT",
+  "keywords": ["knowledge-base", "materials-science", "literature", "markdown"],
+  "category": "Workflow",
+  "tags": ["knowledge-base", "literature", "qc"],
+  "skills": "./skills/"
+}

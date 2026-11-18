@@ -1,0 +1,46 @@
+filters:
+  and:
+    - file.ext == "md"
+    - file.inFolder("raw")
+    - source.contains("mp.weixin.qq.com")
+    - not:
+        - file.inFolder("raw/_park")
+formulas:
+  age_days: (now() - file.ctime).days
+properties:
+  source:
+    displayName: 来源链接
+  author:
+    displayName: 作者/公众号
+  created:
+    displayName: 收录日期
+  published:
+    displayName: 发布日期
+  summary:
+    displayName: 摘要
+views:
+  - type: table
+    name: 公众号文集
+    groupBy:
+      property: created
+      direction: DESC
+    order:
+      - file.name
+      - source
+      - author
+      - created
+      - published
+      - summary
+      - file.tags
+      - formula.age_days
+    sort:
+      - property: created
+        direction: DESC
+      - property: file.name
+        direction: ASC
+  - type: cards
+    name: 公众号卡片
+    order:
+      - file.name
+      - author
+      - created

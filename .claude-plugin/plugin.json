@@ -1,0 +1,8 @@
+{
+  "name": "matsci-knowledge-base",
+  "version": "0.4.0",
+  "description": "Build and operate a materials-science knowledge base from scratch: layered Markdown vault, retrieval/indexing, QC and literature pipeline tools with dry-run-first write discipline. Obsidian optional.",
+  "author": { "name": "Matsci Knowledge Base contributors" },
+  "license": "MIT",
+  "keywords": ["knowledge-base", "materials-science", "literature", "markdown"]
+}

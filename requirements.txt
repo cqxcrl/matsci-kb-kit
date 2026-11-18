@@ -1,0 +1,4 @@
+pyyaml
+jieba
+numpy
+PyMuPDF

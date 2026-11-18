@@ -1,0 +1,23 @@
+filters:
+  and:
+    - file.inFolder("wiki/entities")
+    - file.ext == "md"
+properties:
+  aliases:
+    displayName: 别名
+  summary:
+    displayName: 摘要
+views:
+  - type: table
+    name: 实体名录
+    order:
+      - file.name
+      - file.tags
+      - aliases
+      - summary
+  - type: cards
+    name: 实体卡片
+    order:
+      - file.name
+      - aliases
+      - summary

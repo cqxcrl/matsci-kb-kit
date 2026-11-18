@@ -1,0 +1,54 @@
+# 示例：声明式去个人化表。复制成 private/scrub.yaml 后填你自己的规则。
+# 每项：{file, find, replace, [optional] note}
+#
+# find 用 YAML 单引号（反斜杠按字面量处理）或块标量 |-（多行）。
+# 变换按**列表顺序**应用；同文件多规则时，长的在前（避免短串先命中）。
+# 这是 kit 与真源的唯一差异来源——真源自身完全不动。
+#
+# 收录标准：源库 tools/ 里**命中 leak_denylist 的每一处**都要有一条对应规则，
+# 否则构建会因为泄漏扫描失败而中止。
+#
+# 🔴 两类改写别混淆：
+#    · 纯专名 → 占位符：放 global_scrub.yaml（对每个生成物都跑）；
+#    · **结构性**改写（改代码语义、删整段、换实现）：放这里，按文件精确指定。
+#
+# 🔴 未命中会告警（漂移可见）。告警意味着真源已经变了，规则要么改要么删——
+#    不要为了让输出干净而留着一条永远不命中的规则。
+
+rules:
+  # ---------- 例：把库外绝对路径改成配置驱动，顺带删掉机器专属兜底 ----------
+  # 真源里写死了本机路径；kit 用户没有那个目录，所以换成「由配置提供」。
+  - file: some_tool.py
+    find: |-
+      DEFAULT_DIRS = {
+          "a": r"D:\我的文献目录",
+          "b": r"D:\另一个文献目录",
+      }
+    replace: 'DEFAULT_DIRS = {}   # 由配置文件提供；不内置个人路径'
+
+  # ---------- 例：docstring 里的旧库路径 → 中性描述 ----------
+  - file: another_tool.py
+    find: '（D:/我的旧库/raw）'
+    replace: '（一个已不存在的旧库路径）'
+
+  # ---------- 例：机器专属的环境探测 → 环境变量派生 ----------
+  # 原值把本机绝对路径写死；改成从环境变量 / 用户目录派生，代码仍可运行。
+  - file: doctor_like_tool.py
+    find: 'g = r"D:\.agent\skills\some-skill\SKILL.md"'
+    replace: 'g = os.path.join(os.environ.get("AGENT_HOME") or os.path.expanduser("~/.agent"), "skills", "some-skill", "SKILL.md")'
+
+  # ---------- 例：selftest 夹具里的绝对路径 ----------
+  # 🔴 换夹具路径前先看清断言逻辑。踩过的坑：某 normalize 函数第一步就 .strip("/")，
+  #    于是把 "D:/outside/…" 换成 "/outside/…" 会让它**变成相对路径并通过校验**，
+  #    反例当场失效、selftest FAIL。这种场合要保留盘符，换一个不指向本机的占位盘符
+  #    （如 Z:），判据用正则 ^[A-Za-z]: 就与平台无关了。
+  - file: ingest_like_tool.py
+    find: 'normalize_page_dir("D:/我的知识库/wiki/sources")'
+    replace: 'normalize_page_dir("Z:/outside-vault/wiki/sources")'
+
+  # ---------- 例：把绑源库规模的断言下限放宽 ----------
+  # 源库断言 count > 50（绑源库规模）；kit 装进空库后数量由 include.txt 决定，
+  # 用户也可能只拷一部分 ⇒ 下限改成「非空」，避免自检在合法安装上假失败。
+  - file: manifest_like_tool.py
+    find: 'ok = ok and manifest["count"] > 50'
+    replace: 'ok = ok and manifest["count"] > 0'

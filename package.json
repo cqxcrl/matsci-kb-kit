@@ -1,0 +1,16 @@
+{
+  "name": "matsci-knowledge-base",
+  "version": "0.4.0",
+  "description": "Build and operate a materials-science knowledge base from scratch (agent plugin).",
+  "license": "MIT",
+  "author": "Matsci Knowledge Base contributors",
+  "files": [
+    ".claude-plugin/", ".qoder-plugin/", ".mcp.json",
+    "skills/", "tools/", "scaffold/", "scripts/kb_init.py",
+    "mcp/server.py", "mcp/requirements.txt",
+    "docs/ARCHITECTURE.md", "docs/GETTING-STARTED.md", "docs/MCP.md",
+    "docs/TOOLS.md", "docs/METHODOLOGY.md",
+    "requirements.txt", "requirements-optional.txt",
+    "README.md", "LICENSE", "NOTICE.md", "plugin.yaml"
+  ]
+}

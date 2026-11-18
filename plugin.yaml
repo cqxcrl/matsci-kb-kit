@@ -1,0 +1,149 @@
+_generated_by: build/build_plugin.py
+_note: 本插件是由源知识库过滤+去个人化生成的派生数据；真源不在此仓库。
+source_commit: 61b947df257b61aea16e02a30eff5bf0b79c2ab9
+built_at: '2026-11-17T13:17:24'
+note: 生成物请勿手改；改真源后重跑 build_plugin.py。
+tools:
+- tools/caj_to_pdf.py
+- tools/journals-multidisciplinary.yaml
+- tools/kb.py
+- tools/kb_agentic.py
+- tools/kb_backlinks.py
+- tools/kb_build_index.py
+- tools/kb_cite.py
+- tools/kb_corpus.py
+- tools/kb_dois.py
+- tools/kb_graph.py
+- tools/kb_lib.py
+- tools/kb_lint.py
+- tools/kb_lint_deep.py
+- tools/kb_manifest.py
+- tools/kb_rag.py
+- tools/kb_route.py
+- tools/kb_search.py
+- tools/kb_selftest.py
+- tools/kb_semantic_search.py
+- tools/kb_serve.py
+- tools/kb_stats.py
+- tools/kb_tags.py
+- tools/kb_toolcheck.py
+- tools/kb_where.py
+- tools/lit_batch.py
+- tools/lit_browser_fetch.py
+- tools/lit_catalogue.py
+- tools/lit_cnki_fetch.py
+- tools/lit_daily.py
+- tools/lit_digest.py
+- tools/lit_discover.py
+- tools/lit_doctor.py
+- tools/lit_enrich.py
+- tools/lit_extract.py
+- tools/lit_fetch.py
+- tools/lit_finish.py
+- tools/lit_gapscan.py
+- tools/lit_ingest.py
+- tools/lit_journals.py
+- tools/lit_manual_import.py
+- tools/lit_report.py
+- tools/lit_si.py
+- tools/lit_si_unzip.py
+- tools/qc_author_gate.py
+- tools/qc_author_gate_apply.py
+- tools/qc_base_check.py
+- tools/qc_batch_progress.py
+- tools/qc_evidence_audit.py
+- tools/qc_evidence_base.py
+- tools/qc_evidence_note.py
+- tools/qc_find_ai_deps.py
+- tools/qc_fix_authors.py
+- tools/qc_fix_image_syntax.py
+- tools/qc_fix_pdf_links.py
+- tools/qc_fix_workspace_refs.py
+- tools/qc_fix_yaml.py
+- tools/qc_ledger.py
+- tools/qc_link_twins.py
+- tools/qc_link_wrap_sweep.py
+- tools/qc_pdf_identity.py
+- tools/qc_proj_assets.py
+- tools/qc_proj_names.py
+- tools/qc_proj_sources.py
+- tools/qc_same_text.py
+- tools/qc_schema_check.py
+- tools/qc_si_backfill.py
+- tools/qc_si_sweep.py
+- tools/qc_si_template_sweep.py
+- tools/qc_sources_drift.py
+- tools/qc_status.py
+- tools/qc_unwrap_author_links.py
+tool_sha256:
+  tools/caj_to_pdf.py: cc21948c2c0db7ce39fe79468f1b20f632237b88dc63622b3913925c9ad7450c
+  tools/journals-multidisciplinary.yaml: b0d52afe5f40d164142201deaacc235d4baec56a63ce1c48744368f162ebe414
+  tools/kb.py: 44fe2e322ba592249d5aa1fb70c1c3c2e658f014121da326710f0d714f49f7d6
+  tools/kb_agentic.py: a031cce47ec7bbae99b2ed88ee457231891c7b8bb995152c6de0089067eb3bf1
+  tools/kb_backlinks.py: a5656585e35656f14436041fc525aa9a53450afc599364edb02b65c8d0ba26bd
+  tools/kb_build_index.py: 25abe9436e55542088b89bf20346d066719bbc42905e0bd83524dbc8419e5bad
+  tools/kb_cite.py: 1e202c177567f39160fc99d7868ff35684e0197ccdac041e69b259d82877d0f3
+  tools/kb_corpus.py: 24c5bdaf1036b6d2989f7e34b82fed722da7951733c50fafc12d958b7671f5f9
+  tools/kb_dois.py: f758098a8c2a63fa9f48af4a213cab8eba449c627de0e2d321cd0d38ff2861bd
+  tools/kb_graph.py: e2c330024cd38cb69d7d18224827b4ffb65479575f5b2577bea216e73c254707
+  tools/kb_lib.py: 46c478f9770b4fed60b0acd12c8cb63dcfb4a67ae903df848b75933fe5033c4d
+  tools/kb_lint.py: a6febaf3962b651fe140c252bf3b75bd7c9275b810e8517df5c2ab68053104ee
+  tools/kb_lint_deep.py: 40125553419528af7aeaec8c319c84a202f6234f7472fbddec9d350f9148b1fa
+  tools/kb_manifest.py: 05b53017e2995ed43cccba4158a69fc9942e962c37b0ad4c491e73de34a42b5d
+  tools/kb_rag.py: 75220100a5517d65470d8046fde7a756b7d6aba2c805de88a36ab687c4478507
+  tools/kb_route.py: adbc60408cc09555b9404ef0ab1ddc1cebb5a71a5bf762dee96c2e81d29eae82
+  tools/kb_search.py: a18837dda72c3ff4dfbadc72e3976a25648f0212db80264abfc0fe24bbf1b362
+  tools/kb_selftest.py: c2ad0e277e1bfaf2a5853f6a2a9fded18216e23171fae919af0a0da0c04514ae
+  tools/kb_semantic_search.py: 4f4352e4ae9b6a2d7c0cc0551565d1e89dec389c65ff9ed9ba0c14c46be081f9
+  tools/kb_serve.py: b8a41266f1a29947161b515fd988bf720b21ad853ea52594ab61d6066a4b913e
+  tools/kb_stats.py: 21babd8936525ddc97cf010a54f20353ea16e77321749899223dd3b7cc40ad78
+  tools/kb_tags.py: e95ed986621a2e61e7286a916bf86454123a6d25b523049cebd7e7cbe7690b17
+  tools/kb_toolcheck.py: 2c19dd07083e7ccab014cea3aeeb118060a623c1c7fcbe3e538a92e23c81de9f
+  tools/kb_where.py: cc36de5ba266cce04d65902094143fceef0410c28131c91ca8d1ba81a2f8607b
+  tools/lit_batch.py: 5b880eb35a1c527924eaf1e58473a6ae76ca7f3967bcfd9c9e38a999ecb9ee04
+  tools/lit_browser_fetch.py: 1efcf332d045ea0b30c850f0c6315d6a8c448a9c2e6cafacfeea2495c0012fd3
+  tools/lit_catalogue.py: 4230653f0fdf4437eed70e6e3edf249f8a6c46a696a24fe3b4c2de5e8c11a098
+  tools/lit_cnki_fetch.py: 5391a68e8f84335d5fedcddce3439991473ac40c4d07607275e8ec596d3f7f7d
+  tools/lit_daily.py: a8eae3117413bf223c459ab3d8d5544283a1cf4f2f1129aae6db924e064fe8cf
+  tools/lit_digest.py: fe0c1f707351c0ca8f316e8abf499066849f03198de8002be21692ff9b539f08
+  tools/lit_discover.py: 82fa8cd4965c86e87265c2a7690b2b006c77f6ca1fe70ab7b6f2a6d262c5a374
+  tools/lit_doctor.py: 76f1c7e5777f263a2330b976a3674522d2da413aa2b8f1e84bbff8c474032f7b
+  tools/lit_enrich.py: 78f26c5ec321c41f45b2321816b3b89cc1aeb6b283b3051bf7b2b8b51cf38324
+  tools/lit_extract.py: 55e0640733f2ebfbca9cf7e64d9bb3915f5a6499ff89a02669a3f2c58a89115e
+  tools/lit_fetch.py: 68ec8236844cf5407930f0357ee14da6b945b5d1418a7eadb3cca827c6e1dd25
+  tools/lit_finish.py: ac771f1e24c5872efa74ce02cd9083fbd9356b52e41b2e0e9a4079da86783b5f
+  tools/lit_gapscan.py: 7b2282944ce4e59cb28fc547b574dc9cbe73158a3a90b6b8b3fed970bcf69388
+  tools/lit_ingest.py: 88e8b5f64c6c9c51193c8ed56895baa97965a3f49c5ce59a8daeb0dc39b83508
+  tools/lit_journals.py: 72df5ccc29225c69dab6b814431d2e6cce2684d3d9d119eb5d0ed9cde5a04e9a
+  tools/lit_manual_import.py: ea51f3fedf9071d065eb75c7d23a8423982acd48052484b42f04498eeac01992
+  tools/lit_report.py: 4d9bb1682679ea2438eb21f09a8e2e52b596ce824635aa95b4f69beb714cb5aa
+  tools/lit_si.py: 2ccc13ecc27ab67eb85e5be1ffd002dcb278704bd6c80befcc38e670bfb79236
+  tools/lit_si_unzip.py: ec8b6071415efa86dc60e54fa4872cd8dff5b7d3284981862f4d88f8255304f1
+  tools/qc_author_gate.py: e0a981e46e09693ecf66297a57c5e4b51a57145a87439f87cf70de45f2d8ecbc
+  tools/qc_author_gate_apply.py: 406cb8cccacbfcf28d13bb9628ef52589aec7fd8f687d41fcb0ede21cd5c2ba1
+  tools/qc_base_check.py: 08f4a8a8ecc5d74dcc7208de7357d61c81a176f6b9062fba5c0fe84251fb0ba7
+  tools/qc_batch_progress.py: 69d65f280e98f79b3390700c811c74ad05393363a46655abaca39c96c8813b56
+  tools/qc_evidence_audit.py: b7a3247843b8da2ad61d7a53c4cf9b7edf30447f3db8c0f9f7b8fb3a40356288
+  tools/qc_evidence_base.py: 7941df10195c102320aabfb57f709ca8cdb0fa2978b5a4c8c6d14e0bdd863c1e
+  tools/qc_evidence_note.py: 0ec5efe3e1c9ce86bc8e9b4d75e300eccb237d466860c0afc13285c61387114b
+  tools/qc_find_ai_deps.py: e6abc54c164d135a49dd592992567ccf231526c0cf6b3c025311822274a58104
+  tools/qc_fix_authors.py: 4a01e360f027806d32c3d21fff685b5506a5d92b77a62fdfface6897cdf0bc72
+  tools/qc_fix_image_syntax.py: 238a5e9c63feb5ada2f677a7b9f75857e10f6ba1e3387e7891a9b1228266e8ac
+  tools/qc_fix_pdf_links.py: abee48bb61c8a690b779eb7caad0f3584cae4e989858c14fc55070f4b77f5cac
+  tools/qc_fix_workspace_refs.py: b5070177e435e24561e2b4e9bf3b5edeb933c23cf2f272d7cbeea0b1fb8e2221
+  tools/qc_fix_yaml.py: 216b778913184d02ce48528478195b635536e26ed3f6d4804db7b287469ab4a7
+  tools/qc_ledger.py: be9591b6442dd8866013c6db3bc996db9720b9f854521a59daee4c4e6714686f
+  tools/qc_link_twins.py: bb7ccdec311285741ff413527a7e242ee5d466028a8507aadb45729f3e6c52ad
+  tools/qc_link_wrap_sweep.py: 08075e35bf37e9687ab87a9c824153ce5f94e30f1d22929dde15f451fb61c5dd
+  tools/qc_pdf_identity.py: a51b4c540f814f3962d691e358e00d9d8ca28c2cb7a88a596aaf36fe155a8a35
+  tools/qc_proj_assets.py: 6a1b88e3e4cdbafe38a3acaa9969c9bed697ada4f322c606af72481853a0e8bc
+  tools/qc_proj_names.py: fbe19a1fa145fa30967e046d9ded7d800a194a52c70331dfa05197efca985340
+  tools/qc_proj_sources.py: c0922d589619919430766c704dc55c52e69ef18d43f6005d46bf974b7f500333
+  tools/qc_same_text.py: fc1c024743666917049e479c4075aee4791e6b0d493744f7303f8a0cdcf40ed4
+  tools/qc_schema_check.py: 464c72a22d9a9162f1d30092a0a4332d65f0e58da675a7d272d779ed0af8d0d9
+  tools/qc_si_backfill.py: bff658f9c44040ea4dddbfdec789bc47b9e5ebcf2856be4fb9f8396ad357060f
+  tools/qc_si_sweep.py: 1f610c66065f4cf12d74a14fbafb4798f3611a12651911940132c4de5073e4d4
+  tools/qc_si_template_sweep.py: c5d71dac8621aeaf8122d232c0ab0f5ecad3962f2c094df6db405198c75f3ce6
+  tools/qc_sources_drift.py: ffdf9f0622ae769f04298a9866a5518240ba408d4538d7bd2646d76059fd1de2
+  tools/qc_status.py: 7805705d4f60f346472a9ea3f735c4242233ec26cc722133d1f7410835b4d7f8
+  tools/qc_unwrap_author_links.py: 2d8b7ef2a713e0e37c8577f59aef6c2d7c5ab45ed91eb57cfffa99307fa7a12d

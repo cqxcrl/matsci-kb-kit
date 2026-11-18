@@ -1,0 +1,46 @@
+# 可选依赖 —— 全部「缺了就优雅降级」，不装也能跑完整条 BM25 流水线。
+# 装法：pip install -r requirements-optional.txt
+# 逐个说明「不装会失去什么」，按需取舍。
+
+# ── 检索层 ────────────────────────────────────────────────────────
+# kb_rag / kb_semantic_search / kb_serve 的向量召回与 CrossEncoder 精排。
+# 🔴 不装则 `kb.py search`（默认 --mode hybrid）与 `kb.py ask` 会直接
+#    报 RetrievalUnavailable 并退出码 3 —— 这是刻意的，绝不静默降级成 BM25。
+#    没装时请显式用 `--mode bm25`。
+# 首次精排会下载 BAAI/bge-reranker-base；默认只读本地模型，需 --allow-download 才联网。
+sentence-transformers
+
+# sentence-transformers 缺失时的语义检索降级路径（TF-IDF / 截断 SVD）。
+scikit-learn
+
+# ── 文献流水线 ────────────────────────────────────────────────────
+# lit_browser_fetch：真实浏览器 + 类人鼠标，兜底抓 lit_fetch 拿不到的正文与 SI。
+# 装完还需 `python -m playwright install chromium`。不装则该工具直接报缺依赖退出。
+playwright
+# lit_browser_fetch 过 Cloudflare 的 ACS 路径：导出 cookies 后走 curl_cffi 的 TLS 指纹。
+curl_cffi
+
+# ── 文献辅助：CNKI CAJ/KDH 转换（可选） ──────────────────────────
+# caj_to_pdf：把知网 CAJ/KDH 转成可提取文字的 PDF（只有真 PDF 能进提取链）。
+# 不装不影响核心流水线与 BM25 检索。转换器本体 caj2pdf **不是 pip 包**：
+# 需 git clone https://github.com/caj2pdf/caj2pdf 到库内 _scratch/caj2pdf/
+# （或用 lit_config.yaml: cnki.caj2pdf_home / 环境变量 CAJ2PDF_HOME 指路）。
+# 未就绪时 caj_to_pdf --selftest / --available 退出码 2 并明确提示缺什么（审计豁免项）。
+PyPDF2
+pdfrw
+imagesize
+Pillow
+python-dateutil
+
+# ── 其它 ──────────────────────────────────────────────────────────
+# 不装则跳过绘图并打 [warn]，统计与导出照常。
+matplotlib
+
+# .xlsx 读取的可选后端。缺失时降级为 zip+XML 流式解析（标准库实现，不引入 pandas）。
+openpyxl
+
+# qc_base_check 的 YAML 往返保序写。不装则回退 PyYAML（核心依赖，已在 requirements.txt）。
+ruamel.yaml
+
+# kb_cite --copy 复制到剪贴板。不装则只打印到 stdout。
+pyperclip

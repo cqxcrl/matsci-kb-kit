@@ -1,0 +1,110 @@
+# ============================================================================
+# 文献获取层配置（tools/lit_*.py 的唯一配置来源）
+# ============================================================================
+# 由 matsci-knowledge-base 的 scaffold 提供。路径一律**相对库根**：脚本用 __file__
+# 推导库根后再拼接，所以文件夹改名、目录重构都不必改这里。
+#
+# 三件事按需编辑：
+#   ① journals  —— 你的学科期刊白名单（带 tier）
+#   ② dedup_sources / zotero —— 本机已有的文献目录（避免重复下载）
+#   ③ automation.directions —— 每日发现的方向
+# ============================================================================
+
+# ---------------------------------------------------------------- 1. 目标期刊白名单（分级）
+# issn 用 OpenAlex 的 issn_l（linking ISSN）。tier: T0..T4，定义见 §tiers。
+# 下面给的是**占位示例**，请替换为你关心的期刊。可用 `tools/lit_journals.py` 维护。
+journals:
+  # - {issn_l: "0028-0836", name: "Nature",     tier: T0}
+  # - {issn_l: "1476-1122", name: "Nature Materials", tier: T1}
+  # - {issn_l: "2050-7488", name: "J. Mater. Chem. A", tier: T2}
+
+# 阶段A 的**每刊**相关度阈值取本表 relevance_min（越顶的刊越低）；缺 tier 的刊取 default_tier。
+# ingest_depth：enhanced = 增强精读；standard = 标准精读；light = 轻精读。
+# uncapped: true = 该档文献**不被 --limit 截断**（顶刊优先，宁可多不能漏）。
+#
+# 🔴 阈值必须相对 relevance() 的**评分下限**（SCORE_FLOOR，正值最低 0.70）来设：
+#    能走到复筛的候选都已通过关键词筛选，其分数必然 ≥ 下限 ⇒ 任何 ≤ 0.70 的阈值
+#    都**永远无物可滤**，五档行为完全相同（分级形同虚设）。
+#    故 T0/T1 保持宽松（召回优先，靠 uncapped + 增强精读兜底）；
+#    T2/T3/T4 抬到下限**之上**，才能真正按关键词命中强度区分。
+#    ⚠️ 调本表前先读 `lit_discover.relevance()` 的评分下限，否则又是空转。
+tiers:
+  T0: {label: "正刊/权威综述/旗舰", relevance_min: 0.40, ingest_depth: enhanced, uncapped: true}
+  T1: {label: "大子刊/顶刊子刊",   relevance_min: 0.45, ingest_depth: enhanced, uncapped: true}
+  T2: {label: "领域一区 top",      relevance_min: 0.80, ingest_depth: standard}
+  T3: {label: "普通一区",          relevance_min: 0.90, ingest_depth: standard}
+  T4: {label: "二区/专业刊",       relevance_min: 0.95, ingest_depth: light}
+default_tier: T3
+
+# ---------------------------------------------------------------- 2. 路径（一律相对库根）
+paths:
+  raw_dir:   "raw"
+  text_dir:  "raw/text"
+  pdf_dir:   "raw/pdf"
+  assets_dir: "raw/assets"
+  notes_dir: "raw/notes"
+  runs_dir:  "raw/notes/lit-watch"
+  source_cache: "raw/notes/lit-watch/runs/source_cache.json"
+  download_dir: "raw/notes/lit-watch/downloads"
+  catalogue: "raw/notes/lit-watch/state/local_lit_catalogue.json"
+  extract_ledger: "raw/notes/lit-watch/state/extract_ledger.json"
+  manual_import_log: "raw/notes/lit-watch/state/manual_import_log.json"
+  doi_index: "wiki/.index/dois.json"
+
+# ---------------------------------------------------------------- 3. 默认参数
+defaults:
+  lookback_days: 7
+  max_candidates: 20
+  abstract_min_relevance: 0.6
+  institution_proxy: true
+  lower_tier_floor_factor: 0.5   # 截断时非 uncapped 档的**名额下限系数**（低档至少占 limit 的此比例）；
+                                 # 0 = 恢复旧行为（T0/T1 满额时低档可被挤成 0 篇）
+
+# ---------------------------------------------------------------- 4. 数据源
+# mailto 填你的真实邮箱可进 OpenAlex 礼貌池（更快、更少 429）；留空走公共池。
+datasource:
+  api: "https://api.openalex.org"
+  mailto: ""
+  # OpenAlex 自 2026-10 起要求 **cursor 翻页必须带 API key**：无 key 时第 2 页起返回
+  # `401 API key required for cursor paging` ⇒ 每个分片只取回首屏，命中 >per_page 的
+  # 分片被静默截断（旧版会误报成 rc=3「分片检索失败」）。
+  # 免费申请：https://openalex.org/settings/api（一分钟）。
+  #
+  # 🔴 **不要把 key 明文写在这个字段里。** 本文件会被复制进你的库、而库通常被 git 跟踪，
+  #    明文 key 会随下次提交永久留在历史里（删文件也删不掉历史）。
+  #    请用**环境变量 `OPENALEX_API_KEY`**——代码里它的优先级**高于**本字段
+  #    （见 lit_discover.openalex_api_key）：
+  #      Git Bash:   export OPENALEX_API_KEY="<你的key>"      # 或写进 ~/.bashrc
+  #      PowerShell: setx OPENALEX_API_KEY "<你的key>"        # 需重开终端
+  #      计划任务:   在调用 lit_daily 的 .cmd 里先 set OPENALEX_API_KEY=...
+  #    ⚠️ 本字段留空 = 不注入 key（只取首屏）。key 也绝不写进日志或 URL 打印。
+  api_key: ""
+
+# ---------------------------------------------------------------- 5. 落盘约定
+layout:
+  source_page_backlink_prefix: "raw/text"
+  source_page_dir: "wiki/sources"
+
+# ---------------------------------------------------------------- 6. 去重源（本机文献目录）
+# 除「知识库 DOI 清单」外，还扫这些目录里 PDF 的 DOI，取并集，避免重复下载。
+#   scope: kb   = 知识库自身（raw 全树）
+#   scope: pdfs = 普通文献目录（递归 *.pdf）
+#   path: 相对库根（库内）或绝对路径（库外）
+dedup_sources:
+  - {id: "kb_raw", path: "raw", scope: "kb"}
+  # - {id: "my_pdfs", path: "/absolute/path/to/your/papers", scope: "pdfs"}
+
+# Zotero 数据目录（含 zotero.sqlite 与 storage/）。留空 = 不扫 Zotero。
+zotero:
+  data_dir: ""
+
+# ---------------------------------------------------------------- 7. 每日自动发现
+# 方向从这里读（tools/lit_daily.py）。query 是空格分隔的 OR 语义关键词族。
+automation:
+  window: "近一周"
+  limit: 15
+  results_dir: ""              # 留空 = 缺省库内 raw/notes/lit-watch/results/（digest 副本）；正本在 daily/
+  directions: []               # 全空占位：由 /kb-onboard 访谈后填写；留空时 lit_daily 暂用内置默认方向
+  # 占位示例（取消注释并改成你的方向；query 是空格分隔的 OR 语义关键词族）：
+  # - {slug: your-direction, label: 你的方向, limit: 15,
+  #    query: "keyword1 keyword2 keyword3"}

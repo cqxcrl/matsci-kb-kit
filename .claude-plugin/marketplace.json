@@ -1,0 +1,12 @@
+{
+  "name": "matsci-local",
+  "description": "Local marketplace hosting the matsci-knowledge-base plugin.",
+  "owner": { "name": "Matsci Knowledge Base contributors" },
+  "plugins": [
+    {
+      "name": "matsci-knowledge-base",
+      "source": "./",
+      "description": "Build and operate a materials-science knowledge base from scratch."
+    }
+  ]
+}

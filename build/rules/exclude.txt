@@ -1,0 +1,36 @@
+# 刻意排除项（审计记录，生成器以 include.txt 为准）
+# sci_* 全族：课题辅助与真实课题耦合，插件范围外（spec 决策）
+# 迁移期/一次性工具（绑活库历史期望值，空库无用）：
+kb_baseline.py
+kb_restructure.py
+kb_deabs.py
+kb_fix_frontmatter_quotes.py
+# OS 侧调度脚本（Windows 绑定）：
+lit_daily_task.ps1
+migrate-folder.ps1
+git_checkpoint.ps1
+# 私有配置与运维文档：
+lit_config.yaml
+_README.md
+_MAINTENANCE.md
+_INCIDENTS.md
+_LIT-WATCH-NEXT.md
+_QC-DRIVER.md
+_QC-PROTOCOL.md
+# Task 6 审计追加的排除项写在下方（附理由）：
+# 一次性修复器，绑活库具体页：REPAIRS/CROSS_CHECK 写死两个 concept 页名、
+# 期望出现次数与旁证 source 卡；selftest ② 对真实文件断言「可读且含正确写法」，
+# 空库必 FAIL。泛化需把整个工具重写成通用扫描器（超出 scrub 结构性改写范围），
+# 且非工作流必需工具（必需四件 qc_same_text/qc_author_gate/qc_author_gate_apply/
+# qc_base_check 均保留）。审计判定：排除。
+qc_fix_escaped_tex.py
+# 可选层豁免（工具保留，审计豁免）：caj_to_pdf.py 仍在 include.txt。
+# 依赖第三方转换器 caj2pdf（git clone，非 pip）+ 可选 Python 依赖
+# （见 requirements-optional.txt 文献辅助层）。核心环境未装时 --selftest
+# 退出码 2 并明确提示缺什么（不崩溃）；装齐后自检全过。
+#
+# 审计口径（控制器裁决，Task 6 fix 轮追认）：以**默认 kb_init（含索引）**为准。
+# 索引依赖 5 件（以实际审计表为准：kb_build_index / kb_corpus / kb_route /
+# kb_search / kb_serve）：缺索引时 selftest 退出 2 + 明确指引（先跑
+# kb_build_index.py），不是绑活库期望值；默认建库流程本就含索引 ⇒ 审计豁免，
+# 工具全部保留、不改规则。brief 的 --no-index 命令仅作首轮暴露问题用。
